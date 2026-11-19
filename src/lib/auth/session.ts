@@ -1,14 +1,11 @@
 import { cookies } from "next/headers";
-import { eq } from "drizzle-orm";
-import { db } from "@/db";
-import { profiles } from "@/db/schema";
-import {
-  SESSION_COOKIE,
-  SESSION_MAX_AGE,
-  getAuthSecret,
-  signSession,
-  verifySession,
-} from "./token";
+import { rpc } from "@/lib/supabase";
+
+export const SESSION_COOKIE = "igw_session";
+export const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 days, same as the database
+
+/** Session tokens are 64 hex chars (32 random bytes from the database). */
+export const SESSION_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
 export type SessionUser = {
   id: string;
@@ -17,17 +14,14 @@ export type SessionUser = {
   plan: string;
 };
 
-function requireSecret(): string {
-  const secret = getAuthSecret();
-  if (!secret) {
-    throw new Error("AUTH_SECRET is missing or shorter than 32 characters");
-  }
-  return secret;
+export async function getSessionToken(): Promise<string | null> {
+  const cookieStore = await cookies();
+  const token = cookieStore.get(SESSION_COOKIE)?.value ?? "";
+  return SESSION_TOKEN_PATTERN.test(token) ? token : null;
 }
 
-/** Signs the user in by setting the session cookie. Call from a Server Action. */
-export async function createSession(userId: string): Promise<void> {
-  const token = await signSession(userId, requireSecret());
+/** Stores the token returned by igw_sign_up / igw_sign_in. Call from a Server Action. */
+export async function setSessionCookie(token: string): Promise<void> {
   const cookieStore = await cookies();
   cookieStore.set(SESSION_COOKIE, token, {
     httpOnly: true,
@@ -38,33 +32,14 @@ export async function createSession(userId: string): Promise<void> {
   });
 }
 
-export async function destroySession(): Promise<void> {
+export async function clearSessionCookie(): Promise<void> {
   const cookieStore = await cookies();
   cookieStore.delete(SESSION_COOKIE);
 }
 
-/** The signed-in user, or null. Verifies the signature and that the profile still exists. */
+/** The signed-in user, verified against the sessions table, or null. */
 export async function getSessionUser(): Promise<SessionUser | null> {
-  const cookieStore = await cookies();
-  const session = await verifySession(cookieStore.get(SESSION_COOKIE)?.value, getAuthSecret());
-  if (!session) return null;
-
-  const [row] = await db
-    .select({
-      id: profiles.id,
-      name: profiles.fullName,
-      email: profiles.email,
-      plan: profiles.plan,
-    })
-    .from(profiles)
-    .where(eq(profiles.id, session.sub))
-    .limit(1);
-
-  return row ?? null;
-}
-
-export async function requireSessionUser(): Promise<SessionUser> {
-  const user = await getSessionUser();
-  if (!user) throw new Error("You must be signed in");
-  return user;
+  const token = await getSessionToken();
+  if (!token) return null;
+  return rpc<SessionUser | null>("igw_me", { p_token: token });
 }
