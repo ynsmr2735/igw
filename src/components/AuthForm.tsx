@@ -9,7 +9,6 @@ import {
   type AuthState,
 } from "@/app/auth/actions";
 import { Brand } from "@/components/Brand";
-import { isSupabaseConfigured } from "@/lib/supabase/config";
 
 const initialState: AuthState = {};
 
@@ -21,7 +20,6 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
   );
   const [showPassword, setShowPassword] = useState(false);
   const [accepted, setAccepted] = useState(isSignup);
-  const live = isSupabaseConfigured();
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#f7f7fb] text-[#10152b]">
@@ -102,15 +100,6 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
               </span>
             </div>
 
-            <div className="mt-6 flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
-              <span className={`h-2 w-2 rounded-full ${live ? "bg-emerald-500" : "bg-amber-400"}`} />
-              <p className="text-[11px] font-semibold text-slate-500">
-                {live
-                  ? "Supabase authentication is connected"
-                  : "Demo mode — local database authentication"}
-              </p>
-            </div>
-
             <form action={formAction} className="mt-6 space-y-4">
               <input type="hidden" name="next" value={next} />
 
@@ -146,7 +135,6 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                     type="email"
                     autoComplete="email"
                     required
-                    defaultValue={isSignup ? "" : "deniz@instaglobalwallet.com"}
                     placeholder="you@example.com"
                     className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-4 text-[13px] font-semibold text-slate-800 transition focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
                   />
@@ -171,7 +159,6 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                     autoComplete={isSignup ? "new-password" : "current-password"}
                     required
                     minLength={8}
-                    defaultValue={isSignup ? "" : "demo1234"}
                     placeholder={isSignup ? "At least 8 characters" : "••••••••"}
                     className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-11 text-[13px] font-semibold text-slate-800 transition focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
                   />
@@ -226,19 +213,6 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                 {!pending && <ArrowRight className="h-4 w-4" />}
               </button>
             </form>
-
-            <div className="my-6 flex items-center gap-3">
-              <span className="h-px flex-1 bg-slate-100" />
-              <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">or</span>
-              <span className="h-px flex-1 bg-slate-100" />
-            </div>
-
-            <Link
-              href="/dashboard"
-              className="flex h-11 w-full items-center justify-center rounded-xl border border-slate-200 bg-white text-[12px] font-bold text-slate-700 transition hover:border-purple-300 hover:text-[#7F00FF]"
-            >
-              Explore the dashboard preview
-            </Link>
 
             <p className="mt-6 text-center text-[12px] font-medium text-slate-500">
               {isSignup ? "Already have an account? " : "New to Insta Global Wallet? "}

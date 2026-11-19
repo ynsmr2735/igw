@@ -400,7 +400,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
               <span className="block truncate text-white">{data.user.name}</span>
               <span className="block truncate text-[10px] font-normal text-white/40">{data.user.email}</span>
             </span>
-            <span className="h-2 w-2 rounded-full bg-emerald-400" title={data.mode === "supabase" ? "Supabase connected" : "Demo mode"} />
+            <span className="h-2 w-2 rounded-full bg-emerald-400" title="Signed in" />
           </div>
           <form action={signOutAction}>
             <button type="submit" className="mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[12px] font-semibold text-white/50 transition hover:bg-white/5 hover:text-white">
@@ -464,8 +464,8 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
             <div>
               <p className="flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-[0.16em] text-[#7F00FF]">
                 <Zap className="h-3.5 w-3.5" /> Financial overview
-                <span className={`rounded-full px-2 py-0.5 text-[9px] font-black tracking-normal ${data.mode === "supabase" ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600"}`}>
-                  {data.mode === "supabase" ? "Supabase connected" : "Demo mode"}
+                <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[9px] font-black tracking-normal text-emerald-600">
+                  Secure session
                 </span>
               </p>
               <h1 className="mt-2 text-2xl font-black tracking-tight sm:text-3xl">Merhaba, {data.user.name.split(" ")[0]} 👋</h1>

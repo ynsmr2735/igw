@@ -1,23 +1,21 @@
 import { db, isDatabaseConfigured } from "@/db";
-import { isSupabaseConfigured } from "@/lib/supabase/config";
+import { getAuthSecret } from "@/lib/auth/token";
 import { sql } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const mode = isSupabaseConfigured() ? "supabase" : "demo";
+  const authSecret = Boolean(getAuthSecret());
 
-  // Supabase mode does not need the local PostgreSQL database.
   if (!isDatabaseConfigured()) {
-    return mode === "supabase"
-      ? Response.json({ ok: true, mode, database: "not configured" })
-      : Response.json({ ok: false, mode, error: "DATABASE_URL is not set" }, { status: 500 });
+    return Response.json({ ok: false, database: "DATABASE_URL is not set", authSecret }, { status: 500 });
   }
 
   try {
-    await db.execute(sql`select 1`);
-    return Response.json({ ok: true, mode, database: "ok" });
-  } catch {
-    return Response.json({ ok: false, mode, database: "unreachable" }, { status: 500 });
+    await db.execute(sql`select 1 from public.profiles limit 1`);
+    return Response.json({ ok: authSecret, database: "ok", authSecret }, { status: authSecret ? 200 : 500 });
+  } catch (error) {
+    console.error("Health check failed:", error);
+    return Response.json({ ok: false, database: "unreachable or schema missing", authSecret }, { status: 500 });
   }
 }
