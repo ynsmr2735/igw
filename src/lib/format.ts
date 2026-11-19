@@ -27,12 +27,19 @@ export function formatMoney(amount: number, currency: string): string {
   }
 }
 
+/**
+ * Fixed time zone so the server (UTC on Vercel) and the browser render the
+ * same text; otherwise React reports a hydration mismatch (error #418).
+ */
+export const DISPLAY_TIME_ZONE = "Europe/Istanbul";
+
 export function formatDate(value: string | Date): string {
   return new Intl.DateTimeFormat("tr-TR", {
     day: "2-digit",
     month: "short",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: DISPLAY_TIME_ZONE,
   }).format(new Date(value));
 }
 
