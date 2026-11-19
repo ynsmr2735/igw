@@ -4,7 +4,20 @@
  * the igw_* database functions and nothing else (see supabase/schema.sql).
  */
 
-const SUPABASE_URL = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? "").trim().replace(/\/+$/, "");
+/**
+ * Accepts the project URL in the forms people usually paste:
+ * "https://ref.supabase.co", ".../", ".../rest/v1", ".../rest/v1/".
+ */
+function normalizeUrl(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .replace(/\/+$/, "")
+    .replace(/\/rest\/v1$/i, "")
+    .replace(/\/+$/, "");
+}
+
+const SUPABASE_URL = normalizeUrl(process.env.NEXT_PUBLIC_SUPABASE_URL ?? "");
 const SUPABASE_KEY = (
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
@@ -33,6 +46,11 @@ export function isSupabaseConfigured(): boolean {
 
 export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!SUPABASE_URL) throw new SetupError("NEXT_PUBLIC_SUPABASE_URL is not set.");
+  if (!/^https?:\/\/[^/]+$/i.test(SUPABASE_URL) || /supabase\.com/i.test(SUPABASE_URL)) {
+    throw new SetupError(
+      `NEXT_PUBLIC_SUPABASE_URL must look like https://<project-ref>.supabase.co (got "${SUPABASE_URL}").`,
+    );
+  }
   if (!SUPABASE_KEY) throw new SetupError("NEXT_PUBLIC_SUPABASE_ANON_KEY is not set.");
 
   const headers: Record<string, string> = {
@@ -72,8 +90,17 @@ export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Pr
   if (response.status === 401 || /api key|jwt/i.test(info.message ?? "")) {
     throw new SetupError("NEXT_PUBLIC_SUPABASE_ANON_KEY is wrong or belongs to another project.");
   }
-  if (info.code === "PGRST202" || response.status === 404) {
-    throw new SetupError("Database functions are missing. Run supabase/schema.sql in the Supabase SQL Editor.");
+  if (info.code === "PGRST202") {
+    throw new SetupError(
+      `Database function ${fn} was not found in the project at ${SUPABASE_URL}. ` +
+        "Run the whole supabase/schema.sql in the SQL Editor of this same project.",
+    );
+  }
+  if (response.status === 404) {
+    throw new SetupError(
+      `Supabase returned 404 for ${SUPABASE_URL}/rest/v1/rpc/${fn}. ` +
+        "Check NEXT_PUBLIC_SUPABASE_URL: it must be https://<project-ref>.supabase.co.",
+    );
   }
   if (info.code === "42501") {
     throw new SetupError("Permission denied. Run the latest supabase/schema.sql in the Supabase SQL Editor.");

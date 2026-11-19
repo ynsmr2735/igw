@@ -101,8 +101,21 @@ create index if not exists sessions_user_idx on public.sessions(user_id);
 -- Migration from earlier versions (Supabase Auth / direct DATABASE_URL)
 -- ---------------------------------------------------------------------------
 
-drop trigger if exists on_auth_user_created on auth.users;
-drop function if exists public.handle_new_user();
+-- Newer Supabase projects may not let the SQL Editor change auth.users. If so,
+-- the old trigger is simply left in place (nothing writes to auth.users any
+-- more) instead of aborting the whole script.
+do $$
+begin
+  if to_regclass('auth.users') is not null then
+    execute 'drop trigger if exists on_auth_user_created on auth.users';
+  end if;
+  drop function if exists public.handle_new_user();
+exception
+  when others then
+    raise notice 'Skipped removing the old auth.users trigger: %', sqlerrm;
+end;
+$$;
+
 drop function if exists public.execute_wallet_action(
   text, numeric, bigint, bigint, bigint, bigint, text, text
 );
