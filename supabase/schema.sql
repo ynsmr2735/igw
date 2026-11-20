@@ -334,6 +334,84 @@ insert into public.app_settings (key, value) values
 on conflict (key) do nothing;
 
 -- ---------------------------------------------------------------------------
+-- Cards and crypto withdrawals (igw-rpc-9)
+-- A member can request withdrawals only with an ACTIVE card. Cards are activated,
+-- changed and deactivated by an admin (no fee). Each tier has a daily (24 h) limit.
+-- ---------------------------------------------------------------------------
+create table if not exists public.member_cards (
+  user_id uuid primary key references public.profiles(id) on delete cascade,
+  card_number text not null unique,
+  tier text not null check (tier in ('standard', 'gold', 'premium', 'merchant')),
+  status text not null default 'active' check (status in ('active', 'inactive')),
+  activated_at timestamptz,
+  activated_by uuid references public.profiles(id) on delete set null,
+  deactivated_at timestamptz,
+  deactivated_by uuid references public.profiles(id) on delete set null,
+  deactivation_reason text,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.card_requests (
+  id bigint generated always as identity primary key,
+  reference text not null unique,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  account_number text not null,
+  user_name text not null,
+  tier text not null check (tier in ('standard', 'gold', 'premium', 'merchant')),
+  note text not null default '',
+  status text not null default 'pending' check (status in ('pending', 'approved', 'rejected', 'cancelled')),
+  created_at timestamptz not null default now(),
+  reviewed_at timestamptz,
+  reviewed_by uuid references public.profiles(id) on delete set null,
+  rejection_reason text
+);
+create unique index if not exists card_requests_one_pending on public.card_requests(user_id) where status = 'pending';
+create index if not exists card_requests_status_idx on public.card_requests(status, created_at desc);
+
+create table if not exists public.withdrawal_requests (
+  id bigint generated always as identity primary key,
+  reference text not null unique,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  account_number text not null,
+  user_name text not null,
+  amount_usd numeric(14, 2) not null check (amount_usd > 0),
+  method text not null default 'btc' check (method = 'btc'),
+  btc_address text not null,
+  card_tier text not null,
+  status text not null default 'pending' check (status in ('pending', 'approved', 'rejected', 'cancelled')),
+  txid text check (txid ~ '^[0-9a-f]{64}$'),
+  created_at timestamptz not null default now(),
+  reviewed_at timestamptz,
+  reviewed_by uuid references public.profiles(id) on delete set null,
+  rejection_reason text
+);
+create index if not exists withdrawal_requests_user_idx on public.withdrawal_requests(user_id, created_at desc);
+create index if not exists withdrawal_requests_status_idx on public.withdrawal_requests(status, created_at desc);
+
+alter table public.transactions add column if not exists withdrawal_request_id bigint;
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'transactions_withdrawal_fkey') then
+    alter table public.transactions add constraint transactions_withdrawal_fkey
+      foreign key (withdrawal_request_id) references public.withdrawal_requests(id) on delete set null;
+  end if;
+end;
+$$;
+
+insert into public.app_settings (key, value) values
+  ('card_limit_standard', '750'),
+  ('card_limit_gold', '1250'),
+  ('card_limit_premium', '5000'),
+  ('card_limit_merchant', 'unlimited'),
+  ('withdrawal_min_usd', '10')
+on conflict (key) do nothing;
+
+alter table public.member_cards enable row level security;
+alter table public.card_requests enable row level security;
+alter table public.withdrawal_requests enable row level security;
+revoke all on public.member_cards, public.card_requests, public.withdrawal_requests from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------
 -- Migration from earlier versions (Supabase Auth / direct DATABASE_URL)
 -- ---------------------------------------------------------------------------
 
@@ -899,6 +977,179 @@ as $$
   );
 $$;
 
+-- Cards and withdrawals (igw-rpc-9) -------------------------------------------
+create or replace function igw_private.card_tier_name(p_tier text)
+returns text
+language sql
+immutable
+as $$
+  select case p_tier when 'standard' then 'Standard' when 'gold' then 'Gold'
+                     when 'premium' then 'Premium' when 'merchant' then 'Merchant' else p_tier end;
+$$;
+
+-- Daily (24 h) withdrawal limit in USD; null = unlimited.
+create or replace function igw_private.card_limit(p_tier text)
+returns numeric
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select case when v is null or v = 'unlimited' then null else v::numeric end
+  from (select igw_private.setting('card_limit_' || p_tier) as v) s;
+$$;
+
+create or replace function igw_private.card_tiers()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_agg(jsonb_build_object('tier', t.tier, 'name', igw_private.card_tier_name(t.tier),
+                                      'dailyLimit', igw_private.card_limit(t.tier)) order by t.ord)
+  from (values ('standard', 1), ('gold', 2), ('premium', 3), ('merchant', 4)) t(tier, ord);
+$$;
+
+-- Pending + sent withdrawals of the last 24 hours (rejected/cancelled ones do not count).
+create or replace function igw_private.withdrawn_last_24h(p_user uuid)
+returns numeric
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select coalesce(sum(amount_usd), 0) from public.withdrawal_requests
+  where user_id = p_user and status in ('pending', 'approved') and created_at > now() - interval '24 hours';
+$$;
+
+create or replace function igw_private.card_json(c public.member_cards)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select case when c.user_id is null then null else jsonb_build_object(
+    'cardNumber', c.card_number,
+    'tier', c.tier,
+    'tierName', igw_private.card_tier_name(c.tier),
+    'status', c.status,
+    'dailyLimit', igw_private.card_limit(c.tier),
+    'activatedAt', c.activated_at,
+    'deactivatedAt', c.deactivated_at,
+    'deactivationReason', c.deactivation_reason,
+    'updatedAt', c.updated_at
+  ) end;
+$$;
+
+create or replace function igw_private.card_request_json(r public.card_requests)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select case when r.id is null then null else jsonb_build_object(
+    'id', r.id, 'reference', r.reference, 'accountNumber', r.account_number, 'userName', r.user_name,
+    'tier', r.tier, 'tierName', igw_private.card_tier_name(r.tier), 'dailyLimit', igw_private.card_limit(r.tier),
+    'note', r.note, 'status', r.status, 'createdAt', r.created_at, 'reviewedAt', r.reviewed_at,
+    'rejectionReason', r.rejection_reason
+  ) end;
+$$;
+
+create or replace function igw_private.withdrawal_json(w public.withdrawal_requests)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_build_object(
+    'id', w.id, 'reference', w.reference, 'accountNumber', w.account_number, 'userName', w.user_name,
+    'amountUsd', w.amount_usd, 'method', w.method, 'btcAddress', w.btc_address, 'cardTier', w.card_tier,
+    'cardTierName', igw_private.card_tier_name(w.card_tier), 'status', w.status, 'txid', w.txid,
+    'createdAt', w.created_at, 'reviewedAt', w.reviewed_at, 'rejectionReason', w.rejection_reason,
+    'reviewedBy', (select coalesce(username, full_name) from public.profiles where id = w.reviewed_by)
+  );
+$$;
+
+-- Everything the member's "Withdraw" section needs.
+create or replace function igw_private.withdrawal_center(p_user uuid)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_card public.member_cards%rowtype;
+  v_limit numeric;
+  v_used numeric := igw_private.withdrawn_last_24h(p_user);
+begin
+  select * into v_card from public.member_cards where user_id = p_user;
+  v_limit := case when v_card.status = 'active' then igw_private.card_limit(v_card.tier) end;
+  return jsonb_build_object(
+    'card', igw_private.card_json(v_card),
+    'pendingCardRequest', (select igw_private.card_request_json(r) from public.card_requests r
+                           where r.user_id = p_user and r.status = 'pending' limit 1),
+    'lastCardRequest', (select igw_private.card_request_json(r) from public.card_requests r
+                        where r.user_id = p_user order by r.created_at desc, r.id desc limit 1),
+    'tiers', igw_private.card_tiers(),
+    'canWithdraw', coalesce(v_card.status = 'active', false),
+    'dailyLimit', v_limit,
+    'usedLast24h', v_used,
+    'remainingToday', case when v_card.status = 'active' then
+                        case when v_limit is null then null else greatest(v_limit - v_used, 0) end
+                      else 0 end,
+    'minUsd', igw_private.setting('withdrawal_min_usd')::numeric,
+    'withdrawals', coalesce((
+      select jsonb_agg(igw_private.withdrawal_json(w) order by w.created_at desc, w.id desc)
+      from (select * from public.withdrawal_requests where user_id = p_user order by created_at desc, id desc limit 50) w
+    ), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- Card number shown to the member: IGW + 12 random digits, unique.
+create or replace function igw_private.new_card_number()
+returns text
+language plpgsql
+volatile
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v text;
+begin
+  loop
+    v := '4' || lpad((floor(random() * 1e15))::bigint::text, 15, '0');
+    exit when not exists (select 1 from public.member_cards where card_number = v);
+  end loop;
+  return v;
+end;
+$$;
+
+-- Activate / change tier of a member's card (admin action, used by request approval and direct setting).
+create or replace function igw_private.activate_card(p_admin uuid, p_user uuid, p_tier text)
+returns public.member_cards
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_card public.member_cards%rowtype;
+begin
+  insert into public.member_cards (user_id, card_number, tier, status, activated_at, activated_by, updated_at)
+  values (p_user, igw_private.new_card_number(), p_tier, 'active', now(), p_admin, now())
+  on conflict (user_id) do update
+    set tier = excluded.tier, status = 'active', activated_at = now(), activated_by = p_admin,
+        deactivated_at = null, deactivated_by = null, deactivation_reason = null, updated_at = now()
+  returning * into v_card;
+  return v_card;
+end;
+$$;
+
 create or replace function igw_private.transaction_json(t public.transactions)
 returns jsonb
 language sql
@@ -1046,6 +1297,8 @@ drop function if exists public.igw_admin_set_btc_address(text, text);
 drop function if exists public.igw_admin_set_deposits_enabled(text, boolean);
 -- igw-rpc-7: approve gets p_accept_received.
 drop function if exists public.igw_admin_approve(text, bigint, jsonb);
+-- igw-rpc-8: no blockchain verification; the admin's decision completes the payment.
+drop function if exists public.igw_admin_approve(text, bigint, jsonb, boolean);
 
 create or replace function public.igw_health()
 returns jsonb
@@ -1054,7 +1307,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-7');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-9');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1268,6 +1521,7 @@ begin
       'maxUsd', igw_private.setting('deposit_max_usd')::numeric,
       'quoteMinutes', igw_private.setting('deposit_quote_minutes')::int
     ),
+    'withdrawalCenter', igw_private.withdrawal_center(v_uid),
     'flows', (
       select jsonb_build_object(
         'moneyIn', coalesce(sum(t.amount) filter (where t.direction = 'in'), 0),
@@ -1729,6 +1983,9 @@ begin
       'awaitingPayment', (select count(*) from public.deposit_requests where status = 'awaiting_payment'),
       'approved', (select count(*) from public.deposit_requests where status = 'approved'),
       'rejected', (select count(*) from public.deposit_requests where status = 'rejected'),
+      'withdrawalsPending', (select count(*) from public.withdrawal_requests where status = 'pending'),
+      'cardRequestsPending', (select count(*) from public.card_requests where status = 'pending'),
+      'activeCards', (select count(*) from public.member_cards where status = 'active'),
       'users', (select count(*) from public.profiles),
       'totalBalance', (select coalesce(sum(balance), 0) from public.wallets where currency = 'USD')
     ),
@@ -1808,14 +2065,13 @@ begin
 end;
 $$;
 
--- SERVICE ROLE ONLY + admin session. The admin approves manually, but only a
--- payment verified on its own blockchain right before this call: the server
--- re-checks it, and this function verifies the result matches this exact
--- request (method, address, exact amount, token contract, confirmations).
--- Row lock + status check make a second approval impossible.
-create or replace function public.igw_admin_approve(
-  p_token text, p_id bigint, p_verification jsonb, p_accept_received boolean default false
-)
+-- Admin decision only (igw-rpc-8): there is NO blockchain verification. Approving
+-- completes the payment: the member's balance is credited once, atomically (row lock +
+-- status check), the transaction is completed, the member is notified and the action
+-- is written to the audit log. Only an admin session can call it.
+-- p_credit_usd: optional LOWER amount actually received (e.g. exchange fee deducted);
+-- default = the requested amount.
+create or replace function public.igw_admin_approve(p_token text, p_id bigint, p_credit_usd numeric default null)
 returns jsonb
 language plpgsql
 security definer
@@ -1824,11 +2080,8 @@ as $$
 declare
   v_admin uuid := igw_private.require_admin(p_token);
   v_request public.deposit_requests%rowtype;
-  v_required integer;
   v_wallet public.wallets%rowtype;
-  v_paid bigint := coalesce((p_verification->>'paidUnits')::bigint, -1);
   v_credit numeric(14, 2);
-  v_other text;
 begin
   select * into v_request from public.deposit_requests where id = p_id for update;
   if not found then
@@ -1838,62 +2091,27 @@ begin
     raise exception 'This deposit has already been approved.';
   end if;
   if v_request.status <> 'reviewing' then
-    raise exception 'Only deposits under review can be approved (status: %).', replace(v_request.status, '_', ' ');
+    raise exception 'Only payments marked as paid ("I''ve paid") can be approved (status: %).', replace(v_request.status, '_', ' ');
   end if;
-  v_required := igw_private.setting(igw_private.method_key(v_request.method, 'confirmations'))::integer;
-  -- The payment must be REAL: found on the request's own blockchain, to this request's
-  -- address, (USDT) from the official token contract, with enough confirmations.
-  if p_verification is null
-     or p_verification->>'method' is distinct from v_request.method
-     or p_verification->>'txid' is distinct from v_request.txid
-     or p_verification->>'address' is distinct from v_request.deposit_address
-     or coalesce((p_verification->>'confirmations')::integer, 0) < v_required
-     or (v_request.method = 'usdt_trc20'
-         and p_verification->>'contract' is distinct from 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t')
-     or v_paid <= 0 then
-    raise exception 'Blockchain verification does not match this request. The deposit was not approved.';
+  if p_credit_usd is not null and p_credit_usd <> round(p_credit_usd, 2) then
+    raise exception 'Enter the amount to credit with at most 2 decimal places.';
   end if;
-
-  if v_paid = v_request.amount_units then
-    if coalesce((p_verification->>'matched')::boolean, false) is not true then
-      raise exception 'Blockchain verification does not match this request. The deposit was not approved.';
-    end if;
-    v_credit := v_request.amount_usd;
-  else
-    -- Different amount (e.g. the exchange deducted a fee): only by an explicit admin
-    -- decision, and only if every other check passed.
-    if not coalesce(p_accept_received, false)
-       or coalesce((p_verification->>'matchedExceptAmount')::boolean, false) is not true then
-      raise exception 'The amount received differs from this request. The deposit was not approved.';
-    end if;
-    -- Never give one member the payment that exactly matches another member's request.
-    select reference into v_other
-    from public.deposit_requests
-    where method = v_request.method and amount_units = v_paid and id <> v_request.id
-      and status in ('awaiting_payment', 'reviewing')
-    limit 1;
-    if v_other is not null then
-      raise exception 'This payment exactly matches another member''s request (%). It was not approved.', v_other;
-    end if;
-    v_credit := case v_request.method
-      when 'usdt_trc20' then floor(v_paid / 10000.0) / 100
-      else floor(v_paid * v_request.usd_rate / 1000000.0) / 100
-    end;
-    if v_credit <= 0 then
-      raise exception 'The amount received is too small to credit.';
-    end if;
+  v_credit := coalesce(p_credit_usd, v_request.amount_usd);
+  if v_credit <= 0 or v_credit > v_request.amount_usd then
+    raise exception 'The amount to credit must be more than 0 and at most the requested % USD.', v_request.amount_usd;
   end if;
 
   update public.wallets
   set balance = balance + v_credit
   where user_id = v_request.user_id and currency = 'USD'
   returning * into v_wallet;
+  if not found then
+    raise exception 'The member has no USD wallet.';
+  end if;
 
   update public.transactions
   set status = 'completed', amount = v_credit,
-      description = igw_private.method_asset(v_request.method) || ' deposit · '
-        || igw_private.format_units(v_request.method, v_paid) || ' ' || igw_private.method_asset(v_request.method)
-        || ' · TXID ' || left(v_request.txid, 12) || '…'
+      description = description || ' · TXID ' || left(v_request.txid, 12) || '…'
   where deposit_request_id = v_request.id and status = 'pending';
   if not found then
     insert into public.transactions (
@@ -1904,14 +2122,14 @@ begin
       case v_request.method when 'usdt_trc20' then 'Tether (USDT TRC20)' else 'Bitcoin (BTC)' end, '', 'completed',
       v_request.reference,
       igw_private.method_asset(v_request.method) || ' deposit · '
-        || igw_private.format_units(v_request.method, v_paid) || ' ' || igw_private.method_asset(v_request.method),
+        || igw_private.format_units(v_request.method, v_request.amount_units) || ' ' || igw_private.method_asset(v_request.method),
       v_request.id
     );
   end if;
 
   update public.deposit_requests
-  set status = 'approved', reviewed_at = now(), reviewed_by = v_admin, verification = p_verification,
-      credited_usd = v_credit
+  set status = 'approved', reviewed_at = now(), reviewed_by = v_admin, credited_usd = v_credit,
+      verification = jsonb_build_object('mode', 'manual', 'approvedAt', now())
   where id = v_request.id
   returning * into v_request;
 
@@ -1922,9 +2140,7 @@ begin
   perform igw_private.audit(v_admin, 'deposit_approved', 'deposit_request', v_request.reference,
     jsonb_build_object('requestId', v_request.id, 'method', v_request.method, 'accountNumber', v_request.account_number,
                        'amountUsd', v_request.amount_usd, 'creditedUsd', v_credit,
-                       'amountUnits', v_request.amount_units, 'receivedUnits', v_paid,
-                       'differentAmountAccepted', v_paid <> v_request.amount_units,
-                       'txid', v_request.txid, 'confirmations', p_verification->'confirmations'));
+                       'amountUnits', v_request.amount_units, 'txid', v_request.txid, 'mode', 'manual'));
   perform igw_private.notify(
     v_request.user_id, 'deposit_approved', 'Payment approved',
     format('Your payment has been approved and added to your balance: %s USD (ref. %s).', v_credit, v_request.reference),
@@ -2070,7 +2286,19 @@ begin
     'rejected', (select count(*) from public.deposit_requests where status = 'rejected'),
     'unreadCount', (select count(*) from public.notifications where user_id = v_admin and read_at is null),
     'latestRequestNotificationId', (select max(id) from public.notifications
-                                    where user_id = v_admin and kind = 'deposit_submitted'),
+                                    where user_id = v_admin and kind in ('deposit_submitted', 'withdrawal_submitted', 'card_requested')),
+    'withdrawalsPending', (select count(*) from public.withdrawal_requests where status = 'pending'),
+    'cardRequestsPending', (select count(*) from public.card_requests where status = 'pending'),
+    'newOther', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'notificationId', n.id, 'kind', n.kind,
+        'id', coalesce((n.data->>'withdrawalId')::bigint, (n.data->>'cardRequestId')::bigint),
+        'reference', n.data->>'reference', 'amountUsd', n.data->'amountUsd', 'tier', n.data->>'tier',
+        'userName', n.data->>'userName'
+      ) order by n.id)
+      from public.notifications n
+      where n.user_id = v_admin and n.kind in ('withdrawal_submitted', 'card_requested') and n.read_at is null
+    ), '[]'::jsonb),
     'newRequests', coalesce((
       select jsonb_agg(jsonb_build_object(
         'notificationId', n.id, 'requestId', (n.data->>'requestId')::bigint, 'reference', n.data->>'reference',
@@ -2115,6 +2343,466 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Cards and withdrawals: member functions (igw-rpc-9)
+-- ---------------------------------------------------------------------------
+
+create or replace function public.igw_withdrawal_center(p_token text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+begin
+  return igw_private.withdrawal_center(v_uid);
+end;
+$$;
+
+-- Member asks for a card (or a different tier). An admin decides; there is no fee.
+create or replace function public.igw_card_request(p_token text, p_tier text, p_note text default '')
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+  v_profile public.profiles%rowtype;
+  v_card public.member_cards%rowtype;
+  v_request public.card_requests%rowtype;
+begin
+  if p_tier is null or p_tier not in ('standard', 'gold', 'premium', 'merchant') then
+    raise exception 'Choose a card: Standard, Gold, Premium or Merchant.';
+  end if;
+  select * into v_profile from public.profiles where id = v_uid;
+  select * into v_card from public.member_cards where user_id = v_uid;
+  if v_card.status = 'active' and v_card.tier = p_tier then
+    raise exception 'Your % card is already active.', igw_private.card_tier_name(p_tier);
+  end if;
+  if exists (select 1 from public.card_requests where user_id = v_uid and status = 'pending') then
+    raise exception 'You already have a card request waiting for review.';
+  end if;
+  insert into public.card_requests (reference, user_id, account_number, user_name, tier, note)
+  values (igw_private.new_reference('CRD'), v_uid, v_profile.account_number, v_profile.full_name, p_tier,
+          left(trim(coalesce(p_note, '')), 300))
+  returning * into v_request;
+
+  perform igw_private.notify(v_uid, 'card_request_received', 'Card request received',
+    format('Your %s card request (ref. %s) has been received. Awaiting admin review.', igw_private.card_tier_name(p_tier), v_request.reference),
+    jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier));
+  perform igw_private.notify_admins('card_requested', 'New card request',
+    format('%s (account %s) requests a %s card.', v_profile.full_name, v_profile.account_number, igw_private.card_tier_name(p_tier)),
+    jsonb_build_object('cardRequestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier,
+                       'userName', v_profile.full_name, 'accountNumber', v_profile.account_number));
+  return igw_private.card_request_json(v_request);
+exception
+  when unique_violation then
+    raise exception 'You already have a card request waiting for review.';
+end;
+$$;
+
+create or replace function public.igw_card_request_cancel(p_token text, p_id bigint)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+  v_request public.card_requests%rowtype;
+begin
+  update public.card_requests set status = 'cancelled', reviewed_at = now()
+  where id = p_id and user_id = v_uid and status = 'pending'
+  returning * into v_request;
+  if not found then
+    raise exception 'Only your own pending card request can be cancelled.';
+  end if;
+  return igw_private.card_request_json(v_request);
+end;
+$$;
+
+-- Withdrawal request: needs an ACTIVE card, a valid BTC mainnet address, enough balance
+-- and room in the card's 24 h limit. The amount is taken from the balance at once
+-- (reserved) and given back if the admin rejects or the member cancels.
+create or replace function public.igw_withdrawal_create(p_token text, p_amount_usd numeric, p_btc_address text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+  v_profile public.profiles%rowtype;
+  v_card public.member_cards%rowtype;
+  v_wallet public.wallets%rowtype;
+  v_address text := trim(coalesce(p_btc_address, ''));
+  v_min numeric := igw_private.setting('withdrawal_min_usd')::numeric;
+  v_limit numeric;
+  v_used numeric;
+  v_request public.withdrawal_requests%rowtype;
+  v_tx public.transactions%rowtype;
+begin
+  select * into v_card from public.member_cards where user_id = v_uid;
+  if not found or v_card.status <> 'active' then
+    raise exception 'You need an active card to withdraw. Request a card in the Withdraw section; an admin activates it.';
+  end if;
+  if p_amount_usd is null or p_amount_usd <> round(p_amount_usd, 2) or p_amount_usd <= 0 then
+    raise exception 'Enter an amount in USD with at most 2 decimal places.';
+  end if;
+  if p_amount_usd < v_min then
+    raise exception 'The minimum withdrawal is % USD.', v_min;
+  end if;
+  if not igw_private.deposit_address_valid('btc', v_address) then
+    raise exception 'Enter a valid Bitcoin (mainnet) address.';
+  end if;
+
+  -- Lock the wallet: balance and daily limit are checked and changed atomically.
+  select * into v_wallet from public.wallets where user_id = v_uid and currency = 'USD' for update;
+  if not found then
+    raise exception 'No USD wallet found.';
+  end if;
+  if v_wallet.balance < p_amount_usd then
+    raise exception 'Insufficient balance. Available: % USD.', v_wallet.balance;
+  end if;
+  v_limit := igw_private.card_limit(v_card.tier);
+  v_used := igw_private.withdrawn_last_24h(v_uid);
+  if v_limit is not null and v_used + p_amount_usd > v_limit then
+    raise exception 'Daily limit of your % card is % USD. Used in the last 24 hours: % USD, still available: % USD.',
+      igw_private.card_tier_name(v_card.tier), v_limit, v_used, greatest(v_limit - v_used, 0);
+  end if;
+
+  select * into v_profile from public.profiles where id = v_uid;
+  insert into public.withdrawal_requests (reference, user_id, account_number, user_name, amount_usd, btc_address, card_tier)
+  values (igw_private.new_reference('WDR'), v_uid, v_profile.account_number, v_profile.full_name, p_amount_usd, v_address, v_card.tier)
+  returning * into v_request;
+
+  update public.wallets set balance = balance - p_amount_usd where id = v_wallet.id;
+  insert into public.transactions (
+    wallet_id, type, direction, amount, currency, counterparty, counterparty_account, note, status,
+    reference, description, withdrawal_request_id
+  ) values (
+    v_wallet.id, 'withdrawal', 'out', p_amount_usd, 'USD', 'Bitcoin (BTC)', v_address, '', 'pending',
+    v_request.reference, 'BTC withdrawal to ' || left(v_address, 10) || '…', v_request.id
+  ) returning * into v_tx;
+
+  perform igw_private.notify(v_uid, 'withdrawal_received', 'Withdrawal request received',
+    format('Your withdrawal request of %s USD (ref. %s) has been received. Awaiting admin review.', p_amount_usd, v_request.reference),
+    jsonb_build_object('withdrawalId', v_request.id, 'reference', v_request.reference, 'amountUsd', p_amount_usd));
+  perform igw_private.notify_admins('withdrawal_submitted', 'New withdrawal request',
+    format('%s (account %s) requests %s USD to %s (%s card).', v_profile.full_name, v_profile.account_number,
+           p_amount_usd, v_address, igw_private.card_tier_name(v_card.tier)),
+    jsonb_build_object('withdrawalId', v_request.id, 'reference', v_request.reference, 'amountUsd', p_amount_usd,
+                       'userName', v_profile.full_name, 'accountNumber', v_profile.account_number,
+                       'btcAddress', v_address, 'cardTier', v_card.tier));
+  return igw_private.withdrawal_json(v_request);
+end;
+$$;
+
+create or replace function public.igw_withdrawal_cancel(p_token text, p_id bigint)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+  v_request public.withdrawal_requests%rowtype;
+begin
+  select * into v_request from public.withdrawal_requests where id = p_id and user_id = v_uid for update;
+  if not found or v_request.status <> 'pending' then
+    raise exception 'Only your own pending withdrawal can be cancelled.';
+  end if;
+  update public.wallets set balance = balance + v_request.amount_usd where user_id = v_uid and currency = 'USD';
+  update public.transactions set status = 'cancelled' where withdrawal_request_id = v_request.id and status = 'pending';
+  update public.withdrawal_requests set status = 'cancelled', reviewed_at = now() where id = v_request.id
+  returning * into v_request;
+  update public.notifications set read_at = now()
+  where kind = 'withdrawal_submitted' and read_at is null and (data->>'withdrawalId')::bigint = v_request.id;
+  return igw_private.withdrawal_json(v_request);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Cards and withdrawals: admin functions (igw-rpc-9)
+-- ---------------------------------------------------------------------------
+
+create or replace function igw_private.admin_withdrawal_row(w public.withdrawal_requests)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select igw_private.withdrawal_json(w) || jsonb_build_object(
+    'user', (select jsonb_build_object('id', p.id, 'name', p.full_name, 'email', p.email, 'accountNumber', p.account_number,
+                                       'balance', (select balance from public.wallets x where x.user_id = p.id and x.currency = 'USD'))
+             from public.profiles p where p.id = w.user_id)
+  );
+$$;
+
+create or replace function public.igw_admin_withdrawals(p_token text, p_status text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+begin
+  return coalesce((
+    select jsonb_agg(igw_private.admin_withdrawal_row(w) order by (w.status = 'pending') desc, w.created_at desc, w.id desc)
+    from (select * from public.withdrawal_requests
+          where p_status is null or status = p_status
+          order by (status = 'pending') desc, created_at desc, id desc limit 300) w
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Admin marks the withdrawal as SENT (after sending the BTC from the company wallet).
+create or replace function public.igw_admin_withdrawal_approve(p_token text, p_id bigint, p_txid text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_request public.withdrawal_requests%rowtype;
+  v_txid text := nullif(lower(trim(coalesce(p_txid, ''))), '');
+begin
+  select * into v_request from public.withdrawal_requests where id = p_id for update;
+  if not found then
+    raise exception 'Withdrawal request not found.';
+  end if;
+  if v_request.status <> 'pending' then
+    raise exception 'This withdrawal has already been %.', case v_request.status when 'approved' then 'approved' else replace(v_request.status, '_', ' ') end;
+  end if;
+  if v_txid is not null and v_txid !~ '^[0-9a-f]{64}$' then
+    raise exception 'The transaction ID (TXID) must be 64 hexadecimal characters (or leave it empty).';
+  end if;
+  update public.withdrawal_requests set status = 'approved', txid = v_txid, reviewed_at = now(), reviewed_by = v_admin
+  where id = v_request.id returning * into v_request;
+  update public.transactions
+  set status = 'completed', description = description || coalesce(' · TXID ' || left(v_txid, 12) || '…', '')
+  where withdrawal_request_id = v_request.id and status = 'pending';
+  update public.notifications set read_at = now()
+  where kind = 'withdrawal_submitted' and read_at is null and (data->>'withdrawalId')::bigint = v_request.id;
+  perform igw_private.audit(v_admin, 'withdrawal_approved', 'withdrawal_request', v_request.reference,
+    jsonb_build_object('withdrawalId', v_request.id, 'accountNumber', v_request.account_number, 'amountUsd', v_request.amount_usd,
+                       'btcAddress', v_request.btc_address, 'txid', v_txid));
+  perform igw_private.notify(v_request.user_id, 'withdrawal_approved', 'Withdrawal approved',
+    format('Your withdrawal of %s USD has been approved and sent to %s (ref. %s).', v_request.amount_usd, v_request.btc_address, v_request.reference),
+    jsonb_build_object('withdrawalId', v_request.id, 'reference', v_request.reference, 'txid', v_txid));
+  return jsonb_build_object('ok', true, 'withdrawal', igw_private.admin_withdrawal_row(v_request));
+end;
+$$;
+
+-- Rejection gives the reserved amount back to the member's balance.
+create or replace function public.igw_admin_withdrawal_reject(p_token text, p_id bigint, p_reason text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_reason text := left(trim(coalesce(p_reason, '')), 500);
+  v_request public.withdrawal_requests%rowtype;
+begin
+  if length(v_reason) < 3 then
+    raise exception 'Enter a reason for the rejection (sent to the member).';
+  end if;
+  select * into v_request from public.withdrawal_requests where id = p_id for update;
+  if not found then
+    raise exception 'Withdrawal request not found.';
+  end if;
+  if v_request.status <> 'pending' then
+    raise exception 'Only pending withdrawals can be rejected (status: %).', v_request.status;
+  end if;
+  update public.wallets set balance = balance + v_request.amount_usd where user_id = v_request.user_id and currency = 'USD';
+  update public.transactions set status = 'failed', description = description || ' · rejected'
+  where withdrawal_request_id = v_request.id and status = 'pending';
+  update public.withdrawal_requests set status = 'rejected', rejection_reason = v_reason, reviewed_at = now(), reviewed_by = v_admin
+  where id = v_request.id returning * into v_request;
+  update public.notifications set read_at = now()
+  where kind = 'withdrawal_submitted' and read_at is null and (data->>'withdrawalId')::bigint = v_request.id;
+  perform igw_private.audit(v_admin, 'withdrawal_rejected', 'withdrawal_request', v_request.reference,
+    jsonb_build_object('withdrawalId', v_request.id, 'accountNumber', v_request.account_number, 'amountUsd', v_request.amount_usd,
+                       'reason', v_reason));
+  perform igw_private.notify(v_request.user_id, 'withdrawal_rejected', 'Withdrawal rejected',
+    format('Your withdrawal request was rejected. Reason: %s. %s USD has been returned to your balance (ref. %s).',
+           v_reason, v_request.amount_usd, v_request.reference),
+    jsonb_build_object('withdrawalId', v_request.id, 'reference', v_request.reference, 'reason', v_reason));
+  return jsonb_build_object('ok', true, 'withdrawal', igw_private.admin_withdrawal_row(v_request));
+end;
+$$;
+
+create or replace function public.igw_admin_card_requests(p_token text, p_status text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+begin
+  return coalesce((
+    select jsonb_agg(igw_private.card_request_json(r) || jsonb_build_object(
+             'currentCard', (select igw_private.card_json(c) from public.member_cards c where c.user_id = r.user_id),
+             'email', (select email from public.profiles where id = r.user_id),
+             'balance', (select balance from public.wallets x where x.user_id = r.user_id and x.currency = 'USD'),
+             'reviewedBy', (select coalesce(username, full_name) from public.profiles where id = r.reviewed_by))
+           order by (r.status = 'pending') desc, r.created_at desc, r.id desc)
+    from (select * from public.card_requests where p_status is null or status = p_status
+          order by (status = 'pending') desc, created_at desc, id desc limit 300) r
+  ), '[]'::jsonb);
+end;
+$$;
+
+create or replace function public.igw_admin_card_request_decide(p_token text, p_id bigint, p_approve boolean, p_reason text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_request public.card_requests%rowtype;
+  v_card public.member_cards%rowtype;
+  v_reason text := left(trim(coalesce(p_reason, '')), 500);
+begin
+  select * into v_request from public.card_requests where id = p_id for update;
+  if not found then
+    raise exception 'Card request not found.';
+  end if;
+  if v_request.status <> 'pending' then
+    raise exception 'This card request has already been decided (status: %).', v_request.status;
+  end if;
+  update public.notifications set read_at = now()
+  where kind = 'card_requested' and read_at is null and (data->>'cardRequestId')::bigint = v_request.id;
+  if coalesce(p_approve, false) then
+    v_card := igw_private.activate_card(v_admin, v_request.user_id, v_request.tier);
+    update public.card_requests set status = 'approved', reviewed_at = now(), reviewed_by = v_admin
+    where id = v_request.id returning * into v_request;
+    perform igw_private.audit(v_admin, 'card_activated', 'member_card', v_request.account_number,
+      jsonb_build_object('tier', v_request.tier, 'requestReference', v_request.reference));
+    perform igw_private.notify(v_request.user_id, 'card_activated', 'Card activated',
+      format('Your %s card is active. Daily withdrawal limit: %s.', igw_private.card_tier_name(v_request.tier),
+             coalesce(igw_private.card_limit(v_request.tier)::text || ' USD', 'unlimited')),
+      jsonb_build_object('tier', v_request.tier));
+  else
+    if length(v_reason) < 3 then
+      raise exception 'Enter a reason for the rejection (sent to the member).';
+    end if;
+    update public.card_requests set status = 'rejected', rejection_reason = v_reason, reviewed_at = now(), reviewed_by = v_admin
+    where id = v_request.id returning * into v_request;
+    perform igw_private.audit(v_admin, 'card_request_rejected', 'card_request', v_request.reference,
+      jsonb_build_object('tier', v_request.tier, 'accountNumber', v_request.account_number, 'reason', v_reason));
+    perform igw_private.notify(v_request.user_id, 'card_request_rejected', 'Card request rejected',
+      format('Your %s card request was rejected. Reason: %s', igw_private.card_tier_name(v_request.tier), v_reason),
+      jsonb_build_object('tier', v_request.tier, 'reason', v_reason));
+  end if;
+  return jsonb_build_object('ok', true, 'request', igw_private.card_request_json(v_request));
+end;
+$$;
+
+-- All members that have a card (active or inactive).
+create or replace function public.igw_admin_cards(p_token text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+begin
+  return coalesce((
+    select jsonb_agg(igw_private.card_json(c) || jsonb_build_object(
+             'userName', p.full_name, 'email', p.email, 'accountNumber', p.account_number,
+             'usedLast24h', igw_private.withdrawn_last_24h(c.user_id))
+           order by (c.status = 'active') desc, c.updated_at desc)
+    from public.member_cards c join public.profiles p on p.id = c.user_id
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Admin activates, changes or deactivates a member's card directly (by account number).
+create or replace function public.igw_admin_set_card(
+  p_token text, p_account_number text, p_tier text, p_active boolean, p_reason text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_profile public.profiles%rowtype;
+  v_card public.member_cards%rowtype;
+  v_reason text := nullif(left(trim(coalesce(p_reason, '')), 500), '');
+begin
+  select * into v_profile from public.profiles where account_number = regexp_replace(coalesce(p_account_number, ''), '\s', '', 'g');
+  if not found then
+    raise exception 'No member with this account number.';
+  end if;
+  if coalesce(p_active, false) then
+    if p_tier is null or p_tier not in ('standard', 'gold', 'premium', 'merchant') then
+      raise exception 'Choose a card: Standard, Gold, Premium or Merchant.';
+    end if;
+    v_card := igw_private.activate_card(v_admin, v_profile.id, p_tier);
+    -- A pending request is settled by this decision.
+    update public.card_requests set status = 'approved', reviewed_at = now(), reviewed_by = v_admin
+    where user_id = v_profile.id and status = 'pending' and tier = p_tier;
+    perform igw_private.audit(v_admin, 'card_activated', 'member_card', v_profile.account_number, jsonb_build_object('tier', p_tier));
+    perform igw_private.notify(v_profile.id, 'card_activated', 'Card activated',
+      format('Your %s card is active. Daily withdrawal limit: %s.', igw_private.card_tier_name(p_tier),
+             coalesce(igw_private.card_limit(p_tier)::text || ' USD', 'unlimited')),
+      jsonb_build_object('tier', p_tier));
+  else
+    update public.member_cards
+    set status = 'inactive', deactivated_at = now(), deactivated_by = v_admin, deactivation_reason = v_reason, updated_at = now()
+    where user_id = v_profile.id and status = 'active'
+    returning * into v_card;
+    if not found then
+      raise exception 'This member has no active card.';
+    end if;
+    perform igw_private.audit(v_admin, 'card_deactivated', 'member_card', v_profile.account_number,
+      jsonb_build_object('tier', v_card.tier, 'reason', v_reason));
+    perform igw_private.notify(v_profile.id, 'card_deactivated', 'Card deactivated',
+      format('Your %s card has been deactivated.%s', igw_private.card_tier_name(v_card.tier), coalesce(' Reason: ' || v_reason, '')),
+      jsonb_build_object('tier', v_card.tier, 'reason', v_reason));
+  end if;
+  return jsonb_build_object('ok', true, 'card', igw_private.card_json(v_card),
+                            'member', jsonb_build_object('name', v_profile.full_name, 'accountNumber', v_profile.account_number));
+end;
+$$;
+
+-- Look up a member by account number (admin "Cards" page).
+create or replace function public.igw_admin_member_lookup(p_token text, p_account_number text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_profile public.profiles%rowtype;
+begin
+  select * into v_profile from public.profiles where account_number = regexp_replace(coalesce(p_account_number, ''), '\s', '', 'g');
+  if not found then
+    raise exception 'No member with this account number.';
+  end if;
+  return jsonb_build_object(
+    'name', v_profile.full_name, 'email', v_profile.email, 'accountNumber', v_profile.account_number,
+    'balance', (select balance from public.wallets where user_id = v_profile.id and currency = 'USD'),
+    'card', (select igw_private.card_json(c) from public.member_cards c where c.user_id = v_profile.id),
+    'usedLast24h', igw_private.withdrawn_last_24h(v_profile.id)
+  );
+end;
+$$;
+
 revoke all on all functions in schema igw_private from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -2143,13 +2831,25 @@ declare
     'public.igw_admin_set_method_enabled(text, text, boolean)',
     'public.igw_admin_set_deposit_address(text, text, text)',
     'public.igw_admin_poll(text)',
+    'public.igw_withdrawal_center(text)',
+    'public.igw_card_request(text, text, text)',
+    'public.igw_card_request_cancel(text, bigint)',
+    'public.igw_withdrawal_create(text, numeric, text)',
+    'public.igw_withdrawal_cancel(text, bigint)',
+    'public.igw_admin_withdrawals(text, text)',
+    'public.igw_admin_withdrawal_approve(text, bigint, text)',
+    'public.igw_admin_withdrawal_reject(text, bigint, text)',
+    'public.igw_admin_card_requests(text, text)',
+    'public.igw_admin_card_request_decide(text, bigint, boolean, text)',
+    'public.igw_admin_cards(text)',
+    'public.igw_admin_set_card(text, text, text, boolean, text)',
+    'public.igw_admin_member_lookup(text, text)',
+    'public.igw_admin_approve(text, bigint, numeric)',
     'public.igw_admin_transactions(text, integer)'
   ];
-  -- Trusted inputs (BTC price, blockchain verification, deposit address):
-  -- callable only with the secret service role key held by the server.
+  -- Trusted input (BTC price): callable only with the secret service role key held by the server.
   service_functions text[] := array[
     'public.igw_deposit_create(text, text, numeric, numeric, text)',
-    'public.igw_admin_approve(text, bigint, jsonb, boolean)',
     'public.igw_service_ping()'
   ];
 begin

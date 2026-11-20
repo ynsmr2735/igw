@@ -7,7 +7,7 @@
 export type PaymentMethod = "btc" | "usdt_trc20";
 
 /** Database version this code needs (public.igw_health()). Run supabase/schema.sql if it differs. */
-export const EXPECTED_SCHEMA = "igw-rpc-7";
+export const EXPECTED_SCHEMA = "igw-rpc-9";
 
 export const PAYMENT_METHODS: PaymentMethod[] = ["btc", "usdt_trc20"];
 
@@ -19,7 +19,7 @@ export type MethodInfo = {
   network: "mainnet" | "tron";
   networkLabel: string;
   decimals: number;
-  /** Smallest unit name, used in verification details. */
+  /** Smallest unit name. */
   unit: string;
   explorerName: string;
   explorerTx: (txid: string) => string;
@@ -76,7 +76,6 @@ export type MethodConfig = {
   address: string | null;
   addressUpdatedAt: string | null;
   addressUpdatedBy: string | null;
-  requiredConfirmations: number;
   decimals: number;
 };
 
@@ -93,63 +92,6 @@ export function toMethodConfig(raw: Record<string, unknown>): MethodConfig {
     address: (raw.address as string | null) ?? null,
     addressUpdatedAt: (raw.addressUpdatedAt as string | null) ?? null,
     addressUpdatedBy: (raw.addressUpdatedBy as string | null) ?? null,
-    requiredConfirmations: Number(raw.requiredConfirmations ?? 0),
     decimals: info.decimals,
   };
 }
-
-export type VerificationCheck = { label: string; ok: boolean; detail: string; advisory?: boolean; key?: "amount" };
-
-/** True when every required (non-advisory) check passed. */
-export const requiredChecksPass = (checks: VerificationCheck[]) => checks.filter((c) => !c.advisory).every((c) => c.ok);
-
-/**
- * The payment is REAL (found, right network/address/token, enough confirmations) and only
- * the amount differs from the request. The admin may then approve the amount received.
- */
-export const realPaymentExceptAmount = (checks: VerificationCheck[], paidUnits: number) =>
-  paidUnits > 0 && checks.filter((c) => !c.advisory && c.key !== "amount").every((c) => c.ok);
-
-/** USD credited for a received amount (rounded DOWN to cents; same formula as the database). */
-export function creditForUnits(method: PaymentMethod, units: number, usdRate: number): number {
-  return method === "usdt_trc20" ? Math.floor(units / 10000) / 100 : Math.floor((units * usdRate) / 1e6) / 100;
-}
-
-export function formatUnits(method: PaymentMethod, units: number): string {
-  return method === "usdt_trc20" ? (Math.floor(units / 10000) / 100).toFixed(2) : (units / 1e8).toFixed(8);
-}
-
-/** Result of a blockchain check (BTC or USDT TRC20). Stored with approved requests. */
-export type VerificationSource = {
-  source: string;
-  reachable: boolean;
-  found: boolean;
-  paidUnits: number;
-  confirmed: boolean;
-  blockHeight: number | null;
-  blockTime: string | null;
-  confirmations: number;
-  /** Why the source could not answer (HTTP status, timeout). */
-  error?: string;
-};
-
-export type DepositVerification = {
-  method: PaymentMethod;
-  network: "mainnet" | "tron";
-  txid: string;
-  address: string;
-  /** USDT only: the TRC20 token contract the transfer came from. */
-  contract?: string;
-  expectedUnits: number;
-  paidUnits: number;
-  confirmations: number;
-  requiredConfirmations: number;
-  /** All REQUIRED checks passed. Only then can an admin approve; nothing is ever approved automatically. */
-  matched: boolean;
-  /** Real payment, only the amount differs (admin may approve the amount received). */
-  matchedExceptAmount: boolean;
-  /** advisory: shown to the admin as a warning, does not block approval. */
-  checks: VerificationCheck[];
-  sources: VerificationSource[];
-  checkedAt: string;
-};

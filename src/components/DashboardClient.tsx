@@ -25,6 +25,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
+import WithdrawSection from "@/components/WithdrawSection";
 import { signOutAction } from "@/app/auth/actions";
 import {
   DEPOSIT_STATUS_LABEL,
@@ -52,6 +53,7 @@ const navItems: { id: string; label: string; icon: LucideIcon }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
   { id: "deposit", label: "Deposit", icon: Download },
   { id: "transfer", label: "Transfer", icon: Send },
+  { id: "withdraw", label: "Withdraw", icon: ArrowUpRight },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "profile", label: "Profile", icon: User },
@@ -113,7 +115,7 @@ function TransactionItem({ tx }: { tx: Transaction }) {
 
 /* ---------------------------------------------------------------------------------------------- */
 
-function MethodWarning({ method, amountCrypto, confirmations }: { method: PaymentMethod; amountCrypto: string; confirmations: number }) {
+function MethodWarning({ method, amountCrypto }: { method: PaymentMethod; amountCrypto: string }) {
   if (method === "usdt_trc20") {
     return (
       <div className="space-y-3">
@@ -134,7 +136,7 @@ function MethodWarning({ method, amountCrypto, confirmations }: { method: Paymen
         <ul className="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] leading-5 text-amber-900">
           <li>• Send <b>exactly {amountCrypto} USDT</b>. The cents are a unique identifier of your request. If your exchange deducts a withdrawal fee, add it so that exactly this amount arrives.</li>
           <li>• In your wallet or exchange choose the network <b>TRON (TRC20)</b>.</li>
-          <li>• Your balance is credited after {confirmations} TRON confirmations and an admin review.</li>
+          <li>• Your balance is credited after an admin has checked and approved your payment.</li>
         </ul>
       </div>
     );
@@ -143,7 +145,7 @@ function MethodWarning({ method, amountCrypto, confirmations }: { method: Paymen
     <ul className="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] leading-5 text-amber-900">
       <li>• Send <b>exactly {amountCrypto} BTC</b>. Pay the network fee on top; if your exchange deducts a withdrawal fee from the amount, add it so that exactly this amount arrives.</li>
       <li>• Use the <b>Bitcoin network (Mainnet)</b> only. Payments on other networks (Lightning, BEP20, testnet…) cannot be recovered.</li>
-      <li>• Your balance is credited after {confirmations} network confirmations and an admin review.</li>
+      <li>• Your balance is credited after an admin has checked and approved your payment.</li>
     </ul>
   );
 }
@@ -169,7 +171,6 @@ function DepositSection({
   const method: PaymentMethod = open?.method ?? chosen;
   const info = METHOD_INFO[method];
   const methodConfig = config.methods.find((m) => m.method === method);
-  const confirmations = methodConfig?.requiredConfirmations ?? 0;
 
   async function run(body: Record<string, unknown>, success: string) {
     setBusy(true);
@@ -376,7 +377,7 @@ function DepositSection({
               </div>
             </div>
 
-            <MethodWarning method={method} amountCrypto={open.amountCrypto} confirmations={confirmations} />
+            <MethodWarning method={method} amountCrypto={open.amountCrypto} />
             <p className="text-[12px] text-slate-600">
               Reference: <span className="font-mono">{open.reference}</span> · created {formatDate(open.createdAt)}. After paying, enter the
               transaction ID and press <b>I&apos;ve paid</b>. The request stays open until then (or until you cancel it).
@@ -428,8 +429,8 @@ function DepositSection({
             <div className="min-w-0">
               <p className="text-[14px] font-black">Your payment request has been received. Awaiting admin review.</p>
               <p className="mt-1 text-[12px] leading-5 text-slate-600">
-                An admin checks your payment on the {method === "usdt_trc20" ? "TRON blockchain" : "Bitcoin blockchain"} and decides
-                manually. Your balance changes only after the admin approves it; you will get a notification either way.
+                An admin checks your payment and decides manually. Your balance changes only after the admin approves it;
+                you will get a notification either way.
               </p>
               <p className="mt-2"><Badge tone="purple">Status: Pending review</Badge></p>
               <dl className="mt-3 grid gap-x-6 gap-y-1 text-[12px] sm:grid-cols-2">
@@ -854,8 +855,8 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
                 <button onClick={() => goTo("transfer")} className="rounded-xl bg-white/15 px-4 py-2.5 text-[12px] font-bold text-white backdrop-blur transition hover:bg-white/25">
                   Transfer
                 </button>
-                <button disabled title="Withdrawals are coming soon" className="cursor-not-allowed rounded-xl bg-white/10 px-4 py-2.5 text-[12px] font-bold text-white/50">
-                  Withdraw · soon
+                <button onClick={() => goTo("withdraw")} className="rounded-xl bg-white/15 px-4 py-2.5 text-[12px] font-bold text-white backdrop-blur transition hover:bg-white/25">
+                  Withdraw
                 </button>
               </div>
             </div>
@@ -876,6 +877,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
 
           <DepositSection data={data} onChanged={refresh} notify={setToast} />
           <TransferSection data={data} onChanged={refresh} notify={setToast} />
+          <WithdrawSection center={data.withdrawalCenter} balance={data.wallet.balance} onChanged={refresh} notify={setToast} />
 
           <div className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
             <Card id="transactions">

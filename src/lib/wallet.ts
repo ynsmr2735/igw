@@ -1,5 +1,6 @@
 import { getSessionToken } from "@/lib/auth/session";
 import { getBtcUsdPrice } from "@/lib/btc/price";
+import { toWithdrawalCenter, type WithdrawalCenter } from "@/lib/cards";
 import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import { AuthError, RpcError, rpc, serviceRpc } from "@/lib/supabase";
 import { assertSchema } from "@/lib/system";
@@ -94,6 +95,8 @@ export type DashboardData = {
   deposits: Deposit[];
   openDeposit: Deposit | null;
   depositConfig: DepositConfig;
+  /** Card + crypto withdrawals. */
+  withdrawalCenter: WithdrawalCenter;
   stats: { moneyIn: number; moneyOut: number };
 };
 
@@ -188,6 +191,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       maxUsd: num(config.maxUsd),
       quoteMinutes: num(config.quoteMinutes),
     },
+    withdrawalCenter: toWithdrawalCenter(data.withdrawalCenter as Record<string, unknown>),
     stats: { moneyIn: num(flows.moneyIn), moneyOut: num(flows.moneyOut) },
   };
 }

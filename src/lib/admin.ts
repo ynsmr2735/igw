@@ -1,30 +1,28 @@
 import { getSessionToken } from "@/lib/auth/session";
 import { validateBitcoinAddress } from "@/lib/btc/address";
-import { verifyBtcDeposit } from "@/lib/btc/chain";
 import {
-  creditForUnits,
-  formatUnits,
-  toMethodConfig,
-  type DepositVerification,
-  type MethodConfig,
-  type PaymentMethod,
-} from "@/lib/payment-methods";
-import { AuthError, RpcError, SetupError, rpc, serviceRpc } from "@/lib/supabase";
+  toCard,
+  toCardRequest,
+  toWithdrawal,
+  type CardRequest,
+  type CardTier,
+  type MemberCard,
+  type Withdrawal,
+} from "@/lib/cards";
+import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
+import { AuthError, RpcError, SetupError, rpc } from "@/lib/supabase";
 import { assertSchema } from "@/lib/system";
 import { USDT_TRC20_CONTRACT, validateTronAddress } from "@/lib/tron/address";
-import { verifyUsdtTrc20Deposit } from "@/lib/tron/chain";
 import { toDeposit, toTransaction, type Deposit, type Notification, type Transaction } from "@/lib/wallet";
 
 /** Every function here is re-checked in the database against admin_roles. */
 
 export type AdminDeposit = Deposit & {
-  verification: DepositVerification | null;
   reviewedBy: string | null;
   user: { id: string; name: string; email: string; accountNumber: string; balance: number; memberSince: string };
 };
 
 export type AdminDepositDetail = AdminDeposit & {
-  requiredConfirmations: number;
   userTransactions: Transaction[];
 };
 
@@ -38,6 +36,9 @@ export type AdminOverview = {
     awaitingPayment: number;
     approved: number;
     rejected: number;
+    withdrawalsPending: number;
+    cardRequestsPending: number;
+    activeCards: number;
     users: number;
     totalBalance: number;
   };
@@ -76,7 +77,6 @@ function toAdminDeposit(raw: Record<string, unknown>): AdminDeposit {
   const user = raw.user as Record<string, unknown>;
   return {
     ...toDeposit(raw),
-    verification: (raw.verification as DepositVerification | null) ?? null,
     reviewedBy: (raw.reviewedBy as string | null) ?? null,
     user: { ...(user as AdminDeposit["user"]), balance: Number(user?.balance ?? 0) },
   };
@@ -131,112 +131,32 @@ export async function listDeposits(status: string | null): Promise<AdminDeposit[
 export async function getDeposit(id: number): Promise<AdminDepositDetail> {
   const raw = await rpc<Record<string, unknown>>("igw_admin_deposit", { p_token: await token(), p_id: id });
   if (typeof raw.depositAddress !== "string" || !raw.method) {
-    // Never verify against an empty address because the database answered in an old format.
+    // The database answered in an old format: say so instead of showing wrong data.
     throw new SetupError("The database is on an older version. Run the whole supabase/schema.sql in the Supabase SQL Editor, then reload.");
   }
   return {
     ...toAdminDeposit(raw),
-    requiredConfirmations: Number(raw.requiredConfirmations),
     userTransactions: ((raw.userTransactions as Record<string, unknown>[]) ?? []).map(toTransaction),
   };
 }
 
 /**
- * Checks the request's TXID on the blockchain of ITS payment method (Bitcoin
- * mainnet or TRON mainnet + official USDT contract). Read-only, changes nothing.
- * Always uses the address stored with the request, not the current setting.
- */
-export async function checkDepositOnChain(id: number): Promise<DepositVerification> {
-  const deposit = await getDeposit(id);
-  if (!deposit.txid) throw new RpcError("The user has not submitted a transaction ID yet.");
-  const input = {
-    txid: deposit.txid,
-    address: deposit.depositAddress,
-    amountUnits: deposit.amountUnits,
-    createdAt: deposit.createdAt,
-    expiresAt: deposit.expiresAt,
-  };
-  return deposit.method === "usdt_trc20"
-    ? verifyUsdtTrc20Deposit(input, deposit.requiredConfirmations)
-    : verifyBtcDeposit(input, deposit.requiredConfirmations);
-}
-
-/**
- * Approves only after a fresh blockchain check done here on the server; the
- * browser cannot supply or skip the verification. The database credits the
- * balance once, atomically, and refuses a second approval.
- */
-export type AmountMismatch = {
-  method: PaymentMethod;
-  requestedUsd: number;
-  creditUsd: number;
-  expectedCrypto: string;
-  receivedCrypto: string;
-  asset: string;
-};
-
-/** Approval refused; carries the blockchain result so the admin sees exactly why. */
-export class ApprovalError extends RpcError {
-  constructor(
-    message: string,
-    public verification: DepositVerification,
-    public mismatch: AmountMismatch | null = null,
-  ) {
-    super(message);
-  }
-}
-
-/**
- * Manual approval by the admin. The server checks the transaction on the request's
- * blockchain at that moment (the browser cannot supply or skip this) and the database
- * credits the balance once, atomically. A real payment whose amount differs from the
- * request is credited only if the admin explicitly accepts the amount received.
- * A payment that cannot be found on the blockchain is never credited; the request
- * then stays pending (nothing is rejected automatically).
+ * Manual approval: the admin's decision completes the payment. There is no
+ * blockchain check. The database (admin session required) credits the balance once,
+ * atomically, completes the transaction, notifies the member and writes the audit log.
+ * creditUsd: optional lower amount actually received (default: the requested amount).
  */
 export async function approveDeposit(
   id: number,
-  options: { acceptReceived?: boolean } = {},
-): Promise<{ deposit: AdminDeposit; verification: DepositVerification; creditedUsd: number }> {
+  creditUsd: number | null = null,
+): Promise<{ deposit: AdminDeposit; creditedUsd: number }> {
   await assertSchema();
-  const deposit = await getDeposit(id);
-  const verification = await checkDepositOnChain(id);
-  let acceptReceived = false;
-  if (!verification.matched) {
-    if (verification.matchedExceptAmount) {
-      const mismatch: AmountMismatch = {
-        method: deposit.method,
-        requestedUsd: deposit.amountUsd,
-        creditUsd: creditForUnits(deposit.method, verification.paidUnits, deposit.usdRate),
-        expectedCrypto: deposit.amountCrypto,
-        receivedCrypto: formatUnits(deposit.method, verification.paidUnits),
-        asset: deposit.asset,
-      };
-      if (!options.acceptReceived) {
-        throw new ApprovalError(
-          `The payment was found on the blockchain, but the amount differs: expected ${mismatch.expectedCrypto} ${mismatch.asset}, ` +
-            `received ${mismatch.receivedCrypto} ${mismatch.asset}. Approve the amount received (${mismatch.creditUsd.toFixed(2)} USD) or reject.`,
-          verification,
-          mismatch,
-        );
-      }
-      acceptReceived = true;
-    } else {
-      // The request stays PENDING: nothing is rejected automatically. The admin can retry later or reject.
-      const failed = verification.checks.filter((c) => !c.ok && !c.advisory).map((c) => `${c.label}: ${c.detail}`).join(" · ");
-      throw new ApprovalError(
-        `Not approved — payment not verified on the blockchain. ${failed}. The request stays pending; the balance was not changed.`,
-        verification,
-      );
-    }
-  }
-  const result = await serviceRpc<{ deposit: Record<string, unknown>; creditedUsd: number }>("igw_admin_approve", {
+  const result = await rpc<{ deposit: Record<string, unknown>; creditedUsd: number }>("igw_admin_approve", {
     p_token: await token(),
     p_id: id,
-    p_verification: verification,
-    p_accept_received: acceptReceived,
+    p_credit_usd: creditUsd,
   });
-  return { deposit: toAdminDeposit(result.deposit), verification, creditedUsd: Number(result.creditedUsd) };
+  return { deposit: toAdminDeposit(result.deposit), creditedUsd: Number(result.creditedUsd) };
 }
 
 export async function rejectDeposit(id: number, reason: string): Promise<AdminDeposit> {
@@ -306,6 +226,10 @@ export type AdminPoll = {
   unreadCount: number;
   latestRequestNotificationId: number | null;
   newRequests: { notificationId: number; requestId: number; reference: string; method: PaymentMethod; amountUsd: number; userName: string }[];
+  withdrawalsPending: number;
+  cardRequestsPending: number;
+  /** Unseen withdrawal requests and card requests (for the sound alert and highlighting). */
+  newOther: { notificationId: number; kind: "withdrawal_submitted" | "card_requested"; id: number; reference: string; amountUsd: number | null; tier: string | null; userName: string }[];
 };
 
 /** Light check every few seconds from the admin panel (sound alert, counters). */
@@ -325,9 +249,118 @@ export async function pollAdmin(): Promise<AdminPoll> {
       amountUsd: Number(n.amountUsd ?? 0),
       userName: String(n.userName ?? ""),
     })),
+    withdrawalsPending: Number(raw.withdrawalsPending ?? 0),
+    cardRequestsPending: Number(raw.cardRequestsPending ?? 0),
+    newOther: ((raw.newOther as Record<string, unknown>[]) ?? []).map((n) => ({
+      notificationId: Number(n.notificationId),
+      kind: n.kind === "card_requested" ? "card_requested" : "withdrawal_submitted",
+      id: Number(n.id),
+      reference: String(n.reference ?? ""),
+      amountUsd: n.amountUsd == null ? null : Number(n.amountUsd),
+      tier: (n.tier as string | null) ?? null,
+      userName: String(n.userName ?? ""),
+    })),
   };
 }
 
 export async function markAdminNotificationsRead(ids: number[] | null): Promise<void> {
   await rpc("igw_notifications_read", { p_token: await token(), p_ids: ids });
+}
+
+/* ---------------- cards and withdrawals (admin) ---------------- */
+
+export type AdminWithdrawal = Withdrawal & { user: { id: string; name: string; email: string; accountNumber: string; balance: number } };
+export type AdminCardRequest = CardRequest & { currentCard: MemberCard | null; email: string; balance: number; reviewedBy: string | null };
+export type AdminCard = MemberCard & { userName: string; email: string; accountNumber: string; usedLast24h: number };
+export type MemberLookup = { name: string; email: string; accountNumber: string; balance: number; card: MemberCard | null; usedLast24h: number };
+
+const WITHDRAWAL_STATUSES = ["pending", "approved", "rejected", "cancelled"];
+
+function toAdminWithdrawal(raw: Record<string, unknown>): AdminWithdrawal {
+  const user = (raw.user ?? {}) as Record<string, unknown>;
+  return { ...toWithdrawal(raw), user: { ...(user as AdminWithdrawal["user"]), balance: Number(user.balance ?? 0) } };
+}
+
+export async function listWithdrawals(status: string | null): Promise<AdminWithdrawal[]> {
+  const rows = await rpc<Record<string, unknown>[]>("igw_admin_withdrawals", {
+    p_token: await token(),
+    p_status: status && WITHDRAWAL_STATUSES.includes(status) ? status : null,
+  });
+  return (rows ?? []).map(toAdminWithdrawal);
+}
+
+/** Admin marks a withdrawal as sent (after sending the BTC from the company wallet). TXID optional. */
+export async function approveWithdrawal(id: number, txid: string | null): Promise<AdminWithdrawal> {
+  await assertSchema();
+  const clean = txid?.trim().toLowerCase() || null;
+  if (clean && !/^[0-9a-f]{64}$/.test(clean)) throw new RpcError("The transaction ID (TXID) must be 64 hexadecimal characters (or leave it empty).");
+  const result = await rpc<{ withdrawal: Record<string, unknown> }>("igw_admin_withdrawal_approve", { p_token: await token(), p_id: id, p_txid: clean });
+  return toAdminWithdrawal(result.withdrawal);
+}
+
+/** Rejection returns the amount to the member's balance. */
+export async function rejectWithdrawal(id: number, reason: string): Promise<AdminWithdrawal> {
+  const result = await rpc<{ withdrawal: Record<string, unknown> }>("igw_admin_withdrawal_reject", { p_token: await token(), p_id: id, p_reason: reason });
+  return toAdminWithdrawal(result.withdrawal);
+}
+
+export async function listCardRequests(status: string | null): Promise<AdminCardRequest[]> {
+  const rows = await rpc<Record<string, unknown>[]>("igw_admin_card_requests", {
+    p_token: await token(),
+    p_status: status && ["pending", "approved", "rejected", "cancelled"].includes(status) ? status : null,
+  });
+  return (rows ?? []).map((r) => ({
+    ...toCardRequest(r)!,
+    currentCard: toCard(r.currentCard),
+    email: String(r.email ?? ""),
+    balance: Number(r.balance ?? 0),
+    reviewedBy: (r.reviewedBy as string | null) ?? null,
+  }));
+}
+
+export async function decideCardRequest(id: number, approve: boolean, reason: string | null): Promise<CardRequest> {
+  await assertSchema();
+  const result = await rpc<{ request: Record<string, unknown> }>("igw_admin_card_request_decide", {
+    p_token: await token(),
+    p_id: id,
+    p_approve: approve,
+    p_reason: reason,
+  });
+  return toCardRequest(result.request)!;
+}
+
+export async function listCards(): Promise<AdminCard[]> {
+  const rows = await rpc<Record<string, unknown>[]>("igw_admin_cards", { p_token: await token() });
+  return (rows ?? []).map((r) => ({
+    ...toCard(r)!,
+    userName: String(r.userName ?? ""),
+    email: String(r.email ?? ""),
+    accountNumber: String(r.accountNumber ?? ""),
+    usedLast24h: Number(r.usedLast24h ?? 0),
+  }));
+}
+
+/** Activate / change tier (active = true) or deactivate (active = false) a member's card. */
+export async function setCard(accountNumber: string, tier: CardTier | null, active: boolean, reason: string | null): Promise<MemberCard | null> {
+  await assertSchema();
+  const result = await rpc<{ card: unknown }>("igw_admin_set_card", {
+    p_token: await token(),
+    p_account_number: accountNumber,
+    p_tier: tier,
+    p_active: active,
+    p_reason: reason,
+  });
+  return toCard(result.card);
+}
+
+export async function lookupMember(accountNumber: string): Promise<MemberLookup> {
+  const raw = await rpc<Record<string, unknown>>("igw_admin_member_lookup", { p_token: await token(), p_account_number: accountNumber });
+  return {
+    name: String(raw.name ?? ""),
+    email: String(raw.email ?? ""),
+    accountNumber: String(raw.accountNumber ?? ""),
+    balance: Number(raw.balance ?? 0),
+    card: toCard(raw.card),
+    usedLast24h: Number(raw.usedLast24h ?? 0),
+  };
 }

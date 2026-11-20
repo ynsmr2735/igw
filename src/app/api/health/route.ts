@@ -21,10 +21,8 @@ export async function GET() {
       schema: result?.schema ?? "unknown",
       expectedSchema: EXPECTED_SCHEMA,
       schemaOk: result?.schema === EXPECTED_SCHEMA,
-      // Needed for deposits and admin approvals.
+      // Needed to create deposit requests (server-side BTC price).
       serviceKey: serviceKey ? "configured" : "missing: set SUPABASE_SERVICE_ROLE_KEY",
-      // Optional: higher TronGrid rate limit for USDT TRC20 checks.
-      trongridApiKey: process.env.TRONGRID_API_KEY?.trim() ? "configured" : "not set (public rate limit)",
     });
   } catch (error) {
     const detail = error instanceof SetupError ? error.message : "Supabase check failed";

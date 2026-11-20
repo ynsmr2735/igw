@@ -4,6 +4,8 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeftRight,
+  ArrowUpRight,
+  CreditCard,
   Bell,
   CheckCircle2,
   Clock,
@@ -14,7 +16,6 @@ import {
   Loader2,
   LogOut,
   Menu,
-  Search,
   Settings,
   ShieldCheck,
   Wallet,
@@ -23,8 +24,9 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
+import { AdminCardsView, AdminWithdrawalsView } from "@/components/AdminCardsWithdrawals";
 import { signOutAction } from "@/app/auth/actions";
-import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AmountMismatch, AuditEntry } from "@/lib/admin";
+import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AuditEntry } from "@/lib/admin";
 import {
   isBlocked,
   loadLastSeen,
@@ -36,7 +38,7 @@ import {
   type SoundSettings,
 } from "@/lib/admin-sound";
 import type { StatusItem } from "@/lib/system";
-import { METHOD_INFO, methodInfo, type DepositVerification, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
+import { METHOD_INFO, methodInfo, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import {
   DEPOSIT_STATUS_LABEL,
   TX_STATUS_LABEL,
@@ -48,11 +50,13 @@ import {
 } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, ToastView, postJson, type Toast } from "@/components/wallet-ui";
 
-type View = "notifications" | "deposits" | "transactions" | "settings" | "audit";
+type View = "notifications" | "deposits" | "withdrawals" | "cards" | "transactions" | "settings" | "audit";
 
 const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "deposits", label: "Payment requests", icon: Inbox },
+  { id: "withdrawals", label: "Withdrawals", icon: ArrowUpRight },
+  { id: "cards", label: "Cards", icon: CreditCard },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
   { id: "settings", label: "Payment methods", icon: Settings },
   { id: "audit", label: "Audit log", icon: History },
@@ -82,6 +86,11 @@ const AUDIT_LABEL: Record<string, string> = {
   btc_deposits_enabled: "BTC payments enabled",
   btc_deposits_disabled: "BTC payments disabled",
   deposit_approved: "Payment approved",
+  withdrawal_approved: "Withdrawal sent",
+  withdrawal_rejected: "Withdrawal rejected",
+  card_activated: "Card activated",
+  card_deactivated: "Card deactivated",
+  card_request_rejected: "Card request rejected",
   deposit_rejected: "Payment rejected",
 };
 
@@ -97,6 +106,16 @@ function auditSummary(entry: AuditEntry): string {
       return methodName(d.method);
     case "deposit_approved":
       return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · ${String(d.confirmations)} conf.`;
+    case "withdrawal_approved":
+      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} → ${String(d.btcAddress)}${d.txid ? ` · TXID ${String(d.txid).slice(0, 12)}…` : ""}`;
+    case "withdrawal_rejected":
+      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
+    case "card_activated":
+      return `account ${entry.targetId} · ${String(d.tier)}`;
+    case "card_deactivated":
+      return `account ${entry.targetId} · ${String(d.tier)}${d.reason ? ` · reason: ${String(d.reason)}` : ""}`;
+    case "card_request_rejected":
+      return `${entry.targetId} · account ${String(d.accountNumber)} · ${String(d.tier)} · reason: ${String(d.reason)}`;
     case "deposit_rejected":
       return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
     default:
@@ -126,7 +145,6 @@ function DepositRow({
   const [error, setError] = useState<string | null>(null);
   const pending = deposit.status === "reviewing";
   const info = METHOD_INFO[deposit.method];
-  const [rowMismatch, setRowMismatch] = useState(false);
 
   async function run(body: Record<string, unknown>, success: string) {
     setBusy(true);
@@ -138,7 +156,6 @@ function DepositRow({
       await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed.");
-      setRowMismatch(Boolean((err as { data?: { mismatch?: unknown } }).data?.mismatch));
     } finally {
       setBusy(false);
     }
@@ -216,9 +233,8 @@ function DepositRow({
         <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
           <p className="font-bold text-emerald-900">
             Approve {formatMoney(deposit.amountUsd)} ({deposit.amountCrypto} {deposit.asset}) for {deposit.userName ?? deposit.user.name},
-            account {formatAccountNumber(deposit.user.accountNumber)}? The transaction is verified on the{" "}
-            {deposit.method === "usdt_trc20" ? "TRON blockchain (official USDT TRC20 contract)" : "Bitcoin blockchain"} first
-            (address, exact amount, confirmations, TXID not used before); the balance changes only if every check passes.
+            account {formatAccountNumber(deposit.user.accountNumber)}? Check that the payment arrived in your wallet first:
+            your approval completes the payment and credits the balance immediately.
           </p>
           <div className="mt-2 flex flex-wrap gap-2">
             <button
@@ -227,7 +243,7 @@ function DepositRow({
               className={`${button} h-10 bg-emerald-600 text-white hover:bg-emerald-700`}
             >
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-              Verify &amp; approve
+              Yes, approve
             </button>
             <button onClick={() => { setMode("none"); setError(null); }} disabled={busy} className={`${button} h-10 border border-slate-200 bg-white text-slate-700`}>
               Cancel
@@ -265,18 +281,14 @@ function DepositRow({
 
       {deposit.rejectionReason && <p className="mt-2 text-rose-600">Reason: {deposit.rejectionReason}</p>}
       {deposit.status === "approved" && deposit.creditedUsd != null && deposit.creditedUsd !== deposit.amountUsd && (
-        <p className="mt-2 font-bold text-amber-700">Credited {formatMoney(deposit.creditedUsd)} (amount received on-chain)</p>
+        <p className="mt-2 font-bold text-amber-700">Credited {formatMoney(deposit.creditedUsd)} (amount entered by the admin)</p>
       )}
       {error && (
         <p role="alert" className="mt-2 rounded-xl border border-rose-200 bg-white px-3 py-2 font-semibold text-rose-600">
           {error}
         </p>
       )}
-      {rowMismatch && pending && (
-        <button onClick={onOpen} className={`${button} mt-2 h-10 bg-amber-600 text-white hover:bg-amber-700`}>
-          Open details to approve the received amount
-        </button>
-      )}
+
     </li>
   );
 }
@@ -290,37 +302,6 @@ const admin = <T,>(body: Record<string, unknown>) => postJson<T>("/api/admin", b
 
 /* ---------------------------------------------------------------------------------------------- */
 
-function VerificationView({ verification }: { verification: DepositVerification }) {
-  const info = methodInfo(verification.method);
-  return (
-    <div className={`rounded-2xl border p-4 ${verification.matched ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50"}`} data-testid="verification">
-      <p className={`text-[13px] font-black ${verification.matched ? "text-emerald-800" : "text-rose-700"}`}>
-        {verification.matched
-          ? `Payment verified on the ${verification.method === "usdt_trc20" ? "TRON" : "Bitcoin"} blockchain`
-          : "Payment NOT verified"}
-      </p>
-      <ul className="mt-3 space-y-2 text-[12px]">
-        {verification.checks.map((check) => (
-          <li key={check.label} className="flex items-start gap-2">
-            {check.ok ? (
-              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-            ) : check.advisory ? (
-              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
-            ) : (
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
-            )}
-            <span className="min-w-0">
-              <span className="font-bold">{check.label}{!check.ok && check.advisory ? " (warning — does not block approval)" : ""}</span>
-              <span className="block break-all text-slate-600">{check.detail}</span>
-            </span>
-          </li>
-        ))}
-      </ul>
-      <p className="mt-3 text-[11px] text-slate-500">Checked {formatDate(verification.checkedAt)} · {info.networkLabel}</p>
-    </div>
-  );
-}
-
 function DepositDetail({
   id,
   onClose,
@@ -333,11 +314,9 @@ function DepositDetail({
   notify: (toast: Toast) => void;
 }) {
   const [deposit, setDeposit] = useState<AdminDepositDetail | null>(null);
-  const [verification, setVerification] = useState<DepositVerification | null>(null);
-  const [busy, setBusy] = useState<"verify" | "approve" | "reject" | null>(null);
+  const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
   const [confirmApprove, setConfirmApprove] = useState(false);
-  const [mismatch, setMismatch] = useState<AmountMismatch | null>(null);
-  const [ownershipChecked, setOwnershipChecked] = useState(false);
+  const [creditAmount, setCreditAmount] = useState("");
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -350,36 +329,22 @@ function DepositDetail({
     load().catch((err) => setError(err instanceof Error ? err.message : "Could not load the request."));
   }, [load]);
 
-  async function verify() {
-    setBusy("verify");
-    setError(null);
-    try {
-      const response = await admin<{ verification: DepositVerification }>({ action: "verify", id });
-      setVerification(response.verification);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Verification failed.");
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function approve(acceptReceived = false) {
+  async function approve() {
+    if (!deposit) return;
     setBusy("approve");
     setError(null);
     try {
-      const response = await admin<{ creditedUsd: number; verification: DepositVerification }>({ action: "approve", id, acceptReceived });
-      setVerification(response.verification);
-      setMismatch(null);
+      const credit = creditAmount.trim();
+      const response = await admin<{ creditedUsd: number }>({
+        action: "approve",
+        id,
+        ...(credit && Number(credit) !== deposit.amountUsd ? { creditUsd: credit } : {}),
+      });
       notify({ type: "ok", message: `Payment approved: ${formatMoney(response.creditedUsd)} added to the member's balance.` });
       await Promise.all([load(), onChanged()]);
       setConfirmApprove(false);
     } catch (err) {
-      const data = (err as { data?: { verification?: DepositVerification; mismatch?: AmountMismatch | null } }).data;
-      if (data?.verification) setVerification(data.verification);
-      setMismatch(data?.mismatch ?? null);
-      setOwnershipChecked(false);
-      // An amount mismatch is explained in its own box; other failures show the real reason.
-      setError(data?.mismatch ? null : err instanceof Error ? err.message : "Approval failed.");
+      setError(err instanceof Error ? err.message : "Approval failed.");
     } finally {
       setBusy(null);
     }
@@ -435,7 +400,8 @@ function DepositDetail({
                 <div><dt className="text-[11px] text-slate-500">Reference</dt><dd className="font-mono font-bold">{deposit.reference}</dd></div>
                 <div><dt className="text-[11px] text-slate-500">Payment method</dt><dd className="font-bold" data-testid="detail-method">{info.name}</dd></div>
                 <div><dt className="text-[11px] text-slate-500">Network</dt><dd className="font-bold">{info.networkLabel}</dd></div>
-                <div><dt className="text-[11px] text-slate-500">Amount (credited)</dt><dd className="font-black text-[#7F00FF]">{formatMoney(deposit.amountUsd)}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Requested amount</dt><dd className="font-black text-[#7F00FF]">{formatMoney(deposit.amountUsd)}</dd></div>
+                {deposit.creditedUsd != null && <div><dt className="text-[11px] text-slate-500">Credited</dt><dd className="font-black text-emerald-700">{formatMoney(deposit.creditedUsd)}</dd></div>}
                 <div>
                   <dt className="text-[11px] text-slate-500">Expected {info.asset}</dt>
                   <dd className="font-mono font-bold">
@@ -446,7 +412,7 @@ function DepositDetail({
                 <div><dt className="text-[11px] text-slate-500">Rate</dt><dd className="font-bold">{formatMoney(deposit.usdRate)} / {info.asset} · {deposit.rateSource}</dd></div>
                 <div className="sm:col-span-2"><dt className="text-[11px] text-slate-500">Deposit address of this request ({info.networkLabel})</dt><dd className="break-all font-mono text-[12px] font-bold">{deposit.depositAddress}</dd></div>
                 <div><dt className="text-[11px] text-slate-500">Created</dt><dd>{formatDate(deposit.createdAt)}</dd></div>
-                <div><dt className="text-[11px] text-slate-500">Quote valid until</dt><dd>{formatDate(deposit.expiresAt)}</dd></div>
+                
                 {deposit.submittedAt && <div><dt className="text-[11px] text-slate-500">&quot;I&apos;ve paid&quot; at</dt><dd>{formatDate(deposit.submittedAt)}</dd></div>}
                 {deposit.reviewedAt && <div><dt className="text-[11px] text-slate-500">Reviewed</dt><dd>{formatDate(deposit.reviewedAt)}{deposit.reviewedBy ? ` by ${deposit.reviewedBy}` : ""}</dd></div>}
                 <div className="sm:col-span-2">
@@ -457,7 +423,7 @@ function DepositDetail({
                         <code className="min-w-0 flex-1 break-all text-[12px] font-bold">{deposit.txid}</code>
                         <CopyButton value={deposit.txid} label="Copy" />
                         <a href={info.explorerTx(deposit.txid)} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-[12px] font-bold text-[#7F00FF] hover:underline">
-                          {info.explorerName} <ExternalLink className="h-3.5 w-3.5" />
+                          View on {info.explorerName} <ExternalLink className="h-3.5 w-3.5" />
                         </a>
                       </>
                     ) : (
@@ -469,39 +435,15 @@ function DepositDetail({
               </dl>
             </Card>
 
-            {deposit.txid && (
-              <Card>
-                <div className="flex flex-wrap items-center gap-3">
-                  <p className="text-[13px] font-black">Blockchain check</p>
-                  <button onClick={verify} disabled={busy !== null} className={`${button} ml-auto border border-slate-200 bg-white text-slate-700 hover:text-[#7F00FF]`}>
-                    {busy === "verify" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-                    Check TXID on blockchain
-                  </button>
-                </div>
-                <p className="mt-2 text-[11px] text-slate-500">
-                  {deposit.method === "usdt_trc20"
-                    ? "Reads TRON mainnet via TronGrid (full + solidity node). Requires a successful transfer of the official USDT TRC20 contract, the exact amount to the address above, solidification and at least "
-                    : "Reads mempool.space and blockstream.info. Requires the exact amount to the address above and at least "}
-                  {deposit.requiredConfirmations} confirmations.
-                </p>
-                <div className="mt-3">
-                  {verification ? (
-                    <VerificationView verification={verification} />
-                  ) : deposit.verification ? (
-                    <VerificationView verification={deposit.verification} />
-                  ) : null}
-                </div>
-              </Card>
-            )}
 
             {(reviewable || rejectable) && (
               <Card>
                 <p className="text-[13px] font-black">Decision</p>
                 {reviewable && (
                   <div className="mt-3">
-                    {mismatch ? null : !confirmApprove ? (
+                    {!confirmApprove ? (
                       <button
-                        onClick={() => { setConfirmApprove(true); setMismatch(null); setError(null); }}
+                        onClick={() => { setConfirmApprove(true); setCreditAmount(deposit.amountUsd.toFixed(2)); setError(null); }}
                         disabled={busy !== null}
                         className={`${button} w-full bg-emerald-600 text-white hover:bg-emerald-700`}
                       >
@@ -510,59 +452,40 @@ function DepositDetail({
                     ) : (
                       <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                         <p className="text-[13px] font-bold text-emerald-900">
-                          Credit {formatMoney(deposit.amountUsd)} to {deposit.user.name} ({formatAccountNumber(deposit.user.accountNumber)})?
+                          Approve this payment for {deposit.user.name} ({formatAccountNumber(deposit.user.accountNumber)})?
                         </p>
                         <dl className="mt-2 grid gap-x-4 gap-y-1 text-[12px] text-emerald-900 sm:grid-cols-2" data-testid="approve-summary">
                           <div><dt className="inline opacity-70">Method: </dt><dd className="inline font-bold">{info.name}</dd></div>
                           <div><dt className="inline opacity-70">Amount: </dt><dd className="inline font-bold">{deposit.amountCrypto} {info.asset} = {formatMoney(deposit.amountUsd)}</dd></div>
+                          <div className="sm:col-span-2 break-all"><dt className="inline opacity-70">To: </dt><dd className="inline font-mono">{deposit.depositAddress}</dd></div>
                           <div className="sm:col-span-2 break-all"><dt className="inline opacity-70">TXID: </dt><dd className="inline font-mono">{deposit.txid}</dd></div>
                         </dl>
-                        <p className="mt-2 text-[12px] text-emerald-900">
-                          Your decision. The transaction is checked on the blockchain at this moment; the balance changes only if
-                          the payment is found. If it is not found, the request stays pending and you see the exact reason.
+                        <label htmlFor="credit-amount" className="mt-3 block text-[11px] font-bold uppercase tracking-wide text-emerald-900">
+                          Amount to credit (USD)
+                        </label>
+                        <input
+                          id="credit-amount"
+                          inputMode="decimal"
+                          value={creditAmount}
+                          onChange={(event) => setCreditAmount(event.target.value.replace(",", "."))}
+                          className={`${inputClass} mt-1 font-mono`}
+                        />
+                        <p className="mt-1 text-[11px] text-emerald-900/80">
+                          Normally the requested amount. Enter less if less arrived (e.g. the exchange deducted a fee); more than requested is not possible.
+                        </p>
+                        <p className="mt-2 rounded-xl bg-white/70 p-2.5 text-[12px] font-semibold text-emerald-900">
+                          There is no automatic blockchain check: check in your own wallet{deposit.txid ? <> (or on <a href={info.explorerTx(deposit.txid)} target="_blank" rel="noreferrer noopener" className="underline">{info.explorerName}</a>)</> : null} that the
+                          payment arrived. Your approval completes the payment and credits the balance immediately.
                         </p>
                         <div className="mt-3 flex flex-wrap gap-2">
-                          <button onClick={() => approve(false)} disabled={busy !== null} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
+                          <button onClick={approve} disabled={busy !== null || !(Number(creditAmount) > 0)} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
                             {busy === "approve" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                            Yes, approve
+                            Yes, approve {Number(creditAmount) > 0 ? formatMoney(Number(creditAmount)) : ""}
                           </button>
                           <button onClick={() => setConfirmApprove(false)} disabled={busy !== null} className={`${button} border border-slate-200 bg-white text-slate-700`}>
                             Cancel
                           </button>
                         </div>
-                      </div>
-                    )}
-                    {mismatch && (
-                      <div className="mt-3 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-[12px] text-amber-900" data-testid="amount-mismatch">
-                        <p className="text-[13px] font-black">Payment found — but the amount differs</p>
-                        <dl className="mt-2 grid gap-x-4 gap-y-1 sm:grid-cols-2">
-                          <div><dt className="inline opacity-70">Requested: </dt><dd className="inline font-bold">{mismatch.expectedCrypto} {mismatch.asset} ({formatMoney(mismatch.requestedUsd)})</dd></div>
-                          <div><dt className="inline opacity-70">Received on-chain: </dt><dd className="inline font-bold">{mismatch.receivedCrypto} {mismatch.asset}</dd></div>
-                        </dl>
-                        <p className="mt-2">
-                          Common cause: the sender&apos;s exchange deducted a withdrawal fee. You can credit the amount that actually
-                          arrived ({formatMoney(mismatch.creditUsd)}). Make sure this payment belongs to this member (e.g. ask for a
-                          screenshot of the withdrawal) — a payment that exactly matches another member&apos;s request is refused.
-                        </p>
-                        <label className="mt-2 flex items-start gap-2 font-bold">
-                          <input type="checkbox" checked={ownershipChecked} onChange={(event) => setOwnershipChecked(event.target.checked)} className="mt-0.5 h-4 w-4" />
-                          I checked that this payment belongs to {deposit.user.name}.
-                        </label>
-                        <button
-                          onClick={() => approve(true)}
-                          disabled={busy !== null || !ownershipChecked}
-                          className={`${button} mt-3 w-full bg-amber-600 text-white hover:bg-amber-700`}
-                        >
-                          {busy === "approve" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                          Approve received amount ({formatMoney(mismatch.creditUsd)})
-                        </button>
-                        <button
-                          onClick={() => { setMismatch(null); setConfirmApprove(false); }}
-                          disabled={busy !== null}
-                          className={`${button} mt-2 w-full border border-slate-200 bg-white text-slate-700`}
-                        >
-                          Cancel
-                        </button>
                       </div>
                     )}
                   </div>
@@ -743,10 +666,6 @@ function PaymentMethodCard({
             New payment requests and the QR code use the new address immediately; requests already created keep the address they were shown.
           </p>
         </div>
-        <dl className="grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-2">
-          <div><dt className="text-[11px] text-slate-500">Confirmations required</dt><dd className="font-bold">{config.requiredConfirmations}</dd></div>
-          <div><dt className="text-[11px] text-slate-500">Verification</dt><dd className="font-bold">{config.method === "usdt_trc20" ? "TronGrid · USDT contract TR7NHq…Lj6t" : "mempool.space + blockstream.info"}</dd></div>
-        </dl>
       </div>
     </Card>
   );
@@ -755,7 +674,6 @@ function PaymentMethodCard({
 /** Setup status (database version, server keys). Problems here are why payments cannot work. */
 function StatusPanel({ status, onRecheck, full }: { status: StatusItem[]; onRecheck: () => Promise<void>; full?: boolean }) {
   const [busy, setBusy] = useState(false);
-  const [chain, setChain] = useState<{ btc: { ok: boolean; detail: string }; tron: { ok: boolean; detail: string } } | null>(null);
   const problems = status.filter((s) => !s.ok && s.required);
   const items = full ? status : problems;
   if (!full && problems.length === 0) return null;
@@ -764,16 +682,6 @@ function StatusPanel({ status, onRecheck, full }: { status: StatusItem[]; onRech
     setBusy(true);
     try {
       await onRecheck();
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function testChain() {
-    setBusy(true);
-    try {
-      setChain(await admin<{ btc: { ok: boolean; detail: string }; tron: { ok: boolean; detail: string } }>({ action: "testChain" }));
-    } catch (err) {
-      setChain({ btc: { ok: false, detail: err instanceof Error ? err.message : "failed" }, tron: { ok: false, detail: "" } });
     } finally {
       setBusy(false);
     }
@@ -792,11 +700,6 @@ function StatusPanel({ status, onRecheck, full }: { status: StatusItem[]; onRech
         <button onClick={recheck} disabled={busy} className="ml-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-bold text-slate-600">
           {busy ? "Checking…" : "Check again"}
         </button>
-        {full && (
-          <button onClick={testChain} disabled={busy} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-bold text-slate-600">
-            Test blockchain connections
-          </button>
-        )}
       </div>
       <ul className="mt-2 space-y-1.5">
         {items.map((s) => (
@@ -813,19 +716,6 @@ function StatusPanel({ status, onRecheck, full }: { status: StatusItem[]; onRech
             </span>
           </li>
         ))}
-        {chain &&
-          [
-            ["Bitcoin explorers", chain.btc],
-            ["TronGrid (USDT TRC20)", chain.tron],
-          ].map(([label, r]) => {
-            const result = r as { ok: boolean; detail: string };
-            return (
-              <li key={String(label)} className="flex items-start gap-2" data-testid="chain-test">
-                {result.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />}
-                <span className="min-w-0 [overflow-wrap:anywhere]"><b>{String(label)}</b> — {result.detail}</span>
-              </li>
-            );
-          })}
       </ul>
     </div>
   );
@@ -916,6 +806,10 @@ export default function AdminClient({
           .map((n) => [Number(n.data.requestId), n.id] as [number, number]),
       ),
   );
+  // withdrawalId / cardRequestId -> notificationId of requests this admin has not seen yet
+  const [newWithdrawals, setNewWithdrawals] = useState<Map<number, number>>(new Map());
+  const [newCardRequests, setNewCardRequests] = useState<Map<number, number>>(new Map());
+  const [reloadKey, setReloadKey] = useState(0);
   const [sound, setSound] = useState<SoundSettings>({ enabled: true, volume: 0.7 });
   const [audioBlocked, setAudioBlocked] = useState(false);
   const soundRef = useRef(sound);
@@ -972,10 +866,20 @@ export default function AdminClient({
   const poll = useCallback(async () => {
     const { poll: p } = await admin<{ poll: AdminPoll }>({ action: "poll" });
     setNewRequests(new Map(p.newRequests.map((n) => [n.requestId, n.notificationId] as [number, number])));
+    setNewWithdrawals(new Map(p.newOther.filter((n) => n.kind === "withdrawal_submitted").map((n) => [n.id, n.notificationId] as [number, number])));
+    setNewCardRequests(new Map(p.newOther.filter((n) => n.kind === "card_requested").map((n) => [n.id, n.notificationId] as [number, number])));
     setOverview((o) => ({
       ...o,
       unreadCount: p.unreadCount,
-      counts: { ...o.counts, reviewing: p.reviewing, approved: p.approved, rejected: p.rejected, new: p.newRequests.length },
+      counts: {
+        ...o.counts,
+        reviewing: p.reviewing,
+        approved: p.approved,
+        rejected: p.rejected,
+        new: p.newRequests.length,
+        withdrawalsPending: p.withdrawalsPending,
+        cardRequestsPending: p.cardRequestsPending,
+      },
     }));
     const latest = p.latestRequestNotificationId ?? 0;
     const stored = loadLastSeen();
@@ -990,14 +894,22 @@ export default function AdminClient({
       lastSeenRef.current = latest;
       saveLastSeen(latest);
       const fresh = p.newRequests.filter((n) => n.notificationId > seen);
+      const freshOther = p.newOther.filter((n) => n.notificationId > seen);
       if (soundRef.current.enabled && !playChime(soundRef.current.volume)) setAudioBlocked(true);
       const last = fresh[fresh.length - 1];
+      const lastOther = freshOther[freshOther.length - 1];
+      const deposit = last && (!lastOther || last.notificationId > lastOther.notificationId);
       setToast({
         type: "ok",
-        message: last
+        message: deposit
           ? `New payment request: ${last.userName} · ${formatMoney(last.amountUsd)} · ${methodInfo(last.method).short}`
-          : "New payment request",
+          : lastOther?.kind === "withdrawal_submitted"
+            ? `New withdrawal request: ${lastOther.userName} · ${formatMoney(lastOther.amountUsd ?? 0)}`
+            : lastOther
+              ? `New card request: ${lastOther.userName} · ${lastOther.tier ? lastOther.tier[0].toUpperCase() + lastOther.tier.slice(1) : ""} card`
+              : "New request",
       });
+      setReloadKey((k) => k + 1);
       await refresh();
     } else {
       lastSeenRef.current = seen;
@@ -1087,7 +999,12 @@ export default function AdminClient({
           </p>
           {navItems.map((item) => {
             const Icon = item.icon;
-            const count = item.id === "notifications" ? overview.unreadCount : item.id === "deposits" ? overview.counts.reviewing : 0;
+            const count =
+              item.id === "notifications" ? overview.unreadCount
+              : item.id === "deposits" ? overview.counts.reviewing
+              : item.id === "withdrawals" ? overview.counts.withdrawalsPending ?? 0
+              : item.id === "cards" ? overview.counts.cardRequestsPending ?? 0
+              : 0;
             return (
               <button
                 key={item.id}
@@ -1148,12 +1065,14 @@ export default function AdminClient({
               Sound alerts are blocked by the browser until you interact with the page. Click here to enable them.
             </button>
           )}
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
             {[
               ["New payments", overview.counts.new, "new", "text-amber-600"],
               ["Pending payments", overview.counts.reviewing, "pending", "text-[#7F00FF]"],
               ["Approved payments", overview.counts.approved, "approved", "text-emerald-600"],
               ["Rejected payments", overview.counts.rejected, "rejected", "text-rose-600"],
+              ["Pending withdrawals", overview.counts.withdrawalsPending ?? 0, "withdrawals", "text-rose-600"],
+              ["Card requests", overview.counts.cardRequestsPending ?? 0, "card-requests", "text-[#7F00FF]"],
               ["Members", overview.counts.users, "members", ""],
             ].map(([label, value, key, tone]) => (
               <div key={String(key)} className="rounded-2xl border border-slate-100 bg-white p-4 igw-shadow-soft" data-testid={`count-${key}`}>
@@ -1231,7 +1150,7 @@ export default function AdminClient({
               </div>
               <p className="mb-3 text-[11px] text-slate-500">
                 Every request is decided manually: nothing is approved or rejected automatically, and requests never expire.
-                Approval is possible only after the payment is verified on its blockchain.
+                There is no automatic blockchain check: check your wallet, then APPROVE (credits the balance) or REJECT.
               </p>
               <div className="-mx-1 mb-2 flex gap-2 overflow-x-auto px-1 pb-1" role="group" aria-label="Payment method filter">
                 {METHOD_FILTERS.map((f) => (
@@ -1328,6 +1247,21 @@ export default function AdminClient({
               </Card>
             </div>
           )}
+
+          {view === "withdrawals" && (
+            <AdminWithdrawalsView
+              reloadKey={reloadKey}
+              newIds={newWithdrawals}
+              onSeen={async (notificationId) => {
+                setNewWithdrawals((m) => new Map([...m].filter(([, n]) => n !== notificationId)));
+                try { await admin({ action: "readNotifications", ids: [notificationId] }); } catch { /* not critical */ }
+              }}
+              onChanged={refresh}
+              notify={setToast}
+            />
+          )}
+
+          {view === "cards" && <AdminCardsView reloadKey={reloadKey} newIds={newCardRequests} onChanged={refresh} notify={setToast} />}
 
           {view === "audit" && (
             <Card>

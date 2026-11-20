@@ -57,7 +57,7 @@ export async function getSystemStatus(): Promise<StatusItem[]> {
       label: "SUPABASE_SERVICE_ROLE_KEY",
       ok: false,
       required: true,
-      detail: "Not set. Needed to create deposit requests and to APPROVE payments. Add it in Vercel → Settings → Environment Variables (no NEXT_PUBLIC_ prefix) and redeploy.",
+      detail: "Not set. Needed so members can create deposit requests (server-side BTC price). Add it in Vercel → Settings → Environment Variables (no NEXT_PUBLIC_ prefix) and redeploy.",
     });
   } else {
     try {
@@ -74,15 +74,5 @@ export async function getSystemStatus(): Promise<StatusItem[]> {
     }
   }
 
-  const tron = Boolean(process.env.TRONGRID_API_KEY?.trim());
-  items.push({
-    key: "trongrid",
-    label: "TRONGRID_API_KEY",
-    ok: tron,
-    required: false,
-    detail: tron
-      ? "Set (sent to TronGrid as TRON-PRO-API-KEY)."
-      : "Not set. TronGrid may rate-limit or reject USDT TRC20 checks without a key (free at trongrid.io).",
-  });
   return items;
 }
