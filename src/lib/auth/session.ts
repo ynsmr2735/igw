@@ -17,6 +17,10 @@ export type SessionUser = {
   name: string;
   email: string;
   plan: string;
+  username: string | null;
+  accountNumber: string;
+  /** From public.admin_roles in the database, never from the username. */
+  isAdmin: boolean;
 };
 
 export async function getSessionToken(): Promise<string | null> {

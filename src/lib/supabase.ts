@@ -1,7 +1,11 @@
 /**
  * Minimal Supabase RPC client (PostgREST over fetch), used on the server only.
- * Only the public URL + anon/publishable key are needed. The anon key can call
- * the igw_* database functions and nothing else (see supabase/schema.sql).
+ *
+ * - Public anon/publishable key: may call the igw_* functions that check the
+ *   user's session themselves, and nothing else (see supabase/schema.sql).
+ * - Secret service role key (SUPABASE_SERVICE_ROLE_KEY, server-only, never
+ *   NEXT_PUBLIC_): required for functions that take trusted input from this
+ *   server: BTC price quotes, blockchain-verified approvals, deposit address.
  */
 
 /**
@@ -24,6 +28,9 @@ const SUPABASE_KEY = (
   ""
 ).trim();
 
+// Not NEXT_PUBLIC_: Next.js never sends this value to the browser.
+const SERVICE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY ?? "").trim();
+
 /** A configuration problem the site owner must fix (shown in the UI). */
 export class SetupError extends Error {
   constructor(message: string) {
@@ -40,6 +47,14 @@ export class AuthError extends Error {
   }
 }
 
+/** Signed in, but not allowed (e.g. a member opening an admin function): HTTP 403. */
+export class ForbiddenError extends Error {
+  constructor(message = "Admin access required") {
+    super(message);
+    this.name = "ForbiddenError";
+  }
+}
+
 /** A normal error raised by a database function, e.g. "Insufficient balance". */
 export class RpcError extends Error {
   constructor(message: string) {
@@ -52,7 +67,20 @@ export function isSupabaseConfigured(): boolean {
   return Boolean(SUPABASE_URL && SUPABASE_KEY);
 }
 
-export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Promise<T> {
+export function isServiceKeyConfigured(): boolean {
+  return Boolean(SERVICE_KEY);
+}
+
+/** Calls a function that only the service role may execute (trusted server input). */
+export function serviceRpc<T>(fn: string, args: Record<string, unknown> = {}): Promise<T> {
+  return rpc<T>(fn, args, { service: true });
+}
+
+export async function rpc<T>(
+  fn: string,
+  args: Record<string, unknown> = {},
+  options: { service?: boolean } = {},
+): Promise<T> {
   if (!SUPABASE_URL) throw new SetupError("NEXT_PUBLIC_SUPABASE_URL is not set.");
   if (!/^https?:\/\/[^/]+$/i.test(SUPABASE_URL) || /supabase\.com/i.test(SUPABASE_URL)) {
     throw new SetupError(
@@ -60,14 +88,20 @@ export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Pr
     );
   }
   if (!SUPABASE_KEY) throw new SetupError("NEXT_PUBLIC_SUPABASE_ANON_KEY is not set.");
+  if (options.service && !SERVICE_KEY) {
+    throw new SetupError(
+      "SUPABASE_SERVICE_ROLE_KEY is not set. Add the secret (service role) key from Supabase -> Project Settings -> API Keys to the server environment.",
+    );
+  }
 
+  const key = options.service ? SERVICE_KEY : SUPABASE_KEY;
   const headers: Record<string, string> = {
-    apikey: SUPABASE_KEY,
+    apikey: key,
     "Content-Type": "application/json",
     Accept: "application/json",
   };
-  // Legacy anon keys are JWTs and go in Authorization too; new sb_publishable_ keys do not.
-  if (SUPABASE_KEY.startsWith("eyJ")) headers.Authorization = `Bearer ${SUPABASE_KEY}`;
+  // Legacy keys are JWTs and go in Authorization too; new sb_publishable_/sb_secret_ keys do not.
+  if (key.startsWith("eyJ")) headers.Authorization = `Bearer ${key}`;
 
   let response: Response;
   try {
@@ -98,8 +132,9 @@ export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Pr
     hint?: string;
   };
 
-  // Raised on purpose by igw_wallet_action when the session is not valid.
+  // Raised on purpose by the database functions: not signed in / not an admin.
   if (info.code === "28000") throw new AuthError(info.message || undefined);
+  if (info.code === "PT403") throw new ForbiddenError(info.message || undefined);
 
   console.error(`Supabase RPC ${fn} failed (${response.status}):`, body);
 
@@ -109,7 +144,11 @@ export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Pr
     );
   }
   if (response.status === 401 || /api key|jwt/i.test(info.message ?? "")) {
-    throw new SetupError("NEXT_PUBLIC_SUPABASE_ANON_KEY is wrong or belongs to another project.");
+    throw new SetupError(
+      options.service
+        ? "SUPABASE_SERVICE_ROLE_KEY is wrong or belongs to another project."
+        : "NEXT_PUBLIC_SUPABASE_ANON_KEY is wrong or belongs to another project.",
+    );
   }
   if (info.code === "PGRST202") {
     throw new SetupError(
@@ -124,9 +163,13 @@ export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Pr
     );
   }
   if (info.code === "42501") {
-    throw new SetupError("Permission denied. Run the latest supabase/schema.sql in the Supabase SQL Editor.");
+    throw new SetupError(
+      options.service
+        ? "Permission denied for the service role. Run the latest supabase/schema.sql in the Supabase SQL Editor."
+        : "Permission denied. Run the latest supabase/schema.sql in the Supabase SQL Editor.",
+    );
   }
-  // Errors raised on purpose inside igw_wallet_action (P0001) carry a user-facing message.
+  // Errors raised on purpose by the database functions (P0001) carry a user-facing message.
   if (info.code === "P0001" && info.message) throw new RpcError(info.message);
   throw new Error(info.message ?? `Supabase request failed (${response.status})`);
 }

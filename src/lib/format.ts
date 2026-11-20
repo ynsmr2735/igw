@@ -1,22 +1,13 @@
-export const CURRENCIES: Record<
-  string,
-  { symbol: string; flag: string; label: string; usd: number }
-> = {
-  USD: { symbol: "$", flag: "🇺🇸", label: "Amerikan Doları", usd: 1 },
-  EUR: { symbol: "€", flag: "🇪🇺", label: "Euro", usd: 1.08 },
-  GBP: { symbol: "£", flag: "🇬🇧", label: "İngiliz Sterlini", usd: 1.27 },
-  TRY: { symbol: "₺", flag: "🇹🇷", label: "Türk Lirası", usd: 0.026 },
-};
+/**
+ * Formatting shared by the server and the browser.
+ * A fixed locale and time zone make server and client render identical text
+ * (otherwise React reports a hydration mismatch, error #418).
+ */
+export const DISPLAY_TIME_ZONE = "Europe/Istanbul";
 
-export function convert(amount: number, from: string, to: string): number {
-  const fromRate = CURRENCIES[from]?.usd ?? 1;
-  const toRate = CURRENCIES[to]?.usd ?? 1;
-  return Math.round(((amount * fromRate) / toRate) * 100) / 100;
-}
-
-export function formatMoney(amount: number, currency: string): string {
+export function formatMoney(amount: number, currency = "USD"): string {
   try {
-    return new Intl.NumberFormat("tr-TR", {
+    return new Intl.NumberFormat("en-US", {
       style: "currency",
       currency,
       minimumFractionDigits: 2,
@@ -27,16 +18,11 @@ export function formatMoney(amount: number, currency: string): string {
   }
 }
 
-/**
- * Fixed time zone so the server (UTC on Vercel) and the browser render the
- * same text; otherwise React reports a hydration mismatch (error #418).
- */
-export const DISPLAY_TIME_ZONE = "Europe/Istanbul";
-
 export function formatDate(value: string | Date): string {
-  return new Intl.DateTimeFormat("tr-TR", {
+  return new Intl.DateTimeFormat("en-GB", {
     day: "2-digit",
     month: "short",
+    year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
     timeZone: DISPLAY_TIME_ZONE,
@@ -45,9 +31,47 @@ export function formatDate(value: string | Date): string {
 
 export function initialsOf(name: string): string {
   return name
-    .split(" ")
+    .split(/\s+/)
+    .filter(Boolean)
     .map((part) => part[0])
     .join("")
     .slice(0, 2)
     .toUpperCase();
 }
+
+/** "12345678" -> "1234 5678" for reading; copy the raw value. */
+export function formatAccountNumber(value: string): string {
+  return /^\d{8}$/.test(value) ? `${value.slice(0, 4)} ${value.slice(4)}` : value;
+}
+
+export function shortHash(value: string, size = 10): string {
+  return value.length > size * 2 ? `${value.slice(0, size)}…${value.slice(-size)}` : value;
+}
+
+export const DEPOSIT_STATUS_LABEL: Record<string, string> = {
+  awaiting_payment: "Awaiting payment",
+  reviewing: "Under review",
+  approved: "Approved",
+  rejected: "Rejected",
+  expired: "Expired",
+  cancelled: "Cancelled",
+};
+
+export const TX_STATUS_LABEL: Record<string, string> = {
+  pending: "Pending",
+  completed: "Completed",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
+export const TX_TYPE_LABEL: Record<string, string> = {
+  deposit: "Deposit",
+  withdrawal: "Withdrawal",
+  transfer_out: "Money sent",
+  transfer_in: "Money received",
+  // Entries from the earlier demo version of the wallet.
+  topup: "Top up (legacy)",
+  withdraw: "Withdrawal (legacy)",
+  exchange: "Exchange (legacy)",
+  transfer: "Transfer (legacy)",
+};

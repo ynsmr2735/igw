@@ -1,4 +1,4 @@
-import { SetupError } from "@/lib/supabase";
+import { errorResponse } from "@/lib/api";
 import { getDashboardData } from "@/lib/wallet";
 
 export const dynamic = "force-dynamic";
@@ -9,8 +9,6 @@ export async function GET() {
     if (!data) return Response.json({ error: "You must be signed in" }, { status: 401 });
     return Response.json(data, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
-    console.error("Dashboard verisi alınamadı:", error);
-    const status = error instanceof SetupError ? 503 : 500;
-    return Response.json({ error: "Veriler yüklenemedi" }, { status });
+    return errorResponse(error, "Dashboard");
   }
 }

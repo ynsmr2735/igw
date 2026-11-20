@@ -4,13 +4,14 @@ import { NextResponse, type NextRequest } from "next/server";
 // well-formed token exists; the database verifies it on every request.
 const SESSION_COOKIE = "igw_session";
 const SESSION_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+const PROTECTED_API = ["/api/dashboard", "/api/deposits", "/api/transfers", "/api/notifications", "/api/admin"];
 
 export function proxy(request: NextRequest) {
   const path = request.nextUrl.pathname;
   const hasSession = SESSION_TOKEN_PATTERN.test(request.cookies.get(SESSION_COOKIE)?.value ?? "");
 
-  const isApi = path.startsWith("/api/dashboard") || path.startsWith("/api/transactions");
-  const isProtected = path.startsWith("/dashboard") || isApi;
+  const isApi = PROTECTED_API.some((prefix) => path.startsWith(prefix));
+  const isProtected = path.startsWith("/dashboard") || path.startsWith("/admin") || isApi;
 
   if (!hasSession && isApi) {
     return Response.json({ error: "You must be signed in" }, { status: 401 });
@@ -28,5 +29,13 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*", "/api/dashboard/:path*", "/api/transactions/:path*"],
+  matcher: [
+    "/dashboard/:path*",
+    "/admin/:path*",
+    "/api/dashboard/:path*",
+    "/api/deposits/:path*",
+    "/api/transfers/:path*",
+    "/api/notifications/:path*",
+    "/api/admin/:path*",
+  ],
 };

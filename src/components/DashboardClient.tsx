@@ -1,192 +1,574 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   ArrowDownLeft,
   ArrowLeftRight,
   ArrowUpRight,
   Bell,
-  Check,
+  Coins,
   CheckCircle2,
   ChevronRight,
-  Copy,
-  CreditCard,
+  Clock,
   Download,
-  Gift,
   Globe2,
-  HelpCircle,
-  Landmark,
   LayoutDashboard,
   Loader2,
-  LockKeyhole,
   LogOut,
   Menu,
-  Plus,
-  Repeat2,
-  Search,
   Send,
-  Settings,
   ShieldCheck,
-  Sparkles,
-  TrendingDown,
-  TrendingUp,
-  UnlockKeyhole,
-  Users,
+  User,
   Wallet,
   X,
-  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import { signOutAction } from "@/app/auth/actions";
-import { CURRENCIES, convert, formatDate, formatMoney } from "@/lib/format";
-import type { Card, DashboardData, Transaction } from "@/lib/wallet";
-
-type ActionKey = "send" | "topup" | "withdraw" | "exchange" | null;
-
-type FormState = {
-  recipientId: string;
-  walletId: string;
-  targetWalletId: string;
-  amount: string;
-  note: string;
-  method: string;
-};
-
-const emptyForm: FormState = {
-  recipientId: "",
-  walletId: "",
-  targetWalletId: "",
-  amount: "",
-  note: "",
-  method: "Bank card •••• 3910",
-};
+import {
+  DEPOSIT_STATUS_LABEL,
+  TX_STATUS_LABEL,
+  TX_TYPE_LABEL,
+  formatAccountNumber,
+  formatDate,
+  formatMoney,
+} from "@/lib/format";
+import type { DashboardData, Deposit, TransferResult, Transaction } from "@/lib/wallet";
+import {
+  Badge,
+  Card,
+  CopyButton,
+  Countdown,
+  QrCode,
+  STATUS_TONE,
+  SectionTitle,
+  ToastView,
+  postJson,
+  type Toast,
+} from "@/components/wallet-ui";
 
 const navItems: { id: string; label: string; icon: LucideIcon }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "wallets", label: "My Wallets", icon: Wallet },
+  { id: "deposit", label: "Deposit", icon: Download },
+  { id: "transfer", label: "Transfer", icon: Send },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
-  { id: "cards", label: "My Cards", icon: CreditCard },
-  { id: "recipients", label: "Recipients", icon: Users },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "profile", label: "Profile", icon: User },
 ];
 
-const txMeta: Record<
-  string,
-  { label: string; icon: LucideIcon; bg: string; color: string }
-> = {
-  transfer: { label: "Transfer", icon: ArrowUpRight, bg: "bg-purple-50", color: "text-[#7F00FF]" },
-  payment: { label: "Payment", icon: CreditCard, bg: "bg-cyan-50", color: "text-cyan-600" },
-  topup: { label: "Top up", icon: Plus, bg: "bg-emerald-50", color: "text-emerald-600" },
-  withdraw: { label: "Withdrawal", icon: Landmark, bg: "bg-amber-50", color: "text-amber-600" },
-  exchange: { label: "Exchange", icon: Repeat2, bg: "bg-blue-50", color: "text-blue-600" },
-  reward: { label: "Reward", icon: Gift, bg: "bg-pink-50", color: "text-pink-600" },
-};
+const inputClass =
+  "h-12 w-full rounded-xl border border-slate-200 bg-white px-4 text-base font-semibold text-slate-800 transition focus:border-purple-400 focus:outline-none focus:ring-2 focus:ring-purple-100 sm:text-[13px]";
+const primaryButton =
+  "igw-gradient inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-[13px] font-bold text-white shadow-[0_14px_30px_-12px_rgba(127,0,255,0.9)] transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:translate-y-0";
+const secondaryButton =
+  "inline-flex h-12 items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 text-[13px] font-bold text-slate-700 transition hover:border-purple-300 hover:text-[#7F00FF] disabled:opacity-50";
 
-const quickActions: { key: Exclude<ActionKey, null>; label: string; icon: LucideIcon; tone: string }[] = [
-  { key: "send", label: "Send Money", icon: Send, tone: "from-violet-500 to-purple-700" },
-  { key: "topup", label: "Top Up", icon: Plus, tone: "from-cyan-400 to-blue-600" },
-  { key: "withdraw", label: "Withdraw", icon: Download, tone: "from-emerald-400 to-teal-600" },
-  { key: "exchange", label: "Exchange", icon: Repeat2, tone: "from-amber-400 to-orange-600" },
-];
+function newRequestId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : "10000000-1000-4000-8000-100000000000".replace(/[018]/g, (c) =>
+        (Number(c) ^ (Math.random() * 16) >> (Number(c) / 4)).toString(16),
+      );
+}
 
-function TransactionRow({ item }: { item: Transaction }) {
-  const meta = txMeta[item.type] ?? txMeta.transfer;
-  const Icon = meta.icon;
+/* ---------------------------------------------------------------------------------------------- */
+
+function TransactionItem({ tx }: { tx: Transaction }) {
+  const incoming = tx.direction === "in";
   return (
-    <div className="flex items-center gap-3 border-b border-slate-50 px-4 py-3.5 transition last:border-0 hover:bg-slate-50/70 sm:px-5">
-      <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl ${meta.bg} ${meta.color}`}>
-        <Icon className="h-[18px] w-[18px]" />
+    <li className="flex items-start gap-3 border-b border-slate-50 px-1 py-3.5 last:border-0">
+      <span
+        className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl ${
+          incoming ? "bg-emerald-50 text-emerald-600" : "bg-purple-50 text-[#7F00FF]"
+        }`}
+      >
+        {incoming ? <ArrowDownLeft className="h-[18px] w-[18px]" /> : <ArrowUpRight className="h-[18px] w-[18px]" />}
       </span>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[13px] font-bold text-[#10152b]">{item.counterparty}</p>
-        <p className="mt-0.5 truncate text-[11px] text-slate-400">
-          {meta.label} · {formatDate(item.createdAt)}
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <p className="text-[13px] font-bold">{TX_TYPE_LABEL[tx.type] ?? tx.type}</p>
+          <Badge tone={STATUS_TONE[tx.status]}>{TX_STATUS_LABEL[tx.status] ?? tx.status}</Badge>
+        </div>
+        <p className="mt-1 break-words text-[12px] text-slate-500">{tx.description || tx.counterparty}</p>
+        <p className="mt-1 text-[11px] text-slate-400">
+          <span className="font-mono">{tx.reference}</span> · {formatDate(tx.createdAt)}
         </p>
       </div>
-      <div className="text-right">
-        <p className={`text-[13px] font-black ${item.direction === "in" ? "text-emerald-600" : "text-[#10152b]"}`}>
-          {item.direction === "in" ? "+" : "−"}
-          {formatMoney(item.amount, item.currency)}
-        </p>
-        <p className="mt-0.5 text-[10px] font-semibold text-slate-400">
-          {item.status === "completed" ? "Completed" : item.status}
-        </p>
-      </div>
-    </div>
+      <p
+        className={`shrink-0 text-right text-[13px] font-black ${
+          tx.status === "failed" || tx.status === "cancelled"
+            ? "text-slate-400 line-through"
+            : incoming
+              ? "text-emerald-600"
+              : "text-[#10152b]"
+        }`}
+      >
+        {incoming ? "+" : "−"}
+        {formatMoney(tx.amount, tx.currency)}
+      </p>
+    </li>
   );
 }
 
-function BankCard({ card, onToggle }: { card: Card; onToggle: (id: number) => void }) {
-  const theme =
-    card.theme === "midnight"
-      ? "bg-[#151a32]"
-      : card.theme === "cyan"
-        ? "bg-gradient-to-br from-cyan-500 to-blue-600"
-        : "igw-gradient";
+/* ---------------------------------------------------------------------------------------------- */
+
+function DepositSection({
+  data,
+  onChanged,
+  notify,
+}: {
+  data: DashboardData;
+  onChanged: () => Promise<void>;
+  notify: (toast: Toast) => void;
+}) {
+  const config = data.depositConfig;
+  const open = data.openDeposit;
+  const [amount, setAmount] = useState("");
+  const [txid, setTxid] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run(body: Record<string, unknown>, success: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await postJson("/api/deposits", body);
+      await onChanged();
+      notify({ type: "ok", message: success });
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createQuote(event: FormEvent) {
+    event.preventDefault();
+    if (await run({ action: "create", amountUsd: amount.trim() }, "Payment details created. Send the exact BTC amount.")) {
+      setAmount("");
+    }
+  }
+
+  async function submitPayment(event: FormEvent) {
+    event.preventDefault();
+    if (
+      open &&
+      (await run(
+        { action: "submit", requestId: open.id, txid: txid.trim() },
+        "Thank you! Your deposit will be reviewed by our team.",
+      ))
+    ) {
+      setTxid("");
+    }
+  }
+
+  const paymentUri = open ? `bitcoin:${open.btcAddress}?amount=${open.amountBtc}` : "";
 
   return (
-    <div className={`igw-card-shine relative overflow-hidden rounded-[24px] p-5 text-white shadow-[0_24px_50px_-24px_rgba(16,21,43,0.7)] ${theme}`}>
-      <div className="relative flex items-start justify-between">
-        <div>
-          <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-white/60">Insta Global Wallet</p>
-          <p className="mt-1 text-base font-black">{card.label}</p>
+    <Card id="deposit">
+      <SectionTitle
+        eyebrow="Add money"
+        title="Deposit with Bitcoin"
+        action={
+          <Badge tone="amber">
+            <Coins className="mr-1 h-3 w-3" /> Network: Bitcoin Mainnet (BTC)
+          </Badge>
+        }
+      />
+
+      {!config.btcAddress && !open && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800">
+          Bitcoin deposits are not available yet: the administrator has not configured a deposit address.
         </div>
-        <span className="text-xs font-black italic">{card.brand}</span>
-      </div>
-      <div className="relative mt-8 flex items-center gap-2">
-        <span className="h-6 w-8 rounded-full bg-yellow-300/90" />
-        <span className="-ml-4 h-6 w-8 rounded-full bg-white/70" />
-      </div>
-      <p className="relative mt-5 font-mono text-[15px] tracking-[0.18em]">•••• •••• •••• {card.last4}</p>
-      <div className="relative mt-4 flex items-end justify-between">
-        <div>
-          <p className="text-[9px] uppercase tracking-widest text-white/60">Son kullanma</p>
-          <p className="text-xs font-bold">{card.expiry}</p>
+      )}
+
+      {config.btcAddress && !open && (
+        <form onSubmit={createQuote} className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
+          <div>
+            <label htmlFor="deposit-amount" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
+              Amount to deposit (USD)
+            </label>
+            <div className="relative">
+              <span className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[13px] font-bold text-slate-400">$</span>
+              <input
+                id="deposit-amount"
+                inputMode="decimal"
+                autoComplete="off"
+                placeholder={`${config.minUsd} – ${config.maxUsd}`}
+                value={amount}
+                onChange={(event) => setAmount(event.target.value.replace(",", "."))}
+                className={`${inputClass} pl-8`}
+                required
+              />
+            </div>
+            <p className="mt-2 text-[11px] text-slate-500">
+              Min {formatMoney(config.minUsd)} · max {formatMoney(config.maxUsd)}. The BTC amount is calculated from the live
+              BTC/USD price and locked for {config.quoteMinutes} minutes.
+            </p>
+          </div>
+          <button type="submit" disabled={busy || !amount} className={primaryButton}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Coins className="h-4 w-4" />}
+            Get payment details
+          </button>
+        </form>
+      )}
+
+      {open?.status === "awaiting_payment" && (
+        <div className="grid gap-6 lg:grid-cols-[auto_1fr]">
+          <div className="flex flex-col items-center gap-3">
+            <div className="rounded-3xl border border-slate-100 p-3 shadow-sm">
+              <QrCode value={paymentUri} label="Bitcoin payment QR code" />
+            </div>
+            <p className="text-center text-[11px] text-slate-500">Scan with your Bitcoin wallet</p>
+          </div>
+
+          <div className="min-w-0 space-y-4">
+            <div className="rounded-2xl bg-[#10152b] p-4 text-white">
+              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-white/50">Send exactly</p>
+              <div className="mt-1 flex flex-wrap items-center gap-3">
+                <p className="break-all font-mono text-xl font-black sm:text-2xl" data-testid="btc-amount">
+                  {open.amountBtc} BTC
+                </p>
+                <CopyButton value={open.amountBtc} label="Copy amount" dark onCopied={(ok) => notify(ok ? { type: "ok", message: "Amount copied." } : { type: "error", message: "Could not copy." })} />
+              </div>
+              <p className="mt-1 text-[12px] text-white/60">
+                = {formatMoney(open.amountUsd)} at {formatMoney(open.btcUsdRate)} / BTC ({open.amountSats.toLocaleString("en-US")} sats)
+              </p>
+            </div>
+
+            <div>
+              <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">To this Bitcoin (Mainnet) address</p>
+              <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                <code className="min-w-0 flex-1 break-all text-[13px] font-bold text-slate-800" data-testid="btc-address">
+                  {open.btcAddress}
+                </code>
+                <CopyButton value={open.btcAddress} label="Copy address" onCopied={(ok) => notify(ok ? { type: "ok", message: "Address copied." } : { type: "error", message: "Could not copy." })} />
+              </div>
+            </div>
+
+            <ul className="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] leading-5 text-amber-900">
+              <li>• Send <b>exactly {open.amountBtc} BTC</b>. Pay the network fee on top; if your exchange deducts a withdrawal fee from the amount, add it so that exactly this amount arrives.</li>
+              <li>• Use the <b>Bitcoin network (Mainnet)</b> only. Payments on other networks (Lightning, BEP20, testnet…) cannot be recovered.</li>
+              <li>• Pay within <b><Countdown until={open.expiresAt} /></b> minutes. Reference: <span className="font-mono">{open.reference}</span>.</li>
+              <li>• Your balance is credited after {config.requiredConfirmations} network confirmations and an admin review.</li>
+            </ul>
+
+            <form onSubmit={submitPayment} className="space-y-3">
+              <div>
+                <label htmlFor="txid" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                  Transaction ID (TXID) of your payment
+                </label>
+                <input
+                  id="txid"
+                  value={txid}
+                  onChange={(event) => setTxid(event.target.value)}
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  placeholder="64 characters, shown by your wallet after sending"
+                  className={`${inputClass} font-mono`}
+                  required
+                />
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <button type="submit" disabled={busy || txid.trim().length === 0} className={primaryButton}>
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  I&apos;ve paid
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => run({ action: "cancel", requestId: open.id }, "Deposit request cancelled.")}
+                  className={secondaryButton}
+                >
+                  Cancel request
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
-        <button
-          onClick={() => onToggle(card.id)}
-          className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[10px] font-bold backdrop-blur transition ${
-            card.status === "active" ? "bg-white/15 text-white hover:bg-white/25" : "bg-rose-500/90 text-white"
-          }`}
-        >
-          {card.status === "active" ? <LockKeyhole className="h-3 w-3" /> : <UnlockKeyhole className="h-3 w-3" />}
-          {card.status === "active" ? "Freeze" : "Activate"}
-        </button>
-      </div>
-    </div>
+      )}
+
+      {open?.status === "reviewing" && (
+        <div className="rounded-2xl border border-purple-200 bg-purple-50/70 p-5" data-testid="deposit-review">
+          <div className="flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-white text-[#7F00FF]">
+              <Clock className="h-5 w-5" />
+            </span>
+            <div className="min-w-0">
+              <p className="text-[14px] font-black">Your payment is under review</p>
+              <p className="mt-1 text-[12px] leading-5 text-slate-600">
+                Our team will verify your Bitcoin payment on the blockchain. Your balance is updated only after approval —
+                you will get a notification.
+              </p>
+              <dl className="mt-3 grid gap-x-6 gap-y-1 text-[12px] sm:grid-cols-2">
+                <div><dt className="inline text-slate-500">Reference: </dt><dd className="inline font-mono font-bold">{open.reference}</dd></div>
+                <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(open.amountUsd)} · {open.amountBtc} BTC</dd></div>
+                <div className="sm:col-span-2"><dt className="inline text-slate-500">TXID: </dt><dd className="inline break-all font-mono">{open.txid}</dd></div>
+              </dl>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p role="alert" className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
+          {error}
+        </p>
+      )}
+
+      {data.deposits.length > 0 && (
+        <div className="mt-6">
+          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Recent deposit requests</p>
+          <ul className="divide-y divide-slate-100 rounded-2xl border border-slate-100">
+            {data.deposits.map((deposit: Deposit) => (
+              <li key={deposit.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 text-[12px]">
+                <span className="font-mono text-slate-500">{deposit.reference}</span>
+                <span className="font-bold">{formatMoney(deposit.amountUsd)}</span>
+                <span className="text-slate-500">{deposit.amountBtc} BTC</span>
+                <span className="text-slate-400">{formatDate(deposit.createdAt)}</span>
+                <span className="ml-auto"><Badge tone={STATUS_TONE[deposit.status]}>{DEPOSIT_STATUS_LABEL[deposit.status]}</Badge></span>
+                {deposit.rejectionReason && <p className="w-full text-rose-600">Reason: {deposit.rejectionReason}</p>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Card>
   );
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+
+type TransferStep =
+  | { step: "form" }
+  | { step: "confirm"; recipient: { accountNumber: string; name: string }; amount: string; note: string; requestId: string }
+  | { step: "done"; result: TransferResult };
+
+function TransferSection({
+  data,
+  onChanged,
+  notify,
+}: {
+  data: DashboardData;
+  onChanged: () => Promise<void>;
+  notify: (toast: Toast) => void;
+}) {
+  const [account, setAccount] = useState("");
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+  const [state, setState] = useState<TransferStep>({ step: "form" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const cleanAccount = account.replace(/\D/g, "");
+  const amountNumber = Number(amount);
+  const amountValid = /^\d+(\.\d{1,2})?$/.test(amount) && amountNumber > 0;
+  const enough = amountValid && amountNumber <= data.wallet.balance;
+
+  async function checkRecipient(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    if (cleanAccount.length !== 8) return setError("Account numbers have exactly 8 digits.");
+    if (cleanAccount === data.user.accountNumber) return setError("You cannot transfer money to your own account.");
+    if (!amountValid) return setError("Enter an amount greater than zero (max. 2 decimals).");
+    if (!enough) return setError("Insufficient balance.");
+    setBusy(true);
+    try {
+      const response = await postJson<{ recipient: { accountNumber: string; name: string } }>("/api/transfers", {
+        action: "lookup",
+        accountNumber: cleanAccount,
+      });
+      // One id per confirmation screen: a double click or retry can never send twice.
+      setState({ step: "confirm", recipient: response.recipient, amount, note, requestId: newRequestId() });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Recipient could not be checked.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirm() {
+    if (state.step !== "confirm") return;
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await postJson<{ transfer: TransferResult }>("/api/transfers", {
+        action: "send",
+        accountNumber: state.recipient.accountNumber,
+        amount: state.amount,
+        idempotencyKey: state.requestId,
+        note: state.note,
+      });
+      setState({ step: "done", result: response.transfer });
+      setAccount("");
+      setAmount("");
+      setNote("");
+      await onChanged();
+      notify({ type: "ok", message: "Transfer completed." });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Transfer failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card id="transfer">
+      <SectionTitle eyebrow="Send money" title="Transfer to another member" />
+
+      {state.step === "form" && (
+        <form onSubmit={checkRecipient} className="grid gap-4 md:grid-cols-2">
+          <div>
+            <label htmlFor="recipient-account" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
+              Recipient account number
+            </label>
+            <input
+              id="recipient-account"
+              inputMode="numeric"
+              autoComplete="off"
+              maxLength={9}
+              placeholder="8 digits"
+              value={account}
+              onChange={(event) => setAccount(event.target.value.replace(/[^\d ]/g, ""))}
+              className={`${inputClass} font-mono tracking-[0.2em]`}
+              required
+            />
+          </div>
+          <div>
+            <label htmlFor="transfer-amount" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
+              Amount (USD)
+            </label>
+            <input
+              id="transfer-amount"
+              inputMode="decimal"
+              autoComplete="off"
+              placeholder="0.00"
+              value={amount}
+              onChange={(event) => setAmount(event.target.value.replace(",", ".").replace(/[^\d.]/g, ""))}
+              className={inputClass}
+              required
+            />
+            <p className="mt-1.5 text-[11px] text-slate-500">Available: {formatMoney(data.wallet.balance)}</p>
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="transfer-note" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
+              Description (optional)
+            </label>
+            <input
+              id="transfer-note"
+              maxLength={140}
+              value={note}
+              onChange={(event) => setNote(event.target.value)}
+              className={inputClass}
+            />
+          </div>
+          <div className="md:col-span-2">
+            <button type="submit" disabled={busy} className={`${primaryButton} w-full sm:w-auto`}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+              Check recipient
+            </button>
+          </div>
+        </form>
+      )}
+
+      {state.step === "confirm" && (
+        <div className="space-y-4" data-testid="transfer-confirm">
+          <div className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
+            <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Please confirm</p>
+            <dl className="mt-3 grid gap-3 text-[13px] sm:grid-cols-3">
+              <div>
+                <dt className="text-[11px] text-slate-500">Recipient</dt>
+                <dd className="font-black" data-testid="recipient-name">{state.recipient.name}</dd>
+              </div>
+              <div>
+                <dt className="text-[11px] text-slate-500">Account number</dt>
+                <dd className="font-mono font-bold">{formatAccountNumber(state.recipient.accountNumber)}</dd>
+              </div>
+              <div>
+                <dt className="text-[11px] text-slate-500">Amount</dt>
+                <dd className="text-lg font-black text-[#7F00FF]">{formatMoney(Number(state.amount))}</dd>
+              </div>
+            </dl>
+            {state.note && <p className="mt-3 text-[12px] text-slate-600">“{state.note}”</p>}
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <button type="button" onClick={confirm} disabled={busy} className={primaryButton}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+              Confirm transfer
+            </button>
+            <button type="button" disabled={busy} onClick={() => { setState({ step: "form" }); setError(null); }} className={secondaryButton}>
+              Back
+            </button>
+          </div>
+        </div>
+      )}
+
+      {state.step === "done" && (
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5" data-testid="transfer-done">
+          <div className="flex items-start gap-3">
+            <CheckCircle2 className="mt-0.5 h-6 w-6 shrink-0 text-emerald-600" />
+            <div className="min-w-0 text-[13px]">
+              <p className="font-black text-emerald-800">
+                {formatMoney(state.result.amount)} sent to {state.result.recipientName}
+              </p>
+              <p className="mt-1 text-emerald-900/80">
+                Account {formatAccountNumber(state.result.recipientAccount)} · Reference{" "}
+                <span className="font-mono font-bold">{state.result.reference}</span>
+              </p>
+              <p className="mt-1 text-emerald-900/80">New balance: {formatMoney(state.result.balance)}</p>
+            </div>
+          </div>
+          <button type="button" onClick={() => setState({ step: "form" })} className={`${secondaryButton} mt-4`}>
+            New transfer
+          </button>
+        </div>
+      )}
+
+      {error && (
+        <p role="alert" className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
+          {error}
+        </p>
+      )}
+    </Card>
+  );
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 
 export default function DashboardClient({ initialData }: { initialData: DashboardData }) {
   const [data, setData] = useState(initialData);
   const [activeNav, setActiveNav] = useState("overview");
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [action, setAction] = useState<ActionKey>(null);
-  const [form, setForm] = useState<FormState>(emptyForm);
-  const [loading, setLoading] = useState(false);
-  const [toast, setToast] = useState<{ type: "ok" | "error"; message: string } | null>(null);
+  const [toast, setToast] = useState<Toast>(null);
   const [filter, setFilter] = useState<"all" | "in" | "out">("all");
-  const [search, setSearch] = useState("");
-  const [switches, setSwitches] = useState({ push: true, email: false, security: true });
 
   useEffect(() => {
     if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 3800);
+    const timer = setTimeout(() => setToast(null), 4000);
     return () => clearTimeout(timer);
   }, [toast]);
 
-  /** Session ended (signed out elsewhere, expired or revoked): go to sign-in. */
-  function handleSignedOut() {
-    window.location.assign("/login?next=/dashboard");
-  }
-
-  async function refresh() {
+  const refresh = useCallback(async () => {
     const response = await fetch("/api/dashboard", { cache: "no-store" });
-    if (response.status === 401) return handleSignedOut();
+    if (response.status === 401) {
+      window.location.assign("/login?next=/dashboard");
+      return;
+    }
     if (response.ok) setData((await response.json()) as DashboardData);
-  }
+  }, []);
+
+  // Balance, notifications and deposit status stay current without a reload.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") refresh().catch(() => {});
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [refresh]);
 
   function goTo(id: string) {
     setActiveNav(id);
@@ -194,143 +576,18 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function openAction(next: Exclude<ActionKey, null>) {
-    const firstRecipient = data.recipients[0];
-    const matchingWallet = data.wallets.find(
-      (wallet) => wallet.currency === firstRecipient?.currency,
-    );
-    setForm({
-      ...emptyForm,
-      recipientId: firstRecipient?.id.toString() ?? "",
-      walletId: (matchingWallet ?? data.wallets[0])?.id.toString() ?? "",
-      targetWalletId: data.wallets[1]?.id.toString() ?? data.wallets[0]?.id.toString() ?? "",
-    });
-    setAction(next);
-  }
-
-  const selectedWallet = data.wallets.find((wallet) => wallet.id === Number(form.walletId));
-  const targetWallet = data.wallets.find((wallet) => wallet.id === Number(form.targetWalletId));
-  const selectedRecipient = data.recipients.find(
-    (recipient) => recipient.id === Number(form.recipientId),
-  );
-  const amountValue = Number(form.amount);
-
-  const preview =
-    action === "send" && selectedWallet && selectedRecipient && amountValue > 0
-      ? convert(amountValue, selectedWallet.currency, selectedRecipient.currency)
-      : action === "exchange" && selectedWallet && targetWallet && amountValue > 0
-        ? convert(amountValue, selectedWallet.currency, targetWallet.currency)
-        : null;
-
-  async function submitAction(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!action) return;
-    if (!amountValue || amountValue <= 0) {
-      setToast({ type: "error", message: "Please enter a valid amount." });
-      return;
-    }
-    if ((action === "send" || action === "withdraw" || action === "exchange") && selectedWallet && amountValue > selectedWallet.balance) {
-      setToast({ type: "error", message: "Insufficient balance in this wallet." });
-      return;
-    }
-    if (action === "exchange" && form.walletId === form.targetWalletId) {
-      setToast({ type: "error", message: "Choose a different target wallet." });
-      return;
-    }
-
-    const payload: Record<string, string | number> = {
-      action,
-      amount: amountValue,
-      note: form.note,
-      walletId: Number(form.walletId),
-    };
-    if (action === "send") payload.recipientId = Number(form.recipientId);
-    if (action === "exchange") payload.targetWalletId = Number(form.targetWalletId);
-    if (action === "topup" || action === "withdraw") payload.method = form.method;
-
-    setLoading(true);
+  async function markAllRead() {
     try {
-      const response = await fetch("/api/transactions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (response.status === 401) return handleSignedOut();
-      const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      if (!response.ok || !result.ok) throw new Error(result.error ?? "Transaction failed");
+      await postJson("/api/notifications", { action: "read" });
       await refresh();
-      setAction(null);
-      const messages: Record<string, string> = {
-        send: "Transfer completed successfully.",
-        topup: "Your balance was topped up.",
-        withdraw: "Your withdrawal was completed.",
-        exchange: "Your exchange was completed.",
-      };
-      setToast({ type: "ok", message: messages[action] });
-    } catch (error) {
-      setToast({
-        type: "error",
-        message: error instanceof Error ? error.message : "Transaction failed",
-      });
-    } finally {
-      setLoading(false);
+    } catch (err) {
+      setToast({ type: "error", message: err instanceof Error ? err.message : "Could not update notifications." });
     }
   }
 
-  async function toggleCard(cardId: number) {
-    try {
-      const response = await fetch("/api/transactions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "toggleCard", cardId }),
-      });
-      if (response.status === 401) return handleSignedOut();
-      if (!response.ok) throw new Error("Card could not be updated");
-      await refresh();
-      setToast({ type: "ok", message: "Card status updated." });
-    } catch {
-      setToast({ type: "error", message: "Card status could not be updated." });
-    }
-  }
-
-  async function copyAccount(value: string) {
-    try {
-      await navigator.clipboard.writeText(value);
-      setToast({ type: "ok", message: "Account number copied." });
-    } catch {
-      setToast({ type: "error", message: "Could not copy." });
-    }
-  }
-
-  const visibleTransactions = useMemo(
-    () =>
-      data.transactions.filter((item) => {
-        const matchesDirection = filter === "all" || item.direction === filter;
-        const haystack = `${item.counterparty} ${item.note} ${item.currency}`.toLocaleLowerCase("tr");
-        return matchesDirection && haystack.includes(search.toLocaleLowerCase("tr"));
-      }),
-    [data.transactions, filter, search],
-  );
-
-  const donutSegments = useMemo(() => {
-    const total = data.stats.totalUsd || 1;
-    const palette = ["#7F00FF", "#19A2D3", "#F59E0B", "#10B981"];
-    let cursor = 0;
-    return data.wallets.map((wallet, index) => {
-      const percent =
-        ((wallet.balance * (CURRENCIES[wallet.currency]?.usd ?? 1)) / total) * 100;
-      const segment = `${palette[index % palette.length]} ${cursor}% ${cursor + percent}%`;
-      cursor += percent;
-      return segment;
-    });
-  }, [data.wallets, data.stats.totalUsd]);
-
-  const actionTitles: Record<Exclude<ActionKey, null>, { title: string; subtitle: string }> = {
-    send: { title: "Send money", subtitle: "Pick a recipient, enter an amount and transfer instantly." },
-    topup: { title: "Top up balance", subtitle: "Add money to your wallet quickly and safely." },
-    withdraw: { title: "Withdraw money", subtitle: "Move your balance to a bank account." },
-    exchange: { title: "Exchange currency", subtitle: "Swap between your currencies instantly." },
-  };
+  const transactions = data.transactions.filter((tx) => filter === "all" || tx.direction === filter);
+  const copied = (ok: boolean) =>
+    setToast(ok ? { type: "ok", message: "Account number copied." } : { type: "error", message: "Could not copy." });
 
   return (
     <div lang="en" className="min-h-screen bg-[#f7f7fb] text-[#10152b]">
@@ -347,7 +604,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
           </button>
         </div>
 
-        <nav className="flex-1 space-y-1.5 overflow-y-auto px-4 py-6 scrollbar-thin">
+        <nav className="flex-1 space-y-1.5 overflow-y-auto px-4 py-6">
           <p className="mb-3 px-3 text-[10px] font-bold uppercase tracking-[0.18em] text-white/30">Menu</p>
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -357,56 +614,37 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
                 key={item.id}
                 onClick={() => goTo(item.id)}
                 className={`group flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold transition ${
-                  active
-                    ? "igw-gradient text-white shadow-[0_10px_24px_-10px_rgba(127,0,255,0.9)]"
-                    : "text-white/55 hover:bg-white/5 hover:text-white"
+                  active ? "igw-gradient text-white shadow-[0_10px_24px_-10px_rgba(127,0,255,0.9)]" : "text-white/55 hover:bg-white/5 hover:text-white"
                 }`}
               >
                 <Icon className="h-[18px] w-[18px]" />
                 {item.label}
-                {active && <ChevronRight className="ml-auto h-4 w-4 opacity-70" />}
+                {item.id === "notifications" && data.unreadCount > 0 && (
+                  <span className="ml-auto rounded-full bg-rose-500 px-2 py-0.5 text-[10px] font-black text-white">{data.unreadCount}</span>
+                )}
+                {active && item.id !== "notifications" && <ChevronRight className="ml-auto h-4 w-4 opacity-70" />}
               </button>
             );
           })}
 
           <p className="mb-3 mt-8 px-3 text-[10px] font-bold uppercase tracking-[0.18em] text-white/30">Quick access</p>
-          <button
-            onClick={() => openAction("send")}
-            className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold text-white/55 transition hover:bg-white/5 hover:text-white"
-          >
-            <Send className="h-[18px] w-[18px]" /> Yeni transfer
-          </button>
-          <Link
-            href="/"
-            className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold text-white/55 transition hover:bg-white/5 hover:text-white"
-          >
+          {data.user.isAdmin && (
+            <Link href="/admin" className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold text-amber-300 transition hover:bg-white/5">
+              <ShieldCheck className="h-[18px] w-[18px]" /> Admin panel
+            </Link>
+          )}
+          <Link href="/" className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold text-white/55 transition hover:bg-white/5 hover:text-white">
             <Globe2 className="h-[18px] w-[18px]" /> Home page
           </Link>
         </nav>
 
         <div className="p-4">
-          <div className="relative overflow-hidden rounded-2xl igw-gradient p-4">
-            <div className="absolute -right-6 -top-6 h-20 w-20 rounded-full bg-white/15 blur-xl" />
-            <div className="relative">
-              <Sparkles className="h-5 w-5 text-white" />
-              <p className="mt-3 text-[13px] font-bold">IGW {data.user.plan}</p>
-              <p className="mt-1 text-[11px] leading-5 text-white/75">
-                Enjoy unlimited transfers and special exchange rates.
-              </p>
-              <button onClick={() => goTo("settings")} className="mt-3 text-[11px] font-bold text-white underline underline-offset-4">
-                View benefits
-              </button>
-            </div>
-          </div>
-          <div className="mt-4 flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left text-[12px] font-semibold text-white/60">
-            <span className="flex h-9 w-9 items-center justify-center rounded-full igw-gradient text-[11px] font-black text-white">
-              {data.user.initials}
-            </span>
+          <div className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left text-[12px] font-semibold text-white/60">
+            <span className="flex h-9 w-9 items-center justify-center rounded-full igw-gradient text-[11px] font-black text-white">{data.user.initials}</span>
             <span className="min-w-0 flex-1">
               <span className="block truncate text-white">{data.user.name}</span>
               <span className="block truncate text-[10px] font-normal text-white/40">{data.user.email}</span>
             </span>
-            <span className="h-2 w-2 rounded-full bg-emerald-400" title="Signed in" />
           </div>
           <form action={signOutAction}>
             <button type="submit" className="mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[12px] font-semibold text-white/50 transition hover:bg-white/5 hover:text-white">
@@ -417,563 +655,176 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
       </aside>
 
       {mobileOpen && (
-        <button
-          className="fixed inset-0 z-40 bg-[#10152b]/60 backdrop-blur-sm lg:hidden"
-          onClick={() => setMobileOpen(false)}
-          aria-label="Close menu"
-        />
+        <button className="fixed inset-0 z-40 bg-[#10152b]/60 backdrop-blur-sm lg:hidden" onClick={() => setMobileOpen(false)} aria-label="Close menu" />
       )}
 
-      {/* Main area */}
       <div className="lg:pl-[264px]">
         <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-white/85 backdrop-blur-xl">
-          <div className="flex h-[76px] items-center gap-4 px-4 sm:px-8">
+          <div className="flex h-[68px] items-center gap-3 px-4 sm:h-[76px] sm:px-8">
             <button className="text-slate-600 lg:hidden" onClick={() => setMobileOpen(true)} aria-label="Open menu">
               <Menu className="h-5 w-5" />
             </button>
-            <div className="hidden min-w-0 sm:block">
-              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">Insta Global Wallet</p>
-              <p className="truncate text-sm font-extrabold text-[#10152b]">
-                {navItems.find((item) => item.id === activeNav)?.label ?? "Overview"}
-              </p>
+            <div className="min-w-0">
+              <p className="hidden text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400 sm:block">Insta Global Wallet</p>
+              <p className="truncate text-sm font-extrabold">{navItems.find((item) => item.id === activeNav)?.label ?? "Overview"}</p>
             </div>
-            <div className="relative ml-auto hidden w-full max-w-xs lg:block">
-              <Search className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-              <input
-                value={search}
-                onChange={(event) => {
-                  setSearch(event.target.value);
-                  setActiveNav("transactions");
-                }}
-                placeholder="Search transactions or recipients..."
-                className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 pl-10 pr-4 text-[12px] font-medium text-slate-700 transition focus:border-purple-400 focus:bg-white focus:ring-2 focus:ring-purple-100"
-              />
-            </div>
-            <div className="ml-auto flex items-center gap-2 lg:ml-0">
-              <button className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:text-[#7F00FF]" aria-label="Notifications">
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                onClick={() => goTo("notifications")}
+                className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:text-[#7F00FF]"
+                aria-label={`Notifications (${data.unreadCount} unread)`}
+              >
                 <Bell className="h-[18px] w-[18px]" />
-                <span className="absolute right-2.5 top-2.5 h-1.5 w-1.5 rounded-full bg-[#7F00FF]" />
+                {data.unreadCount > 0 && (
+                  <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-black text-white">
+                    {data.unreadCount}
+                  </span>
+                )}
               </button>
-              <button className="hidden h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:text-[#7F00FF] sm:flex" aria-label="Help">
-                <HelpCircle className="h-[18px] w-[18px]" />
-              </button>
-              <span className="ml-1 flex h-10 w-10 items-center justify-center rounded-xl igw-gradient text-[11px] font-black text-white">
-                {data.user.initials}
-              </span>
+              <span className="flex h-10 w-10 items-center justify-center rounded-xl igw-gradient text-[11px] font-black text-white">{data.user.initials}</span>
             </div>
           </div>
         </header>
 
-        <main className="mx-auto max-w-[1440px] space-y-7 px-4 py-8 sm:px-8">
-          {/* Greeting */}
-          <div className="flex flex-wrap items-end justify-between gap-4">
-            <div>
-              <p className="flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-[0.16em] text-[#7F00FF]">
-                <Zap className="h-3.5 w-3.5" /> Financial overview
-                <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[9px] font-black tracking-normal text-emerald-600">
-                  Secure session
-                </span>
-              </p>
-              <h1 className="mt-2 text-2xl font-black tracking-tight sm:text-3xl">Merhaba, {data.user.name.split(" ")[0]} 👋</h1>
-              <p className="mt-1 text-[13px] text-slate-500">Everything in your wallet on one screen, fully under your control.</p>
-            </div>
-            <button
-              onClick={() => openAction("send")}
-              className="igw-gradient inline-flex items-center gap-2 rounded-xl px-5 py-3 text-[13px] font-bold text-white shadow-[0_14px_30px_-12px_rgba(127,0,255,0.9)] transition hover:-translate-y-0.5"
-            >
-              <Send className="h-4 w-4" /> Send money
-            </button>
+        <main className="mx-auto max-w-[1280px] space-y-6 px-4 py-6 sm:px-8 sm:py-8">
+          <div>
+            <h1 className="text-2xl font-black tracking-tight sm:text-3xl">Hello, {data.user.name.split(" ")[0]} 👋</h1>
+            <p className="mt-1 text-[13px] text-slate-500">Your balance, deposits and transfers in one place.</p>
           </div>
 
           {/* Overview */}
-          <section id="overview" className="grid gap-5 scroll-mt-28 lg:grid-cols-[1.5fr_1fr_1fr]">
+          <section id="overview" className="grid scroll-mt-28 gap-5 lg:grid-cols-[1.6fr_1fr]">
             <div className="relative overflow-hidden rounded-[26px] igw-gradient p-6 text-white igw-shadow sm:p-7">
               <div className="pointer-events-none absolute -right-14 -top-16 h-56 w-56 rounded-full bg-white/15 blur-2xl" />
-              <div className="relative flex items-start justify-between">
-                <div>
+              <div className="relative flex items-start justify-between gap-4">
+                <div className="min-w-0">
                   <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/70">Total balance</p>
-                  <p className="mt-3 text-[clamp(2rem,3.4vw,2.9rem)] font-black tracking-tight">
-                    {formatMoney(data.stats.totalUsd, "USD")}
-                  </p>
-                  <p className="mt-1.5 flex items-center gap-1.5 text-[11px] font-medium text-emerald-100">
-                    <TrendingUp className="h-3.5 w-3.5" /> Combined value of all wallets (USD equivalent)
+                  <p className="mt-2 break-all text-[clamp(2rem,6vw,2.9rem)] font-black tracking-tight" data-testid="balance">
+                    {formatMoney(data.wallet.balance)}
                   </p>
                 </div>
-                <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-white/15 backdrop-blur">
+                <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-white/15 backdrop-blur">
                   <Wallet className="h-5 w-5" />
                 </span>
               </div>
-              <div className="relative mt-8 flex flex-wrap gap-2.5">
-                <button onClick={() => openAction("topup")} className="rounded-xl bg-white px-4 py-2.5 text-[11px] font-bold text-[#7F00FF] transition hover:-translate-y-0.5">
-                  + Top up
-                </button>
-                <button onClick={() => openAction("exchange")} className="rounded-xl bg-white/15 px-4 py-2.5 text-[11px] font-bold text-white backdrop-blur transition hover:bg-white/25">
-                  Exchange currency
-                </button>
-              </div>
-            </div>
-
-            <div className="rounded-[26px] border border-slate-100 bg-white p-6 igw-shadow-soft">
-              <div className="flex items-center justify-between">
-                <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-600">
-                  <ArrowDownLeft className="h-5 w-5" />
-                </span>
-                <span className="flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-bold text-emerald-600">
-                  <TrendingUp className="h-3 w-3" /> %12,4
-                </span>
-              </div>
-              <p className="mt-5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Incoming · last 30 days</p>
-              <p className="mt-1 text-2xl font-black tracking-tight">{formatMoney(data.stats.moneyIn, "USD")}</p>
-              <p className="mt-2 text-[11px] text-slate-400">Total in USD</p>
-            </div>
-
-            <div className="rounded-[26px] border border-slate-100 bg-white p-6 igw-shadow-soft">
-              <div className="flex items-center justify-between">
-                <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-purple-50 text-[#7F00FF]">
-                  <ArrowUpRight className="h-5 w-5" />
-                </span>
-                <span className="flex items-center gap-1 rounded-full bg-rose-50 px-2 py-1 text-[10px] font-bold text-rose-500">
-                  <TrendingDown className="h-3 w-3" /> %3,1
-                </span>
-              </div>
-              <p className="mt-5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Outgoing · last 30 days</p>
-              <p className="mt-1 text-2xl font-black tracking-tight">{formatMoney(data.stats.moneyOut, "USD")}</p>
-              <p className="mt-2 text-[11px] text-slate-400">Total in USD</p>
-            </div>
-          </section>
-
-          {/* Quick actions + wallets */}
-          <section className="grid gap-5 xl:grid-cols-[0.85fr_2.15fr]">
-            <div className="rounded-[26px] border border-slate-100 bg-white p-5 igw-shadow-soft">
-              <p className="text-[11px] font-bold uppercase tracking-[0.14em] text-slate-400">Quick actions</p>
-              <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-2">
-                {quickActions.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <button
-                      key={item.key}
-                      onClick={() => openAction(item.key)}
-                      className="group flex flex-col items-center gap-2 rounded-2xl border border-slate-100 bg-slate-50/60 p-4 transition hover:-translate-y-0.5 hover:border-purple-200 hover:bg-white"
-                    >
-                      <span className={`flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br ${item.tone} text-white shadow-md`}>
-                        <Icon className="h-[18px] w-[18px]" />
-                      </span>
-                      <span className="text-[11px] font-bold text-slate-700">{item.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div id="wallets" className="scroll-mt-28">
-              <div className="mb-3 flex items-center justify-between">
-                <h2 className="text-sm font-black tracking-tight">My currencies</h2>
-                <span className="text-[11px] font-semibold text-slate-400">{data.wallets.length} active wallets</span>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                {data.wallets.map((wallet, index) => {
-                  const colors = [
-                    "from-violet-500 to-purple-700",
-                    "from-cyan-400 to-blue-600",
-                    "from-amber-400 to-orange-600",
-                    "from-emerald-400 to-teal-600",
-                  ];
-                  return (
-                    <div key={wallet.id} className="group relative overflow-hidden rounded-[22px] border border-slate-100 bg-white p-4 transition hover:-translate-y-1 hover:shadow-[0_20px_40px_-24px_rgba(127,0,255,0.5)]">
-                      <div className="flex items-center justify-between">
-                        <span className={`flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br ${colors[index % colors.length]} text-base shadow-sm`}>
-                          {CURRENCIES[wallet.currency]?.flag ?? "💳"}
-                        </span>
-                        {wallet.isPrimary && (
-                          <span className="rounded-full bg-purple-50 px-2 py-1 text-[9px] font-bold uppercase tracking-wide text-[#7F00FF]">Main</span>
-                        )}
-                      </div>
-                      <p className="mt-3 text-[11px] font-semibold text-slate-400">{wallet.name}</p>
-                      <p className="mt-0.5 text-lg font-black tracking-tight">{formatMoney(wallet.balance, wallet.currency)}</p>
-                      <div className="mt-3 flex items-center justify-between border-t border-slate-50 pt-3">
-                        <span className="truncate text-[9px] font-medium text-slate-400">{wallet.accountNumber}</span>
-                        <button
-                          onClick={() => copyAccount(wallet.accountNumber)}
-                          className="ml-2 text-slate-300 transition hover:text-[#7F00FF]"
-                          aria-label="Copy account number"
-                        >
-                          <Copy className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          </section>
-
-          {/* Transactions and side widgets */}
-          <section className="grid gap-5 xl:grid-cols-[1.6fr_0.9fr]">
-            <div id="transactions" className="scroll-mt-28 overflow-hidden rounded-[26px] border border-slate-100 bg-white igw-shadow-soft">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-5">
-                <div>
-                  <h2 className="text-sm font-black tracking-tight">Recent activity</h2>
-                  <p className="mt-1 text-[11px] text-slate-400">Activity across all your wallets</p>
+              <div className="relative mt-6 flex flex-wrap items-center gap-3 rounded-2xl bg-white/10 p-3 backdrop-blur">
+                <div className="min-w-0">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-white/60">Account number</p>
+                  <p className="font-mono text-xl font-black tracking-[0.18em]" data-testid="account-number">
+                    {formatAccountNumber(data.user.accountNumber)}
+                  </p>
                 </div>
-                <div className="flex rounded-xl bg-slate-100 p-1">
-                  {(["all", "in", "out"] as const).map((item) => (
-                    <button
-                      key={item}
-                      onClick={() => setFilter(item)}
-                      className={`rounded-lg px-3 py-1.5 text-[11px] font-bold transition ${
-                        filter === item ? "bg-white text-[#7F00FF] shadow-sm" : "text-slate-500 hover:text-slate-800"
-                      }`}
-                    >
-                      {item === "all" ? "All" : item === "in" ? "In" : "Out"}
-                    </button>
-                  ))}
-                </div>
+                <CopyButton value={data.user.accountNumber} label="Copy" dark className="ml-auto" onCopied={copied} />
               </div>
-              <div className="max-h-[480px] overflow-y-auto scrollbar-thin">
-                {visibleTransactions.length > 0 ? (
-                  visibleTransactions.map((item) => <TransactionRow key={item.id} item={item} />)
-                ) : (
-                  <div className="px-5 py-14 text-center">
-                    <Search className="mx-auto h-6 w-6 text-slate-300" />
-                    <p className="mt-3 text-[13px] font-semibold text-slate-500">No matching transactions found.</p>
-                  </div>
-                )}
-              </div>
-              <div className="border-t border-slate-100 px-5 py-3.5 text-center">
-                <span className="text-[11px] font-semibold text-slate-400">
-                  {visibleTransactions.length} transactions shown
-                </span>
+              <div className="relative mt-5 flex flex-wrap gap-2.5">
+                <button onClick={() => goTo("deposit")} className="rounded-xl bg-white px-4 py-2.5 text-[12px] font-bold text-[#7F00FF] transition hover:-translate-y-0.5">
+                  + Deposit
+                </button>
+                <button onClick={() => goTo("transfer")} className="rounded-xl bg-white/15 px-4 py-2.5 text-[12px] font-bold text-white backdrop-blur transition hover:bg-white/25">
+                  Transfer
+                </button>
+                <button disabled title="Withdrawals are coming soon" className="cursor-not-allowed rounded-xl bg-white/10 px-4 py-2.5 text-[12px] font-bold text-white/50">
+                  Withdraw · soon
+                </button>
               </div>
             </div>
 
-            <div className="space-y-5">
+            <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">
               <div className="rounded-[26px] border border-slate-100 bg-white p-5 igw-shadow-soft">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h2 className="text-sm font-black tracking-tight">Asset allocation</h2>
-                    <p className="mt-1 text-[11px] text-slate-400">By currency wallet</p>
-                  </div>
-                  <Globe2 className="h-4 w-4 text-[#7F00FF]" />
-                </div>
-                <div className="mt-5 flex items-center gap-6">
-                  <div
-                    className="relative h-32 w-32 shrink-0 rounded-full"
-                    style={{ background: `conic-gradient(${donutSegments.join(",")})` }}
-                  >
-                    <div className="absolute inset-[15px] flex flex-col items-center justify-center rounded-full bg-white">
-                      <span className="text-[9px] font-semibold text-slate-400">Total</span>
-                      <span className="text-sm font-black">{data.wallets.length} currencies</span>
-                    </div>
-                  </div>
-                  <div className="min-w-0 flex-1 space-y-3">
-                    {data.wallets.map((wallet, index) => (
-                      <div key={wallet.id} className="flex items-center gap-2">
-                        <span
-                          className="h-2.5 w-2.5 shrink-0 rounded-full"
-                          style={{ background: ["#7F00FF", "#19A2D3", "#F59E0B", "#10B981"][index % 4] }}
-                        />
-                        <span className="text-[11px] font-bold text-slate-600">{wallet.currency}</span>
-                        <span className="ml-auto text-[11px] font-bold text-slate-800">
-                          %{Math.round(
-                            (wallet.balance * (CURRENCIES[wallet.currency]?.usd ?? 1)) /
-                              (data.stats.totalUsd || 1) *
-                              100,
-                          )}
-                        </span>
-                      </div>
+                <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-600"><ArrowDownLeft className="h-5 w-5" /></span>
+                <p className="mt-4 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Money in · last 30 days</p>
+                <p className="mt-1 text-2xl font-black tracking-tight">{formatMoney(data.stats.moneyIn)}</p>
+              </div>
+              <div className="rounded-[26px] border border-slate-100 bg-white p-5 igw-shadow-soft">
+                <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-purple-50 text-[#7F00FF]"><ArrowUpRight className="h-5 w-5" /></span>
+                <p className="mt-4 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Money out · last 30 days</p>
+                <p className="mt-1 text-2xl font-black tracking-tight">{formatMoney(data.stats.moneyOut)}</p>
+              </div>
+            </div>
+          </section>
+
+          <DepositSection data={data} onChanged={refresh} notify={setToast} />
+          <TransferSection data={data} onChanged={refresh} notify={setToast} />
+
+          <div className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
+            <Card id="transactions">
+              <SectionTitle
+                eyebrow="History"
+                title="Transactions"
+                action={
+                  <div className="flex rounded-xl bg-slate-100 p-1 text-[11px] font-bold">
+                    {(["all", "in", "out"] as const).map((key) => (
+                      <button
+                        key={key}
+                        onClick={() => setFilter(key)}
+                        className={`rounded-lg px-3 py-1.5 transition ${filter === key ? "bg-white text-[#7F00FF] shadow-sm" : "text-slate-500"}`}
+                      >
+                        {key === "all" ? "All" : key === "in" ? "Incoming" : "Outgoing"}
+                      </button>
                     ))}
                   </div>
-                </div>
-              </div>
+                }
+              />
+              {transactions.length === 0 ? (
+                <p className="rounded-2xl bg-slate-50 p-6 text-center text-[13px] text-slate-500">No transactions yet.</p>
+              ) : (
+                <ul>{transactions.map((tx) => <TransactionItem key={tx.id} tx={tx} />)}</ul>
+              )}
+            </Card>
 
-              <div id="recipients" className="scroll-mt-28 rounded-[26px] border border-slate-100 bg-white p-5 igw-shadow-soft">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h2 className="text-sm font-black tracking-tight">Saved recipients</h2>
-                    <p className="mt-1 text-[11px] text-slate-400">Send money in one tap</p>
-                  </div>
-                  <span className="flex h-8 w-8 items-center justify-center rounded-xl bg-purple-50 text-[#7F00FF]"><Users className="h-4 w-4" /></span>
-                </div>
-                <div className="mt-4 space-y-1">
-                  {data.recipients.map((recipient) => (
-                    <div key={recipient.id} className="flex items-center gap-3 rounded-xl px-1 py-2 transition hover:bg-slate-50">
-                      <span
-                        className="flex h-9 w-9 items-center justify-center rounded-full text-[10px] font-black text-white"
-                        style={{ background: recipient.color }}
-                      >
-                        {recipient.name.split(" ").map((part) => part[0]).join("").slice(0, 2)}
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-[12px] font-bold">{recipient.name}</p>
-                        <p className="truncate text-[10px] text-slate-400">{recipient.currency} · {recipient.email}</p>
-                      </div>
-                      <button
-                        onClick={() => {
-                          openAction("send");
-                          setForm((current) => ({ ...current, recipientId: recipient.id.toString() }));
-                        }}
-                        className="rounded-lg bg-slate-100 p-2 text-slate-500 transition hover:bg-purple-50 hover:text-[#7F00FF]"
-                        aria-label={`${recipient.name} send money to`}
-                      >
-                        <Send className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div id="settings" className="scroll-mt-28 rounded-[26px] border border-slate-100 bg-white p-5 igw-shadow-soft">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h2 className="text-sm font-black tracking-tight">Preferences</h2>
-                    <p className="mt-1 text-[11px] text-slate-400">Notification and security settings</p>
-                  </div>
-                  <ShieldCheck className="h-4 w-4 text-emerald-500" />
-                </div>
-                <div className="mt-4 space-y-3">
-                  {([
-                    ["push", "Instant notifications", "Know about every transaction"],
-                    ["email", "Email summary", "Your weekly account digest"],
-                    ["security", "2FA protection", "Secure sign-in verification"],
-                  ] as const).map(([key, label, description]) => (
-                    <button
-                      key={key}
-                      onClick={() => setSwitches((current) => ({ ...current, [key]: !current[key] }))}
-                      className="flex w-full items-center gap-3 rounded-xl px-1 py-1.5 text-left"
-                    >
-                      <span className="min-w-0 flex-1">
-                        <span className="block text-[12px] font-bold">{label}</span>
-                        <span className="block text-[10px] text-slate-400">{description}</span>
-                      </span>
-                      <span className={`relative h-5 w-9 rounded-full transition ${switches[key] ? "igw-gradient" : "bg-slate-200"}`}>
-                        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition ${switches[key] ? "left-[18px]" : "left-0.5"}`} />
-                      </span>
+            <Card id="notifications">
+              <SectionTitle
+                eyebrow="Updates"
+                title="Notifications"
+                action={
+                  data.unreadCount > 0 ? (
+                    <button onClick={markAllRead} className="text-[11px] font-bold text-[#7F00FF] hover:underline">
+                      Mark all as read
                     </button>
+                  ) : undefined
+                }
+              />
+              {data.notifications.length === 0 ? (
+                <p className="rounded-2xl bg-slate-50 p-6 text-center text-[13px] text-slate-500">No notifications yet.</p>
+              ) : (
+                <ul className="space-y-2.5">
+                  {data.notifications.map((n) => (
+                    <li
+                      key={n.id}
+                      className={`rounded-2xl border p-3.5 text-[12px] ${n.read ? "border-slate-100 bg-white" : "border-purple-200 bg-purple-50/60"}`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {!n.read && <span className="h-2 w-2 shrink-0 rounded-full bg-[#7F00FF]" aria-label="Unread" />}
+                        <p className="font-black">{n.title}</p>
+                        <span className="ml-auto shrink-0 text-[10px] text-slate-400">{formatDate(n.createdAt)}</span>
+                      </div>
+                      <p className="mt-1 leading-5 text-slate-600">{n.body}</p>
+                    </li>
                   ))}
-                </div>
-              </div>
-            </div>
-          </section>
+                </ul>
+              )}
+            </Card>
+          </div>
 
-          {/* Cards */}
-          <section id="cards" className="scroll-mt-28 rounded-[26px] border border-slate-100 bg-white p-6 igw-shadow-soft">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+          <Card id="profile">
+            <SectionTitle eyebrow="Account" title="Profile" />
+            <dl className="grid gap-4 text-[13px] sm:grid-cols-2 lg:grid-cols-4">
+              <div><dt className="text-[11px] text-slate-500">Name</dt><dd className="mt-1 font-bold">{data.user.name}</dd></div>
+              <div><dt className="text-[11px] text-slate-500">Email</dt><dd className="mt-1 break-all font-bold">{data.user.email}</dd></div>
               <div>
-                <h2 className="text-sm font-black tracking-tight">My Cards</h2>
-                <p className="mt-1 text-[11px] text-slate-400">Manage all your cards in one place and freeze them anytime</p>
+                <dt className="text-[11px] text-slate-500">Account number</dt>
+                <dd className="mt-1 flex items-center gap-2">
+                  <span className="font-mono font-black tracking-[0.12em]">{formatAccountNumber(data.user.accountNumber)}</span>
+                  <CopyButton value={data.user.accountNumber} onCopied={copied} />
+                </dd>
               </div>
-              <button
-                onClick={() => setToast({ type: "ok", message: "Your new card request was received." })}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-purple-200 px-3.5 py-2 text-[11px] font-bold text-[#7F00FF] transition hover:bg-purple-50"
-              >
-                <Plus className="h-3.5 w-3.5" /> Create new card
-              </button>
-            </div>
-            <div className="mt-6 grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-              {data.cards.map((card) => (
-                <BankCard key={card.id} card={card} onToggle={toggleCard} />
-              ))}
-            </div>
-            <div className="mt-6 flex items-center gap-3 rounded-2xl bg-slate-50 p-4">
-              <LockKeyhole className="h-5 w-5 shrink-0 text-[#7F00FF]" />
-              <p className="text-[11px] leading-5 text-slate-500">
-                All card activity is protected by 256-bit encryption. If you lose a card, freeze it with one tap.
-              </p>
-            </div>
-          </section>
-
-          <footer className="flex flex-wrap items-center justify-between gap-3 pb-4 text-[11px] text-slate-400">
-            <p>© {new Date().getFullYear()} Insta Global Wallet · Demo dashboard</p>
-            <p className="flex items-center gap-1.5"><ShieldCheck className="h-3.5 w-3.5" /> Secure connection · {data.user.plan}</p>
-          </footer>
+              <div><dt className="text-[11px] text-slate-500">Member since</dt><dd className="mt-1 font-bold">{formatDate(data.user.memberSince)}</dd></div>
+            </dl>
+          </Card>
         </main>
       </div>
 
-      {/* Action drawer */}
-      {action && (
-        <div className="fixed inset-0 z-[60] flex">
-          <button className="absolute inset-0 bg-[#10152b]/55 backdrop-blur-sm" onClick={() => setAction(null)} aria-label="Kapat" />
-          <div className="relative ml-auto flex h-full w-full max-w-[440px] flex-col bg-white shadow-2xl">
-            <div className="flex items-start justify-between border-b border-slate-100 px-6 py-5">
-              <div>
-                <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-[#7F00FF]">New transaction</p>
-                <h2 className="mt-1.5 text-xl font-black tracking-tight">{actionTitles[action].title}</h2>
-                <p className="mt-1 text-[12px] text-slate-500">{actionTitles[action].subtitle}</p>
-              </div>
-              <button onClick={() => setAction(null)} className="rounded-xl p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700" aria-label="Kapat">
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            <form onSubmit={submitAction} className="flex flex-1 flex-col overflow-hidden">
-              <div className="flex-1 space-y-5 overflow-y-auto px-6 py-6 scrollbar-thin">
-                {action === "send" && (
-                  <>
-                    <div>
-                      <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">Recipient</label>
-                      <select
-                        value={form.recipientId}
-                        onChange={(event) => setForm((current) => ({ ...current, recipientId: event.target.value }))}
-                        className="h-12 w-full rounded-xl border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-800 focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                      >
-                        {data.recipients.map((recipient) => (
-                          <option key={recipient.id} value={recipient.id}>{recipient.name} · {recipient.currency}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">From wallet</label>
-                      <select
-                        value={form.walletId}
-                        onChange={(event) => setForm((current) => ({ ...current, walletId: event.target.value }))}
-                        className="h-12 w-full rounded-xl border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-800 focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                      >
-                        {data.wallets.map((wallet) => (
-                          <option key={wallet.id} value={wallet.id}>
-                            {CURRENCIES[wallet.currency]?.flag} {wallet.currency} · {formatMoney(wallet.balance, wallet.currency)}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </>
-                )}
-
-                {(action === "topup" || action === "withdraw" || action === "exchange") && (
-                  <div>
-                    <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                      {action === "exchange" ? "From wallet" : "Wallet"}
-                    </label>
-                    <select
-                      value={form.walletId}
-                      onChange={(event) => setForm((current) => ({ ...current, walletId: event.target.value }))}
-                      className="h-12 w-full rounded-xl border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-800 focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                    >
-                      {data.wallets.map((wallet) => (
-                        <option key={wallet.id} value={wallet.id}>
-                          {CURRENCIES[wallet.currency]?.flag} {wallet.currency} · {formatMoney(wallet.balance, wallet.currency)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-
-                {action === "exchange" && (
-                  <div>
-                    <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">To wallet</label>
-                    <select
-                      value={form.targetWalletId}
-                      onChange={(event) => setForm((current) => ({ ...current, targetWalletId: event.target.value }))}
-                      className="h-12 w-full rounded-xl border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-800 focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                    >
-                      {data.wallets.map((wallet) => (
-                        <option key={wallet.id} value={wallet.id}>
-                          {CURRENCIES[wallet.currency]?.flag} {wallet.currency} · {formatMoney(wallet.balance, wallet.currency)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-
-                {(action === "topup" || action === "withdraw") && (
-                  <div>
-                    <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                      {action === "topup" ? "Payment method" : "Withdrawal account"}
-                    </label>
-                    <select
-                      value={form.method}
-                      onChange={(event) => setForm((current) => ({ ...current, method: event.target.value }))}
-                      className="h-12 w-full rounded-xl border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-800 focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                    >
-                      <option>Bank card •••• 3910</option>
-                      <option>Bank account •••• 7742</option>
-                      <option>IGW Virtual •••• 4291</option>
-                    </select>
-                  </div>
-                )}
-
-                <div>
-                  <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">Amount</label>
-                  <div className="relative">
-                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-lg font-bold text-slate-400">
-                      {selectedWallet ? CURRENCIES[selectedWallet.currency]?.symbol : "$"}
-                    </span>
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      autoFocus
-                      value={form.amount}
-                      onChange={(event) => setForm((current) => ({ ...current, amount: event.target.value }))}
-                      placeholder="0,00"
-                      className="h-14 w-full rounded-xl border border-slate-200 pl-10 pr-20 text-xl font-black text-[#10152b] focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                    />
-                    <span className="absolute right-4 top-1/2 -translate-y-1/2 text-[11px] font-bold text-slate-400">
-                      {selectedWallet?.currency ?? "USD"}
-                    </span>
-                  </div>
-                  {selectedWallet && (
-                    <p className="mt-2 text-[11px] text-slate-400">
-                      Available balance: <span className="font-bold text-slate-600">{formatMoney(selectedWallet.balance, selectedWallet.currency)}</span>
-                    </p>
-                  )}
-                </div>
-
-                {preview !== null && (
-                  <div className="flex items-center gap-3 rounded-2xl igw-gradient-soft p-4">
-                    <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-white text-[#7F00FF] shadow-sm"><Repeat2 className="h-4 w-4" /></span>
-                    <div>
-                      <p className="text-[10px] font-semibold text-slate-500">Recipient will receive</p>
-                      <p className="text-sm font-black text-[#10152b]">
-                        {formatMoney(preview, action === "send" ? selectedRecipient?.currency ?? "USD" : targetWallet?.currency ?? "USD")}
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                <div>
-                  <label className="mb-2 block text-[11px] font-bold uppercase tracking-wide text-slate-500">Note <span className="font-normal normal-case text-slate-400">(optional)</span></label>
-                  <textarea
-                    value={form.note}
-                    onChange={(event) => setForm((current) => ({ ...current, note: event.target.value }))}
-                    rows={3}
-                    placeholder="Add a note for this transaction..."
-                    className="w-full resize-none rounded-xl border border-slate-200 p-3 text-[13px] font-medium text-slate-800 focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
-                  />
-                </div>
-
-                <div className="flex items-start gap-2.5 rounded-xl bg-slate-50 p-3.5">
-                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-                  <p className="text-[11px] leading-5 text-slate-500">Your transaction is protected with 256-bit encryption and updates instantly.</p>
-                </div>
-              </div>
-
-              <div className="border-t border-slate-100 bg-white px-6 py-4">
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="igw-gradient flex h-12 w-full items-center justify-center gap-2 rounded-xl text-[13px] font-bold text-white shadow-[0_14px_28px_-12px_rgba(127,0,255,0.9)] transition hover:-translate-y-0.5 disabled:opacity-60"
-                >
-                  {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                  {loading ? "Processing..." : "Confirm transaction"}
-                </button>
-                <button type="button" onClick={() => setAction(null)} className="mt-2 h-10 w-full rounded-xl text-[12px] font-semibold text-slate-400 transition hover:text-slate-700">
-                  Cancel
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Toast */}
-      {toast && (
-        <div className={`fixed bottom-6 right-6 z-[80] flex max-w-sm items-center gap-3 rounded-2xl px-4 py-3.5 text-[12px] font-bold text-white shadow-2xl ${
-          toast.type === "ok" ? "bg-[#10152b]" : "bg-rose-600"
-        }`}>
-          {toast.type === "ok" ? <Check className="h-4 w-4 text-emerald-300" /> : <X className="h-4 w-4" />}
-          {toast.message}
-        </div>
-      )}
+      <ToastView toast={toast} />
     </div>
   );
 }

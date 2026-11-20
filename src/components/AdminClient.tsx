@@ -1,0 +1,679 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
+import {
+  ArrowLeftRight,
+  Bell,
+  CheckCircle2,
+  ChevronRight,
+  ExternalLink,
+  Inbox,
+  Loader2,
+  LogOut,
+  Menu,
+  Search,
+  Settings,
+  ShieldCheck,
+  Wallet,
+  X,
+  XCircle,
+  type LucideIcon,
+} from "lucide-react";
+import { Brand } from "@/components/Brand";
+import { signOutAction } from "@/app/auth/actions";
+import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminTransaction } from "@/lib/admin";
+import type { DepositVerification } from "@/lib/btc/chain";
+import {
+  DEPOSIT_STATUS_LABEL,
+  TX_STATUS_LABEL,
+  TX_TYPE_LABEL,
+  formatAccountNumber,
+  formatDate,
+  formatMoney,
+  shortHash,
+} from "@/lib/format";
+import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, ToastView, postJson, type Toast } from "@/components/wallet-ui";
+
+type View = "notifications" | "deposits" | "transactions" | "settings";
+
+const navItems: { id: View; label: string; icon: LucideIcon }[] = [
+  { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "deposits", label: "Deposit requests", icon: Inbox },
+  { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
+  { id: "settings", label: "Settings", icon: Settings },
+];
+
+const FILTERS: { id: string | null; label: string }[] = [
+  { id: "reviewing", label: "Pending review" },
+  { id: "awaiting_payment", label: "Awaiting payment" },
+  { id: "approved", label: "Approved" },
+  { id: "rejected", label: "Rejected" },
+  { id: null, label: "All" },
+];
+
+const button =
+  "inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-[13px] font-bold transition disabled:cursor-not-allowed disabled:opacity-50";
+const inputClass =
+  "h-11 w-full rounded-xl border border-slate-200 bg-white px-3.5 text-base font-semibold text-slate-800 focus:border-purple-400 focus:outline-none focus:ring-2 focus:ring-purple-100 sm:text-[13px]";
+
+const admin = <T,>(body: Record<string, unknown>) => postJson<T>("/api/admin", body, "/admin");
+
+/* ---------------------------------------------------------------------------------------------- */
+
+function VerificationView({ verification }: { verification: DepositVerification }) {
+  return (
+    <div className={`rounded-2xl border p-4 ${verification.matched ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50"}`} data-testid="verification">
+      <p className={`text-[13px] font-black ${verification.matched ? "text-emerald-800" : "text-rose-700"}`}>
+        {verification.matched ? "Payment verified on the Bitcoin blockchain" : "Payment NOT verified"}
+      </p>
+      <ul className="mt-3 space-y-2 text-[12px]">
+        {verification.checks.map((check) => (
+          <li key={check.label} className="flex items-start gap-2">
+            {check.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />}
+            <span className="min-w-0">
+              <span className="font-bold">{check.label}</span>
+              <span className="block break-all text-slate-600">{check.detail}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-3 text-[11px] text-slate-500">Checked {formatDate(verification.checkedAt)} · Bitcoin Mainnet</p>
+    </div>
+  );
+}
+
+function DepositDetail({
+  id,
+  onClose,
+  onChanged,
+  notify,
+}: {
+  id: number;
+  onClose: () => void;
+  onChanged: () => Promise<void>;
+  notify: (toast: Toast) => void;
+}) {
+  const [deposit, setDeposit] = useState<AdminDepositDetail | null>(null);
+  const [verification, setVerification] = useState<DepositVerification | null>(null);
+  const [busy, setBusy] = useState<"verify" | "approve" | "reject" | null>(null);
+  const [confirmApprove, setConfirmApprove] = useState(false);
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const response = await admin<{ deposit: AdminDepositDetail }>({ action: "deposit", id });
+    setDeposit(response.deposit);
+  }, [id]);
+
+  useEffect(() => {
+    load().catch((err) => setError(err instanceof Error ? err.message : "Could not load the request."));
+  }, [load]);
+
+  async function verify() {
+    setBusy("verify");
+    setError(null);
+    try {
+      const response = await admin<{ verification: DepositVerification }>({ action: "verify", id });
+      setVerification(response.verification);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Verification failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function approve() {
+    setBusy("approve");
+    setError(null);
+    try {
+      await admin({ action: "approve", id });
+      notify({ type: "ok", message: "Deposit approved and balance credited." });
+      await Promise.all([load(), onChanged()]);
+      setConfirmApprove(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Approval failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function reject() {
+    setBusy("reject");
+    setError(null);
+    try {
+      await admin({ action: "reject", id, reason });
+      notify({ type: "ok", message: "Deposit rejected. The user was notified." });
+      setReason("");
+      await Promise.all([load(), onChanged()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Rejection failed.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const reviewable = deposit?.status === "reviewing";
+  const rejectable = deposit?.status === "reviewing" || deposit?.status === "awaiting_payment";
+
+  return (
+    <div className="fixed inset-0 z-[60] flex justify-end bg-[#10152b]/50 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label="Deposit request">
+      <div className="h-full w-full max-w-[640px] overflow-y-auto bg-[#f7f7fb] p-4 sm:p-6">
+        <div className="mb-4 flex items-center gap-3">
+          <p className="text-lg font-black">Deposit request</p>
+          {deposit && <Badge tone={STATUS_TONE[deposit.status]}>{DEPOSIT_STATUS_LABEL[deposit.status]}</Badge>}
+          <button onClick={onClose} className="ml-auto flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white" aria-label="Close">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        {!deposit && !error && <Loader2 className="mx-auto mt-10 h-6 w-6 animate-spin text-[#7F00FF]" />}
+
+        {deposit && (
+          <div className="space-y-4">
+            <Card>
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">User</p>
+              <dl className="mt-3 grid gap-3 text-[13px] sm:grid-cols-2">
+                <div><dt className="text-[11px] text-slate-500">Name</dt><dd className="font-bold">{deposit.user.name}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Email</dt><dd className="break-all font-bold">{deposit.user.email}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Account number</dt><dd className="font-mono font-bold">{formatAccountNumber(deposit.user.accountNumber)}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Current balance</dt><dd className="font-bold">{formatMoney(deposit.user.balance)}</dd></div>
+              </dl>
+            </Card>
+
+            <Card>
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Payment</p>
+              <dl className="mt-3 grid gap-3 text-[13px] sm:grid-cols-2">
+                <div><dt className="text-[11px] text-slate-500">Reference</dt><dd className="font-mono font-bold">{deposit.reference}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Amount</dt><dd className="font-black text-[#7F00FF]">{formatMoney(deposit.amountUsd)}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Expected BTC</dt><dd className="font-mono font-bold">{deposit.amountBtc} BTC ({deposit.amountSats.toLocaleString("en-US")} sats)</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Rate</dt><dd className="font-bold">{formatMoney(deposit.btcUsdRate)} · {deposit.rateSource}</dd></div>
+                <div className="sm:col-span-2"><dt className="text-[11px] text-slate-500">Address (Bitcoin Mainnet)</dt><dd className="break-all font-mono text-[12px] font-bold">{deposit.btcAddress}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Created</dt><dd>{formatDate(deposit.createdAt)}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Quote valid until</dt><dd>{formatDate(deposit.expiresAt)}</dd></div>
+                {deposit.submittedAt && <div><dt className="text-[11px] text-slate-500">&quot;I&apos;ve paid&quot; at</dt><dd>{formatDate(deposit.submittedAt)}</dd></div>}
+                {deposit.reviewedAt && <div><dt className="text-[11px] text-slate-500">Reviewed</dt><dd>{formatDate(deposit.reviewedAt)}{deposit.reviewedBy ? ` by ${deposit.reviewedBy}` : ""}</dd></div>}
+                <div className="sm:col-span-2">
+                  <dt className="text-[11px] text-slate-500">Transaction ID (TXID)</dt>
+                  <dd className="mt-1 flex flex-wrap items-center gap-2">
+                    {deposit.txid ? (
+                      <>
+                        <code className="min-w-0 flex-1 break-all text-[12px] font-bold">{deposit.txid}</code>
+                        <CopyButton value={deposit.txid} label="Copy" />
+                        <a href={`https://mempool.space/tx/${deposit.txid}`} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-[12px] font-bold text-[#7F00FF] hover:underline">
+                          mempool.space <ExternalLink className="h-3.5 w-3.5" />
+                        </a>
+                      </>
+                    ) : (
+                      <span className="text-slate-400">Not submitted yet</span>
+                    )}
+                  </dd>
+                </div>
+                {deposit.rejectionReason && <div className="sm:col-span-2"><dt className="text-[11px] text-slate-500">Rejection reason</dt><dd className="text-rose-600">{deposit.rejectionReason}</dd></div>}
+              </dl>
+            </Card>
+
+            {deposit.txid && (
+              <Card>
+                <div className="flex flex-wrap items-center gap-3">
+                  <p className="text-[13px] font-black">Blockchain check</p>
+                  <button onClick={verify} disabled={busy !== null} className={`${button} ml-auto border border-slate-200 bg-white text-slate-700 hover:text-[#7F00FF]`}>
+                    {busy === "verify" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                    Check TXID on blockchain
+                  </button>
+                </div>
+                <p className="mt-2 text-[11px] text-slate-500">
+                  Reads mempool.space and blockstream.info. Requires the exact amount to the address above and at least{" "}
+                  {deposit.requiredConfirmations} confirmations.
+                </p>
+                <div className="mt-3">
+                  {verification ? (
+                    <VerificationView verification={verification} />
+                  ) : deposit.verification ? (
+                    <VerificationView verification={deposit.verification} />
+                  ) : null}
+                </div>
+              </Card>
+            )}
+
+            {(reviewable || rejectable) && (
+              <Card>
+                <p className="text-[13px] font-black">Decision</p>
+                {reviewable && (
+                  <div className="mt-3">
+                    {!confirmApprove ? (
+                      <button
+                        onClick={() => setConfirmApprove(true)}
+                        disabled={busy !== null || !verification?.matched}
+                        className={`${button} w-full bg-emerald-600 text-white hover:bg-emerald-700`}
+                        title={verification?.matched ? "" : "Run a successful blockchain check first"}
+                      >
+                        <CheckCircle2 className="h-4 w-4" /> Approve payment
+                      </button>
+                    ) : (
+                      <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                        <p className="text-[13px] font-bold text-emerald-900">
+                          Credit {formatMoney(deposit.amountUsd)} to {deposit.user.name} ({formatAccountNumber(deposit.user.accountNumber)})?
+                          The blockchain is checked again before the balance changes.
+                        </p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button onClick={approve} disabled={busy !== null} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
+                            {busy === "approve" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                            Yes, approve
+                          </button>
+                          <button onClick={() => setConfirmApprove(false)} disabled={busy !== null} className={`${button} border border-slate-200 bg-white text-slate-700`}>
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {!verification?.matched && (
+                      <p className="mt-2 text-[11px] text-slate-500">Approval is available after a successful blockchain check.</p>
+                    )}
+                  </div>
+                )}
+                {rejectable && (
+                  <div className="mt-4">
+                    <label htmlFor="reject-reason" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                      Rejection reason (sent to the user)
+                    </label>
+                    <textarea
+                      id="reject-reason"
+                      value={reason}
+                      onChange={(event) => setReason(event.target.value)}
+                      rows={3}
+                      maxLength={500}
+                      className="w-full rounded-xl border border-slate-200 bg-white p-3 text-base focus:border-purple-400 focus:outline-none focus:ring-2 focus:ring-purple-100 sm:text-[13px]"
+                    />
+                    <button onClick={reject} disabled={busy !== null || reason.trim().length < 3} className={`${button} mt-2 w-full bg-rose-600 text-white hover:bg-rose-700`}>
+                      {busy === "reject" ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />}
+                      Reject payment
+                    </button>
+                  </div>
+                )}
+              </Card>
+            )}
+
+            <Card>
+              <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">User&apos;s recent transactions</p>
+              {deposit.userTransactions.length === 0 ? (
+                <p className="mt-3 text-[12px] text-slate-500">None.</p>
+              ) : (
+                <ul className="mt-2 divide-y divide-slate-100 text-[12px]">
+                  {deposit.userTransactions.map((tx) => (
+                    <li key={tx.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2">
+                      <span className="font-mono text-slate-500">{tx.reference}</span>
+                      <span className="font-bold">{TX_TYPE_LABEL[tx.type] ?? tx.type}</span>
+                      <span>{tx.direction === "in" ? "+" : "−"}{formatMoney(tx.amount, tx.currency)}</span>
+                      <span className="ml-auto"><Badge tone={STATUS_TONE[tx.status]}>{TX_STATUS_LABEL[tx.status] ?? tx.status}</Badge></span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          </div>
+        )}
+
+        {error && (
+          <p role="alert" className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
+            {error}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+
+export default function AdminClient({
+  initialOverview,
+  initialDeposits,
+}: {
+  initialOverview: AdminOverview;
+  initialDeposits: AdminDeposit[];
+}) {
+  const [overview, setOverview] = useState(initialOverview);
+  const [deposits, setDeposits] = useState(initialDeposits);
+  const [filter, setFilter] = useState<string | null>("reviewing");
+  const [transactions, setTransactions] = useState<AdminTransaction[] | null>(null);
+  const [view, setView] = useState<View>("notifications");
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [toast, setToast] = useState<Toast>(null);
+  const [address, setAddress] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  const refresh = useCallback(async () => {
+    const [o, d] = await Promise.all([
+      admin<{ overview: AdminOverview }>({ action: "overview" }),
+      admin<{ deposits: AdminDeposit[] }>({ action: "deposits", status: null }),
+    ]);
+    setOverview(o.overview);
+    setDeposits(d.deposits);
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") refresh().catch(() => {});
+    }, 20000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (view === "transactions" && transactions === null) {
+      admin<{ transactions: AdminTransaction[] }>({ action: "transactions" })
+        .then((r) => setTransactions(r.transactions))
+        .catch((err) => setToast({ type: "error", message: err instanceof Error ? err.message : "Could not load." }));
+    }
+  }, [view, transactions]);
+
+  async function openNotification(id: number, requestId?: unknown) {
+    try {
+      await admin({ action: "readNotifications", ids: [id] });
+    } catch {
+      /* not critical */
+    }
+    if (typeof requestId === "number") setOpenId(requestId);
+    refresh().catch(() => {});
+  }
+
+  async function saveAddress() {
+    setSaving(true);
+    try {
+      const response = await admin<{ btcAddress: string }>({ action: "setBtcAddress", address });
+      setToast({ type: "ok", message: `Deposit address saved: ${shortHash(response.btcAddress, 8)}` });
+      setAddress("");
+      await refresh();
+    } catch (err) {
+      setToast({ type: "error", message: err instanceof Error ? err.message : "Could not save the address." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const visibleDeposits = deposits.filter((d) => filter === null || d.status === filter);
+  const goTo = (id: View) => {
+    setView(id);
+    setMobileOpen(false);
+  };
+
+  return (
+    <div lang="en" className="min-h-screen bg-[#f7f7fb] text-[#10152b]">
+      <aside
+        className={`fixed inset-y-0 left-0 z-50 flex w-[264px] flex-col bg-[#10152b] text-white transition-transform duration-300 lg:translate-x-0 ${
+          mobileOpen ? "translate-x-0" : "-translate-x-full"
+        }`}
+      >
+        <div className="flex h-[76px] items-center justify-between border-b border-white/5 px-6">
+          <Brand dark compact href="/admin" />
+          <button className="text-white/60 lg:hidden" onClick={() => setMobileOpen(false)} aria-label="Close menu">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <nav className="flex-1 space-y-1.5 px-4 py-6">
+          <p className="mb-3 flex items-center gap-2 px-3 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-300">
+            <ShieldCheck className="h-3.5 w-3.5" /> Admin
+          </p>
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const count = item.id === "notifications" ? overview.unreadCount : item.id === "deposits" ? overview.counts.reviewing : 0;
+            return (
+              <button
+                key={item.id}
+                onClick={() => goTo(item.id)}
+                className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold transition ${
+                  view === item.id ? "igw-gradient text-white" : "text-white/55 hover:bg-white/5 hover:text-white"
+                }`}
+              >
+                <Icon className="h-[18px] w-[18px]" />
+                {item.label}
+                {count > 0 ? (
+                  <span className="ml-auto rounded-full bg-rose-500 px-2 py-0.5 text-[10px] font-black">{count}</span>
+                ) : (
+                  view === item.id && <ChevronRight className="ml-auto h-4 w-4 opacity-70" />
+                )}
+              </button>
+            );
+          })}
+          <Link href="/dashboard" className="mt-6 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-[13px] font-semibold text-white/55 hover:bg-white/5 hover:text-white">
+            <Wallet className="h-[18px] w-[18px]" /> My wallet
+          </Link>
+        </nav>
+        <div className="p-4">
+          <p className="truncate px-2 text-[12px] font-semibold text-white">{overview.admin.name}</p>
+          <p className="truncate px-2 text-[10px] text-white/40">@{overview.admin.username ?? overview.admin.email}</p>
+          <form action={signOutAction}>
+            <button type="submit" className="mt-2 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-[12px] font-semibold text-white/50 hover:bg-white/5 hover:text-white">
+              <LogOut className="h-4 w-4" /> Sign out
+            </button>
+          </form>
+        </div>
+      </aside>
+      {mobileOpen && <button className="fixed inset-0 z-40 bg-[#10152b]/60 lg:hidden" onClick={() => setMobileOpen(false)} aria-label="Close menu" />}
+
+      <div className="lg:pl-[264px]">
+        <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-white/85 backdrop-blur-xl">
+          <div className="flex h-[68px] items-center gap-3 px-4 sm:px-8">
+            <button className="text-slate-600 lg:hidden" onClick={() => setMobileOpen(true)} aria-label="Open menu">
+              <Menu className="h-5 w-5" />
+            </button>
+            <p className="text-sm font-extrabold">Admin · {navItems.find((n) => n.id === view)?.label}</p>
+            {overview.counts.reviewing > 0 && (
+              <button onClick={() => { setFilter("reviewing"); goTo("deposits"); }} className="ml-auto rounded-full bg-rose-500 px-3 py-1.5 text-[11px] font-black text-white">
+                {overview.counts.reviewing} pending
+              </button>
+            )}
+          </div>
+        </header>
+
+        <main className="mx-auto max-w-[1200px] space-y-6 px-4 py-6 sm:px-8">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            {[
+              ["Pending review", overview.counts.reviewing],
+              ["Awaiting payment", overview.counts.awaitingPayment],
+              ["Members", overview.counts.users],
+              ["Total balances", formatMoney(overview.counts.totalBalance)],
+            ].map(([label, value]) => (
+              <div key={String(label)} className="rounded-2xl border border-slate-100 bg-white p-4 igw-shadow-soft">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{label}</p>
+                <p className="mt-1 text-xl font-black">{value}</p>
+              </div>
+            ))}
+          </div>
+
+          {view === "notifications" && (
+            <Card>
+              <SectionTitle
+                eyebrow="Inbox"
+                title="Notifications"
+                action={overview.unreadCount > 0 ? (
+                  <button onClick={async () => { await admin({ action: "readNotifications" }); await refresh(); }} className="text-[11px] font-bold text-[#7F00FF] hover:underline">
+                    Mark all as read
+                  </button>
+                ) : undefined}
+              />
+              {overview.notifications.length === 0 ? (
+                <p className="rounded-2xl bg-slate-50 p-6 text-center text-[13px] text-slate-500">No notifications.</p>
+              ) : (
+                <ul className="space-y-2.5">
+                  {overview.notifications.map((n) => {
+                    const d = n.data as Record<string, string | number | undefined>;
+                    return (
+                      <li key={n.id}>
+                        <button
+                          onClick={() => openNotification(n.id, d.requestId)}
+                          className={`w-full rounded-2xl border p-4 text-left text-[12px] transition hover:border-purple-300 ${
+                            n.read ? "border-slate-100 bg-white" : "border-[#7F00FF] bg-purple-50 shadow-[0_0_0_3px_rgba(127,0,255,0.08)]"
+                          }`}
+                          data-testid={n.read ? "notification" : "notification-new"}
+                        >
+                          <div className="flex flex-wrap items-center gap-2">
+                            {!n.read && <Badge tone="purple">NEW</Badge>}
+                            <p className="font-black">{n.title}</p>
+                            <span className="ml-auto text-[10px] text-slate-400">{formatDate(n.createdAt)}</span>
+                          </div>
+                          {n.kind === "deposit_submitted" ? (
+                            <dl className="mt-2 grid gap-x-4 gap-y-1 sm:grid-cols-2">
+                              <div><dt className="inline text-slate-500">User: </dt><dd className="inline font-bold">{d.userName}</dd></div>
+                              <div><dt className="inline text-slate-500">Account: </dt><dd className="inline font-mono font-bold">{d.accountNumber}</dd></div>
+                              <div className="break-all"><dt className="inline text-slate-500">Email: </dt><dd className="inline">{d.email}</dd></div>
+                              <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(Number(d.amountUsd))} · {d.amountBtc} BTC</dd></div>
+                              <div><dt className="inline text-slate-500">Reference: </dt><dd className="inline font-mono">{d.reference}</dd></div>
+                              <div><dt className="inline text-slate-500">Date: </dt><dd className="inline">{d.submittedAt ? formatDate(String(d.submittedAt)) : "—"}</dd></div>
+                              <div><dt className="inline text-slate-500">Status: </dt><dd className="inline">{DEPOSIT_STATUS_LABEL[String(d.status)] ?? d.status}</dd></div>
+                            </dl>
+                          ) : (
+                            <p className="mt-1 text-slate-600">{n.body}</p>
+                          )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </Card>
+          )}
+
+          {view === "deposits" && (
+            <Card>
+              <SectionTitle eyebrow="BTC" title="Deposit requests" />
+              <div className="-mx-1 mb-4 flex gap-2 overflow-x-auto px-1 pb-1">
+                {FILTERS.map((f) => (
+                  <button
+                    key={f.label}
+                    onClick={() => setFilter(f.id)}
+                    className={`shrink-0 rounded-xl px-3 py-2 text-[12px] font-bold ${filter === f.id ? "igw-gradient text-white" : "bg-slate-100 text-slate-600"}`}
+                  >
+                    {f.label}
+                    {f.id === "reviewing" && overview.counts.reviewing > 0 ? ` (${overview.counts.reviewing})` : ""}
+                  </button>
+                ))}
+              </div>
+              {visibleDeposits.length === 0 ? (
+                <p className="rounded-2xl bg-slate-50 p-6 text-center text-[13px] text-slate-500">No requests.</p>
+              ) : (
+                <ul className="space-y-2.5">
+                  {visibleDeposits.map((d) => (
+                    <li key={d.id}>
+                      <button
+                        onClick={() => setOpenId(d.id)}
+                        className={`grid w-full gap-2 rounded-2xl border p-4 text-left text-[12px] transition hover:border-purple-300 sm:grid-cols-[1.3fr_1fr_1fr_auto] sm:items-center ${
+                          d.status === "reviewing" ? "border-purple-300 bg-purple-50/50" : "border-slate-100 bg-white"
+                        }`}
+                        data-testid="deposit-row"
+                      >
+                        <span className="min-w-0">
+                          <span className="block truncate font-black">{d.user.name}</span>
+                          <span className="block font-mono text-slate-500">{formatAccountNumber(d.user.accountNumber)} · {d.reference}</span>
+                        </span>
+                        <span>
+                          <span className="block font-black">{formatMoney(d.amountUsd)}</span>
+                          <span className="block font-mono text-slate-500">{d.amountBtc} BTC</span>
+                        </span>
+                        <span className="text-slate-500">{formatDate(d.submittedAt ?? d.createdAt)}</span>
+                        <span><Badge tone={STATUS_TONE[d.status]}>{DEPOSIT_STATUS_LABEL[d.status]}</Badge></span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          )}
+
+          {view === "transactions" && (
+            <Card>
+              <SectionTitle eyebrow="History" title="All transactions" />
+              {transactions === null ? (
+                <Loader2 className="mx-auto h-6 w-6 animate-spin text-[#7F00FF]" />
+              ) : transactions.length === 0 ? (
+                <p className="rounded-2xl bg-slate-50 p-6 text-center text-[13px] text-slate-500">No transactions.</p>
+              ) : (
+                <ul className="divide-y divide-slate-100 text-[12px]">
+                  {transactions.map((tx) => (
+                    <li key={tx.id} className="grid gap-1 py-3 sm:grid-cols-[1.2fr_1fr_1fr_auto] sm:items-center">
+                      <span className="min-w-0">
+                        <span className="block truncate font-bold">{tx.user.name}</span>
+                        <span className="block font-mono text-slate-500">{tx.user.accountNumber} · {tx.reference}</span>
+                      </span>
+                      <span>
+                        <span className="block font-bold">{TX_TYPE_LABEL[tx.type] ?? tx.type}</span>
+                        <span className="block truncate text-slate-500">{tx.description}</span>
+                      </span>
+                      <span className="text-slate-500">{formatDate(tx.createdAt)}</span>
+                      <span className="flex items-center gap-2 sm:justify-end">
+                        <b className={tx.direction === "in" ? "text-emerald-600" : ""}>{tx.direction === "in" ? "+" : "−"}{formatMoney(tx.amount, tx.currency)}</b>
+                        <Badge tone={STATUS_TONE[tx.status]}>{TX_STATUS_LABEL[tx.status] ?? tx.status}</Badge>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Card>
+          )}
+
+          {view === "settings" && (
+            <Card>
+              <SectionTitle eyebrow="Configuration" title="BTC deposits" action={<Badge tone="amber">Bitcoin Mainnet</Badge>} />
+              <div className="space-y-4 text-[13px]">
+                <div>
+                  <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Current deposit address</p>
+                  {overview.settings.btcAddress ? (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                      <code className="min-w-0 flex-1 break-all font-bold" data-testid="current-address">{overview.settings.btcAddress}</code>
+                      <CopyButton value={overview.settings.btcAddress} />
+                    </div>
+                  ) : (
+                    <p className="mt-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-amber-800">
+                      Not configured — members cannot deposit until you set an address.
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label htmlFor="btc-address" className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                    New deposit address (Bitcoin Mainnet: bc1…, 1… or 3…)
+                  </label>
+                  <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
+                    <input
+                      id="btc-address"
+                      value={address}
+                      onChange={(event) => setAddress(event.target.value.trim())}
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      className={`${inputClass} font-mono`}
+                    />
+                    <button onClick={saveAddress} disabled={saving || address.length < 26} className={`${button} igw-gradient text-white`}>
+                      {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                      Save address
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-slate-500">
+                    The checksum is verified and testnet addresses are refused. Open requests keep the address they were given.
+                  </p>
+                </div>
+                <dl className="grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-4">
+                  <div><dt className="text-[11px] text-slate-500">Confirmations required</dt><dd className="font-bold">{overview.settings.requiredConfirmations}</dd></div>
+                  <div><dt className="text-[11px] text-slate-500">Minimum</dt><dd className="font-bold">{formatMoney(overview.settings.minUsd)}</dd></div>
+                  <div><dt className="text-[11px] text-slate-500">Maximum</dt><dd className="font-bold">{formatMoney(overview.settings.maxUsd)}</dd></div>
+                  <div><dt className="text-[11px] text-slate-500">Quote valid</dt><dd className="font-bold">{overview.settings.quoteMinutes} min</dd></div>
+                </dl>
+              </div>
+            </Card>
+          )}
+        </main>
+      </div>
+
+      {openId !== null && (
+        <DepositDetail id={openId} onClose={() => setOpenId(null)} onChanged={refresh} notify={setToast} />
+      )}
+      <ToastView toast={toast} />
+    </div>
+  );
+}

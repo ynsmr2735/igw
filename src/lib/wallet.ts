@@ -1,151 +1,243 @@
 import { getSessionToken } from "@/lib/auth/session";
-import { AuthError, rpc } from "@/lib/supabase";
-import { CURRENCIES, initialsOf } from "./format";
+import { getBtcUsdPrice } from "@/lib/btc/price";
+import { AuthError, rpc, serviceRpc } from "@/lib/supabase";
 
-export {
-  CURRENCIES,
-  convert,
-  formatDate,
-  formatMoney,
-  initialsOf,
-} from "./format";
+export { formatDate, formatMoney, initialsOf } from "./format";
 
-export type Wallet = {
+export type DepositStatus =
+  | "awaiting_payment"
+  | "reviewing"
+  | "approved"
+  | "rejected"
+  | "expired"
+  | "cancelled";
+
+export type Deposit = {
   id: number;
-  currency: string;
-  name: string;
-  balance: number;
+  reference: string;
   accountNumber: string;
-  isPrimary: boolean;
+  amountUsd: number;
+  btcUsdRate: number;
+  rateSource: string;
+  amountSats: number;
+  amountBtc: string;
+  btcAddress: string;
+  network: "mainnet";
+  status: DepositStatus;
+  txid: string | null;
+  expiresAt: string;
+  submitDeadline: string;
+  createdAt: string;
+  submittedAt: string | null;
+  reviewedAt: string | null;
+  rejectionReason: string | null;
 };
 
 export type Transaction = {
   id: number;
+  reference: string;
   type: string;
   direction: "in" | "out";
   amount: number;
   currency: string;
   counterparty: string;
-  note: string;
-  status: string;
+  counterpartyAccount: string | null;
+  description: string;
+  status: "pending" | "completed" | "failed" | "cancelled";
   createdAt: string;
 };
 
-export type Card = {
+export type Notification = {
   id: number;
-  label: string;
-  last4: string;
-  brand: string;
-  type: string;
-  expiry: string;
-  status: string;
-  theme: string;
+  kind: string;
+  title: string;
+  body: string;
+  data: Record<string, unknown>;
+  read: boolean;
+  createdAt: string;
 };
 
-export type Recipient = {
-  id: number;
-  name: string;
-  email: string;
-  currency: string;
-  color: string;
-  walletId?: number | null;
+export type DepositConfig = {
+  btcAddress: string | null;
+  network: "mainnet";
+  minUsd: number;
+  maxUsd: number;
+  requiredConfirmations: number;
+  quoteMinutes: number;
 };
 
 export type DashboardData = {
-  user: { name: string; email: string; plan: string; initials: string };
-  wallets: Wallet[];
-  transactions: Transaction[];
-  cards: Card[];
-  recipients: Recipient[];
-  stats: {
-    totalUsd: number;
-    moneyIn: number;
-    moneyOut: number;
-    currencyCount: number;
+  user: {
+    name: string;
+    email: string;
+    plan: string;
+    username: string | null;
+    accountNumber: string;
+    isAdmin: boolean;
+    memberSince: string;
+    initials: string;
   };
+  wallet: { balance: number; currency: "USD"; accountNumber: string };
+  transactions: Transaction[];
+  notifications: Notification[];
+  unreadCount: number;
+  deposits: Deposit[];
+  openDeposit: Deposit | null;
+  depositConfig: DepositConfig;
+  stats: { moneyIn: number; moneyOut: number };
 };
 
-export type ActionPayload = {
-  action: string;
-  amount?: number;
-  note?: string;
-  walletId?: number;
-  recipientId?: number;
-  targetWalletId?: number;
-  method?: string;
-  cardId?: number;
+export type TransferResult = {
+  ok: true;
+  duplicate: boolean;
+  reference: string;
+  amount: number;
+  recipientName: string;
+  recipientAccount: string;
+  balance: number;
+  createdAt: string;
 };
 
-/** Shape returned by the igw_dashboard database function. */
-type DashboardRpc =
-  | { ok: false; error: string }
-  | {
-      ok: true;
-      user: { name: string; email: string; plan: string };
-      wallets: Wallet[];
-      transactions: Transaction[];
-      cards: Card[];
-      recipients: Recipient[];
-      flows: { moneyIn: number | string; moneyOut: number | string };
-    };
+/* ---------------- normalisation (Postgres numerics arrive as numbers or strings) ---------------- */
 
-/** Dashboard data for the signed-in user, or null when the session is missing/expired. */
-export async function getDashboardData(): Promise<DashboardData | null> {
-  const token = await getSessionToken();
-  if (!token) return null;
+const num = (value: unknown) => Number(value ?? 0);
 
-  const data = await rpc<DashboardRpc>("igw_dashboard", { p_token: token });
-  if (!data?.ok) return null;
-
-  const wallets = data.wallets.map((wallet) => ({
-    ...wallet,
-    id: Number(wallet.id),
-    balance: Number(wallet.balance),
-  }));
-
+export function toDeposit(raw: Record<string, unknown>): Deposit {
   return {
-    user: { ...data.user, initials: initialsOf(data.user.name) },
-    wallets,
-    transactions: data.transactions.map((row) => ({
-      ...row,
-      id: Number(row.id),
-      amount: Number(row.amount),
-      direction: row.direction === "in" ? "in" : "out",
-      note: row.note ?? "",
-    })),
-    cards: data.cards.map((card) => ({ ...card, id: Number(card.id) })),
-    recipients: data.recipients.map((recipient) => ({
-      ...recipient,
-      id: Number(recipient.id),
-      walletId: recipient.walletId == null ? null : Number(recipient.walletId),
-    })),
-    stats: {
-      totalUsd: wallets.reduce(
-        (total, wallet) => total + wallet.balance * (CURRENCIES[wallet.currency]?.usd ?? 1),
-        0,
-      ),
-      moneyIn: Number(data.flows?.moneyIn ?? 0),
-      moneyOut: Number(data.flows?.moneyOut ?? 0),
-      currencyCount: wallets.length,
-    },
+    ...(raw as unknown as Deposit),
+    id: num(raw.id),
+    amountUsd: num(raw.amountUsd),
+    btcUsdRate: num(raw.btcUsdRate),
+    amountSats: num(raw.amountSats),
   };
 }
 
-export async function executeAction(payload: ActionPayload): Promise<{ convertedAmount?: number }> {
+export function toTransaction(raw: Record<string, unknown>): Transaction {
+  return {
+    ...(raw as unknown as Transaction),
+    id: num(raw.id),
+    amount: num(raw.amount),
+    direction: raw.direction === "in" ? "in" : "out",
+    description: String(raw.description ?? ""),
+  };
+}
+
+function toNotification(raw: Record<string, unknown>): Notification {
+  return { ...(raw as unknown as Notification), id: num(raw.id), read: Boolean(raw.read) };
+}
+
+function initials(name: string): string {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+}
+
+async function requireToken(): Promise<string> {
   const token = await getSessionToken();
   if (!token) throw new AuthError();
+  return token;
+}
 
-  const result = await rpc<{ ok: boolean; converted_amount?: number | string }>("igw_wallet_action", {
+/* ---------------- dashboard ---------------- */
+
+type DashboardRpc = { ok: false } | ({ ok: true } & Record<string, unknown>);
+
+/** Wallet data for the signed-in user, or null when the session is missing/expired. */
+export async function getDashboardData(): Promise<DashboardData | null> {
+  const token = await getSessionToken();
+  if (!token) return null;
+  const data = await rpc<DashboardRpc>("igw_dashboard", { p_token: token });
+  if (!data?.ok) return null;
+
+  const user = data.user as DashboardData["user"];
+  const wallet = data.wallet as Record<string, unknown>;
+  const config = data.depositConfig as Record<string, unknown>;
+  const flows = (data.flows ?? {}) as Record<string, unknown>;
+
+  return {
+    user: { ...user, isAdmin: Boolean(user.isAdmin), initials: initials(user.name) },
+    wallet: { balance: num(wallet.balance), currency: "USD", accountNumber: String(wallet.accountNumber) },
+    transactions: ((data.transactions as Record<string, unknown>[]) ?? []).map(toTransaction),
+    notifications: ((data.notifications as Record<string, unknown>[]) ?? []).map(toNotification),
+    unreadCount: num(data.unreadCount),
+    deposits: ((data.deposits as Record<string, unknown>[]) ?? []).map(toDeposit),
+    openDeposit: data.openDeposit ? toDeposit(data.openDeposit as Record<string, unknown>) : null,
+    depositConfig: {
+      btcAddress: (config.btcAddress as string | null) ?? null,
+      network: "mainnet",
+      minUsd: num(config.minUsd),
+      maxUsd: num(config.maxUsd),
+      requiredConfirmations: num(config.requiredConfirmations),
+      quoteMinutes: num(config.quoteMinutes),
+    },
+    stats: { moneyIn: num(flows.moneyIn), moneyOut: num(flows.moneyOut) },
+  };
+}
+
+/* ---------------- deposits ---------------- */
+
+/** Creates a payment quote. The BTC price is fetched here, on the server, never taken from the browser. */
+export async function createDeposit(amountUsd: number): Promise<Deposit> {
+  const token = await requireToken();
+  const price = await getBtcUsdPrice();
+  const raw = await serviceRpc<Record<string, unknown>>("igw_deposit_create", {
     p_token: token,
-    p_action: payload.action,
-    p_amount: payload.amount ?? 0,
-    p_wallet_id: payload.walletId ?? null,
-    p_target_wallet_id: payload.targetWalletId ?? null,
-    p_recipient_id: payload.recipientId ?? null,
-    p_card_id: payload.cardId ?? null,
-    p_note: payload.note ?? "",
-    p_method: payload.method ?? "",
+    p_amount_usd: amountUsd,
+    p_btc_usd_rate: price.rate,
+    p_rate_source: price.source,
   });
+  return toDeposit(raw);
+}
 
-  return result?.converted_amount == null ? {} : { convertedAmount: Number(result.converted_amount) };
+/** "I've paid": records the TXID; the balance does NOT change until an admin approves. */
+export async function submitDeposit(requestId: number, txid: string): Promise<Deposit> {
+  const token = await requireToken();
+  const raw = await rpc<Record<string, unknown>>("igw_deposit_submit", {
+    p_token: token,
+    p_request_id: requestId,
+    p_txid: txid,
+  });
+  return toDeposit(raw);
+}
+
+export async function cancelDeposit(requestId: number): Promise<Deposit> {
+  const token = await requireToken();
+  const raw = await rpc<Record<string, unknown>>("igw_deposit_cancel", { p_token: token, p_request_id: requestId });
+  return toDeposit(raw);
+}
+
+/* ---------------- transfers ---------------- */
+
+export async function lookupRecipient(accountNumber: string): Promise<{ accountNumber: string; name: string }> {
+  const token = await requireToken();
+  return rpc("igw_transfer_lookup", { p_token: token, p_account_number: accountNumber });
+}
+
+export async function sendTransfer(input: {
+  accountNumber: string;
+  amount: number;
+  idempotencyKey: string;
+  note?: string;
+}): Promise<TransferResult> {
+  const token = await requireToken();
+  const raw = await rpc<Record<string, unknown>>("igw_transfer_send", {
+    p_token: token,
+    p_account_number: input.accountNumber,
+    p_amount: input.amount,
+    p_idempotency_key: input.idempotencyKey,
+    p_note: input.note ?? "",
+  });
+  return { ...(raw as unknown as TransferResult), amount: num(raw.amount), balance: num(raw.balance) };
+}
+
+/* ---------------- notifications ---------------- */
+
+export async function markNotificationsRead(ids: number[] | null): Promise<number> {
+  const token = await requireToken();
+  const result = await rpc<{ updated: number }>("igw_notifications_read", { p_token: token, p_ids: ids });
+  return num(result?.updated);
 }

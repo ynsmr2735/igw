@@ -1,8 +1,8 @@
-import { SetupError, isSupabaseConfigured, rpc } from "@/lib/supabase";
+import { SetupError, isServiceKeyConfigured, isSupabaseConfigured, rpc } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
 
-/** Checks the Supabase URL, the anon key and that supabase/schema.sql was run. */
+/** Checks the Supabase URL/key, that supabase/schema.sql was run, and the server-only service key. */
 export async function GET() {
   if (!isSupabaseConfigured()) {
     return Response.json(
@@ -13,7 +13,14 @@ export async function GET() {
 
   try {
     const result = await rpc<{ ok: boolean; schema: string }>("igw_health");
-    return Response.json({ ok: true, supabase: "ok", schema: result?.schema ?? "unknown" });
+    const serviceKey = isServiceKeyConfigured();
+    return Response.json({
+      ok: true,
+      supabase: "ok",
+      schema: result?.schema ?? "unknown",
+      // Needed for BTC deposits and admin approvals.
+      serviceKey: serviceKey ? "configured" : "missing: set SUPABASE_SERVICE_ROLE_KEY",
+    });
   } catch (error) {
     const detail = error instanceof SetupError ? error.message : "Supabase check failed";
     return Response.json({ ok: false, detail }, { status: 500 });
