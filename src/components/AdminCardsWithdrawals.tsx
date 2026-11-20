@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, CreditCard, ExternalLink, Loader2, Search, XCircle } from "lucide-react";
 import type { AdminCard, AdminCardRequest, AdminWithdrawal, MemberLookup } from "@/lib/admin";
-import { CARD_TIERS, CARD_TIER_STYLE, type CardTier } from "@/lib/cards";
+import { CARD_TIERS, CARD_TIER_STYLE, formatValidThru, type CardTier } from "@/lib/cards";
 import { formatAccountNumber, formatDate, formatMoney } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, postJson, type Toast } from "@/components/wallet-ui";
 import { WITHDRAWAL_STATUS_LABEL } from "@/components/WithdrawSection";
@@ -370,7 +370,7 @@ function ManageMemberCard({ onChanged, notify }: { onChanged: () => Promise<void
           <p>
             Card:{" "}
             {member.card ? (
-              <><TierBadge tier={member.card.tier} name={member.card.tierName} /> <Badge tone={member.card.status === "active" ? "green" : "slate"}>{member.card.status}</Badge> · used {formatMoney(member.usedLast24h)} in 24 h</>
+              <><TierBadge tier={member.card.tier} name={member.card.tierName} /> <Badge tone={member.card.status !== "active" ? "slate" : member.card.expired ? "amber" : "green"}>{member.card.status === "active" && member.card.expired ? "expired" : member.card.status}</Badge> · valid thru {formatValidThru(member.card.validUntil)} · used {formatMoney(member.usedLast24h)} in 24 h</>
             ) : (
               <b>none</b>
             )}
@@ -381,7 +381,7 @@ function ManageMemberCard({ onChanged, notify }: { onChanged: () => Promise<void
               {CARD_TIERS.map((t) => <option key={t} value={t}>{CARD_TIER_STYLE[t].name}</option>)}
             </select>
             <button onClick={() => set(true)} disabled={busy} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
-              <CreditCard className="h-4 w-4" /> {member.card?.status === "active" ? "Change / keep active" : "Activate card"}
+              <CreditCard className="h-4 w-4" /> {member.card?.status !== "active" ? "Activate card" : member.card.expired ? "Renew (3 years)" : "Change / keep active"}
             </button>
           </div>
           {member.card?.status === "active" && (
@@ -472,12 +472,12 @@ export function AdminCardsView({
               <li key={c.accountNumber} className="grid gap-1 py-3 sm:grid-cols-[1.3fr_1fr_1fr_auto] sm:items-center">
                 <span className="min-w-0">
                   <span className="block truncate font-bold">{c.userName}</span>
-                  <span className="block font-mono text-slate-500">{formatAccountNumber(c.accountNumber)} · •••• {c.cardNumber.slice(-4)}</span>
+                  <span className="block font-mono text-slate-500">{formatAccountNumber(c.accountNumber)} · •••• {c.cardNumber.slice(-4)} · valid thru {formatValidThru(c.validUntil)}</span>
                 </span>
                 <span><TierBadge tier={c.tier} name={c.tierName} /> <span className="text-slate-500">{limitText(c.dailyLimit)}</span></span>
                 <span className="text-slate-500">Used 24 h: {formatMoney(c.usedLast24h)}</span>
                 <span className="flex items-center gap-2 sm:justify-end">
-                  <Badge tone={c.status === "active" ? "green" : "slate"}>{c.status === "active" ? "Active" : "Inactive"}</Badge>
+                  <Badge tone={c.status !== "active" ? "slate" : c.expired ? "amber" : "green"}>{c.status !== "active" ? "Inactive" : c.expired ? "Expired" : "Active"}</Badge>
                   <button onClick={() => quick(c, c.status !== "active")} className="rounded-lg border border-slate-200 px-2 py-1 font-bold text-slate-600 hover:text-[#7F00FF]">
                     {c.status === "active" ? "Deactivate" : "Activate"}
                   </button>

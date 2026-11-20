@@ -18,6 +18,7 @@ import {
   rejectDeposit,
   setDepositAddress,
   setMethodEnabled,
+  setContact,
 } from "@/lib/admin";
 import { isCardTier } from "@/lib/cards";
 import { isPaymentMethod } from "@/lib/payment-methods";
@@ -76,6 +77,18 @@ export async function POST(request: Request) {
         if (!isPaymentMethod(body.method)) return Response.json({ error: "Unknown payment method" }, { status: 400 });
         if (typeof body.enabled !== "boolean") return Response.json({ error: "enabled must be true or false" }, { status: 400 });
         return Response.json({ ok: true, method: body.method, enabled: await setMethodEnabled(body.method, body.enabled) });
+      }
+      case "setContact": {
+        const raw = body.contact;
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) return Response.json({ error: "contact must be an object" }, { status: 400 });
+        const input = raw as Record<string, unknown>;
+        const contact: Record<string, string> = {};
+        for (const key of ["email", "phone", "whatsapp", "telegram", "address", "hours"]) {
+          const v = input[key];
+          if (v !== undefined && v !== null && typeof v !== "string") return Response.json({ error: `${key} must be text` }, { status: 400 });
+          contact[key] = String(v ?? "").slice(0, 400);
+        }
+        return Response.json({ ok: true, contact: await setContact(contact) });
       }
       case "withdrawals":
         return Response.json({ ok: true, withdrawals: await listWithdrawals(typeof body.status === "string" ? body.status : null) });

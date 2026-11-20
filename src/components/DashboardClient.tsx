@@ -26,6 +26,8 @@ import {
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import WithdrawSection from "@/components/WithdrawSection";
+import { ContactDetails } from "@/components/ContactDetails";
+import { hasContact } from "@/lib/contact";
 import { signOutAction } from "@/app/auth/actions";
 import {
   DEPOSIT_STATUS_LABEL,
@@ -830,7 +832,10 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
               <div className="pointer-events-none absolute -right-14 -top-16 h-56 w-56 rounded-full bg-white/15 blur-2xl" />
               <div className="relative flex items-start justify-between gap-4">
                 <div className="min-w-0">
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/70">Total balance</p>
+                  <p className="truncate text-[13px] font-extrabold uppercase tracking-[0.12em] text-white" data-testid="balance-holder">
+                    {data.user.name}
+                  </p>
+                  <p className="mt-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-white/70">Total balance</p>
                   <p className="mt-2 break-all text-[clamp(2rem,6vw,2.9rem)] font-black tracking-tight" data-testid="balance">
                     {formatMoney(data.wallet.balance)}
                   </p>
@@ -954,6 +959,13 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
               <div><dt className="text-[11px] text-slate-500">Member since</dt><dd className="mt-1 font-bold">{formatDate(data.user.memberSince)}</dd></div>
             </dl>
           </Card>
+
+          {hasContact(data.contact) && (
+            <Card id="support">
+              <SectionTitle eyebrow="Help" title="Contact support" />
+              <ContactDetails contact={data.contact} tone="card" />
+            </Card>
+          )}
         </main>
       </div>
 

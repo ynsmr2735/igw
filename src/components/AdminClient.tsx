@@ -16,6 +16,7 @@ import {
   Loader2,
   LogOut,
   Menu,
+  Phone,
   Settings,
   ShieldCheck,
   Wallet,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import { AdminCardsView, AdminWithdrawalsView } from "@/components/AdminCardsWithdrawals";
+import { AdminContactView } from "@/components/AdminContact";
 import { signOutAction } from "@/app/auth/actions";
 import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AuditEntry } from "@/lib/admin";
 import {
@@ -50,7 +52,7 @@ import {
 } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, ToastView, postJson, type Toast } from "@/components/wallet-ui";
 
-type View = "notifications" | "deposits" | "withdrawals" | "cards" | "transactions" | "settings" | "audit";
+type View = "notifications" | "deposits" | "withdrawals" | "cards" | "transactions" | "settings" | "contact" | "audit";
 
 const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "notifications", label: "Notifications", icon: Bell },
@@ -59,6 +61,7 @@ const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "cards", label: "Cards", icon: CreditCard },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
   { id: "settings", label: "Payment methods", icon: Settings },
+  { id: "contact", label: "Contact details", icon: Phone },
   { id: "audit", label: "Audit log", icon: History },
 ];
 
@@ -91,6 +94,7 @@ const AUDIT_LABEL: Record<string, string> = {
   card_activated: "Card activated",
   card_deactivated: "Card deactivated",
   card_request_rejected: "Card request rejected",
+  contact_updated: "Contact details changed",
   deposit_rejected: "Payment rejected",
 };
 
@@ -116,6 +120,12 @@ function auditSummary(entry: AuditEntry): string {
       return `account ${entry.targetId} · ${String(d.tier)}${d.reason ? ` · reason: ${String(d.reason)}` : ""}`;
     case "card_request_rejected":
       return `${entry.targetId} · account ${String(d.accountNumber)} · ${String(d.tier)} · reason: ${String(d.reason)}`;
+    case "contact_updated": {
+      const prev = (d.previous ?? {}) as Record<string, string>;
+      const next = (d.new ?? {}) as Record<string, string>;
+      const changed = Object.keys(next).filter((k) => (prev[k] ?? "") !== (next[k] ?? ""));
+      return changed.length ? changed.map((k) => `${k}: ${prev[k] || "—"} → ${next[k] || "—"}`).join(" · ") : "no change";
+    }
     case "deposit_rejected":
       return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
     default:
@@ -1260,6 +1270,8 @@ export default function AdminClient({
               notify={setToast}
             />
           )}
+
+          {view === "contact" && <AdminContactView contact={overview.contact} onChanged={refresh} notify={setToast} />}
 
           {view === "cards" && <AdminCardsView reloadKey={reloadKey} newIds={newCardRequests} onChanged={refresh} notify={setToast} />}
 

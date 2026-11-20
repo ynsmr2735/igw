@@ -1,6 +1,7 @@
 import { getSessionToken } from "@/lib/auth/session";
 import { getBtcUsdPrice } from "@/lib/btc/price";
 import { toWithdrawalCenter, type WithdrawalCenter } from "@/lib/cards";
+import { toContact, type ContactInfo } from "@/lib/contact";
 import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import { AuthError, RpcError, rpc, serviceRpc } from "@/lib/supabase";
 import { assertSchema } from "@/lib/system";
@@ -97,6 +98,8 @@ export type DashboardData = {
   depositConfig: DepositConfig;
   /** Card + crypto withdrawals. */
   withdrawalCenter: WithdrawalCenter;
+  /** Site contact details (set by the admin). */
+  contact: ContactInfo;
   stats: { moneyIn: number; moneyOut: number };
 };
 
@@ -192,6 +195,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
       quoteMinutes: num(config.quoteMinutes),
     },
     withdrawalCenter: toWithdrawalCenter(data.withdrawalCenter as Record<string, unknown>),
+    contact: toContact(data.contact),
     stats: { moneyIn: num(flows.moneyIn), moneyOut: num(flows.moneyOut) },
   };
 }

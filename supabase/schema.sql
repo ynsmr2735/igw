@@ -406,6 +406,16 @@ insert into public.app_settings (key, value) values
   ('withdrawal_min_usd', '10')
 on conflict (key) do nothing;
 
+-- igw-rpc-10: card validity ("VALID THRU"): 3 years from (re)activation.
+alter table public.member_cards add column if not exists valid_until timestamptz;
+update public.member_cards set valid_until = coalesce(activated_at, updated_at, now()) + interval '3 years' where valid_until is null;
+
+-- igw-rpc-10: contact details shown on the website (edited by an admin).
+insert into public.app_settings (key, value) values
+  ('contact_email', ''), ('contact_phone', ''), ('contact_whatsapp', ''),
+  ('contact_telegram', ''), ('contact_address', ''), ('contact_hours', '')
+on conflict (key) do nothing;
+
 alter table public.member_cards enable row level security;
 alter table public.card_requests enable row level security;
 alter table public.withdrawal_requests enable row level security;
@@ -1037,6 +1047,9 @@ as $$
     'status', c.status,
     'dailyLimit', igw_private.card_limit(c.tier),
     'activatedAt', c.activated_at,
+    'validUntil', c.valid_until,
+    'expired', c.valid_until is not null and c.valid_until <= now(),
+    'holderName', (select full_name from public.profiles where id = c.user_id),
     'deactivatedAt', c.deactivated_at,
     'deactivationReason', c.deactivation_reason,
     'updatedAt', c.updated_at
@@ -1089,6 +1102,11 @@ declare
 begin
   select * into v_card from public.member_cards where user_id = p_user;
   v_limit := case when v_card.status = 'active' then igw_private.card_limit(v_card.tier) end;
+  -- An expired card cannot be used until an admin renews it (re-activation).
+  if v_card.status = 'active' and v_card.valid_until is not null and v_card.valid_until <= now() then
+    v_card.status := 'expired';
+    v_limit := null;
+  end if;
   return jsonb_build_object(
     'card', igw_private.card_json(v_card),
     'pendingCardRequest', (select igw_private.card_request_json(r) from public.card_requests r
@@ -1099,6 +1117,7 @@ begin
     'canWithdraw', coalesce(v_card.status = 'active', false),
     'dailyLimit', v_limit,
     'usedLast24h', v_used,
+    'cardExpired', coalesce(v_card.status = 'expired', false),
     'remainingToday', case when v_card.status = 'active' then
                         case when v_limit is null then null else greatest(v_limit - v_used, 0) end
                       else 0 end,
@@ -1111,7 +1130,7 @@ begin
 end;
 $$;
 
--- Card number shown to the member: IGW + 12 random digits, unique.
+-- Card number: 16 digits starting with 4, unique (only the last 4 are shown in the UI).
 create or replace function igw_private.new_card_number()
 returns text
 language plpgsql
@@ -1140,14 +1159,34 @@ as $$
 declare
   v_card public.member_cards%rowtype;
 begin
-  insert into public.member_cards (user_id, card_number, tier, status, activated_at, activated_by, updated_at)
-  values (p_user, igw_private.new_card_number(), p_tier, 'active', now(), p_admin, now())
+  insert into public.member_cards (user_id, card_number, tier, status, activated_at, activated_by, updated_at, valid_until)
+  values (p_user, igw_private.new_card_number(), p_tier, 'active', now(), p_admin, now(), now() + interval '3 years')
   on conflict (user_id) do update
     set tier = excluded.tier, status = 'active', activated_at = now(), activated_by = p_admin,
+        valid_until = now() + interval '3 years',
         deactivated_at = null, deactivated_by = null, deactivation_reason = null, updated_at = now()
   returning * into v_card;
   return v_card;
 end;
+$$;
+
+-- Contact details shown on the website (igw-rpc-10).
+create or replace function igw_private.contact_json()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_build_object(
+    'email', coalesce(igw_private.setting('contact_email'), ''),
+    'phone', coalesce(igw_private.setting('contact_phone'), ''),
+    'whatsapp', coalesce(igw_private.setting('contact_whatsapp'), ''),
+    'telegram', coalesce(igw_private.setting('contact_telegram'), ''),
+    'address', coalesce(igw_private.setting('contact_address'), ''),
+    'hours', coalesce(igw_private.setting('contact_hours'), ''),
+    'updatedAt', (select max(updated_at) from public.app_settings where key like 'contact\_%')
+  );
 $$;
 
 create or replace function igw_private.transaction_json(t public.transactions)
@@ -1307,7 +1346,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-9');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-10');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1522,6 +1561,7 @@ begin
       'quoteMinutes', igw_private.setting('deposit_quote_minutes')::int
     ),
     'withdrawalCenter', igw_private.withdrawal_center(v_uid),
+    'contact', igw_private.contact_json(),
     'flows', (
       select jsonb_build_object(
         'moneyIn', coalesce(sum(t.amount) filter (where t.direction = 'in'), 0),
@@ -2005,6 +2045,7 @@ begin
       ) order by a.created_at desc, a.id desc)
       from (select * from public.admin_audit_log order by created_at desc, id desc limit 100) a
     ), '[]'::jsonb),
+    'contact', igw_private.contact_json(),
     'settings', jsonb_build_object(
       'methods', jsonb_build_array(igw_private.method_config('btc'), igw_private.method_config('usdt_trc20')),
       'minUsd', igw_private.setting('deposit_min_usd')::numeric,
@@ -2378,7 +2419,8 @@ begin
   end if;
   select * into v_profile from public.profiles where id = v_uid;
   select * into v_card from public.member_cards where user_id = v_uid;
-  if v_card.status = 'active' and v_card.tier = p_tier then
+  -- An expired card of the same tier may be requested again (renewal).
+  if v_card.status = 'active' and v_card.tier = p_tier and (v_card.valid_until is null or v_card.valid_until > now()) then
     raise exception 'Your % card is already active.', igw_private.card_tier_name(p_tier);
   end if;
   if exists (select 1 from public.card_requests where user_id = v_uid and status = 'pending') then
@@ -2447,6 +2489,9 @@ begin
   select * into v_card from public.member_cards where user_id = v_uid;
   if not found or v_card.status <> 'active' then
     raise exception 'You need an active card to withdraw. Request a card in the Withdraw section; an admin activates it.';
+  end if;
+  if v_card.valid_until is not null and v_card.valid_until <= now() then
+    raise exception 'Your card expired on %. Ask an admin to renew it.', to_char(v_card.valid_until at time zone 'Europe/Istanbul', 'MM/YY');
   end if;
   if p_amount_usd is null or p_amount_usd <> round(p_amount_usd, 2) or p_amount_usd <= 0 then
     raise exception 'Enter an amount in USD with at most 2 decimal places.';
@@ -2803,6 +2848,72 @@ begin
 end;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Contact details (igw-rpc-10): public read, admin update.
+-- ---------------------------------------------------------------------------
+create or replace function public.igw_contact_info()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select igw_private.contact_json();
+$$;
+
+create or replace function public.igw_admin_set_contact(p_token text, p_contact jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_email text := trim(coalesce(p_contact->>'email', ''));
+  v_phone text := trim(coalesce(p_contact->>'phone', ''));
+  v_whatsapp text := trim(coalesce(p_contact->>'whatsapp', ''));
+  v_telegram text := trim(coalesce(p_contact->>'telegram', ''));
+  v_address text := trim(coalesce(p_contact->>'address', ''));
+  v_hours text := trim(coalesce(p_contact->>'hours', ''));
+  v_before jsonb := igw_private.contact_json();
+  v_key text;
+  v_value text;
+begin
+  if v_email <> '' and (length(v_email) > 120 or v_email !~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}$') then
+    raise exception 'Enter a valid email address (or leave it empty).';
+  end if;
+  if v_phone <> '' and v_phone !~ '^\+?[0-9][0-9 ()-]{5,24}$' then
+    raise exception 'Enter a valid phone number, e.g. +90 555 123 45 67 (or leave it empty).';
+  end if;
+  if v_whatsapp <> '' and v_whatsapp !~ '^\+?[0-9][0-9 ()-]{5,24}$' then
+    raise exception 'Enter the WhatsApp number with country code, e.g. +90 555 123 45 67 (or leave it empty).';
+  end if;
+  if v_telegram <> '' and v_telegram !~ '^(@?[A-Za-z0-9_]{5,32}|https://t\.me/[A-Za-z0-9_]{5,32})$' then
+    raise exception 'Enter a Telegram username (e.g. @igwsupport) or a t.me link (or leave it empty).';
+  end if;
+  if length(v_address) > 300 then
+    raise exception 'The address can be at most 300 characters.';
+  end if;
+  if length(v_hours) > 120 then
+    raise exception 'Working hours can be at most 120 characters.';
+  end if;
+  for v_key, v_value in
+    select * from (values ('contact_email', v_email), ('contact_phone', v_phone), ('contact_whatsapp', v_whatsapp),
+                          ('contact_telegram', v_telegram), ('contact_address', v_address), ('contact_hours', v_hours)) x(k, v)
+  loop
+    insert into public.app_settings (key, value, updated_at, updated_by)
+    values (v_key, v_value, now(), v_admin)
+    on conflict (key) do update set value = excluded.value, updated_at = now(), updated_by = v_admin
+    where public.app_settings.value is distinct from excluded.value;
+  end loop;
+  if (v_before - 'updatedAt') is distinct from (igw_private.contact_json() - 'updatedAt') then
+    perform igw_private.audit(v_admin, 'contact_updated', 'setting', 'contact',
+      jsonb_build_object('previous', v_before - 'updatedAt', 'new', igw_private.contact_json() - 'updatedAt'));
+  end if;
+  return igw_private.contact_json();
+end;
+$$;
+
 revoke all on all functions in schema igw_private from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -2844,6 +2955,8 @@ declare
     'public.igw_admin_cards(text)',
     'public.igw_admin_set_card(text, text, text, boolean, text)',
     'public.igw_admin_member_lookup(text, text)',
+    'public.igw_contact_info()',
+    'public.igw_admin_set_contact(text, jsonb)',
     'public.igw_admin_approve(text, bigint, numeric)',
     'public.igw_admin_transactions(text, integer)'
   ];

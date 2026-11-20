@@ -15,6 +15,13 @@ import {
   Zap,
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
+import { ContactDetails } from "@/components/ContactDetails";
+import { hasContact } from "@/lib/contact";
+import { getContactInfo } from "@/lib/contact-server";
+
+// Contact details come from the database (Admin → Contact details), so render per request:
+// a change by the admin shows up immediately.
+export const dynamic = "force-dynamic";
 
 const features = [
   {
@@ -70,7 +77,9 @@ const footerColumns = [
   { title: "Legal", links: ["Privacy Policy", "Terms of Use", "Cookie Policy", "Compliance"] },
 ];
 
-export default function LandingPage() {
+export default async function LandingPage() {
+  const contact = await getContactInfo();
+  const showContact = hasContact(contact);
   return (
     <main className="overflow-hidden bg-white">
       {/* Announcement */}
@@ -93,6 +102,7 @@ export default function LandingPage() {
             <a className="transition hover:text-[#7F00FF]" href="#how">How it works</a>
             <a className="transition hover:text-[#7F00FF]" href="#cards">IGW Cards</a>
             <a className="transition hover:text-[#7F00FF]" href="#security">Security</a>
+            {showContact && <a className="transition hover:text-[#7F00FF]" href="#contact">Contact</a>}
           </div>
           <div className="flex items-center gap-3">
             <Link href="/login" className="hidden text-[13px] font-semibold text-slate-700 transition hover:text-[#7F00FF] sm:block">
@@ -491,6 +501,22 @@ export default function LandingPage() {
         </div>
       </section>
 
+      {/* Contact (details are set by the admin: Admin → Contact details) */}
+      {showContact && (
+        <section id="contact" className="scroll-mt-24 px-5 pb-24 sm:px-8" data-testid="contact-section">
+          <div className="mx-auto max-w-7xl">
+            <p className="text-xs font-black uppercase tracking-[0.2em] text-[#7F00FF]">Contact</p>
+            <h2 className="mt-3 text-[clamp(1.8rem,3.2vw,2.6rem)] font-black tracking-tight text-[#10152b]">
+              Get in <span className="igw-text-gradient">touch.</span>
+            </h2>
+            <p className="mt-3 max-w-xl text-[15px] text-slate-600">Questions about your account, deposits or withdrawals? Reach our team here.</p>
+            <div className="mt-8">
+              <ContactDetails contact={contact} />
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* Footer */}
       <footer className="border-t border-slate-100 bg-[#fafafe]">
         <div className="mx-auto max-w-7xl px-5 py-14 sm:px-8">
@@ -513,7 +539,7 @@ export default function LandingPage() {
                 <ul className="mt-4 space-y-2.5">
                   {column.links.map((link) => (
                     <li key={link}>
-                      <a href="#features" className="text-[13px] text-slate-500 transition hover:text-[#7F00FF]">{link}</a>
+                      <a href={link === "Contact" && showContact ? "#contact" : "#features"} className="text-[13px] text-slate-500 transition hover:text-[#7F00FF]">{link}</a>
                     </li>
                   ))}
                 </ul>

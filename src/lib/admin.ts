@@ -9,6 +9,7 @@ import {
   type MemberCard,
   type Withdrawal,
 } from "@/lib/cards";
+import { toContact, type ContactInfo } from "@/lib/contact";
 import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import { AuthError, RpcError, SetupError, rpc } from "@/lib/supabase";
 import { assertSchema } from "@/lib/system";
@@ -45,6 +46,8 @@ export type AdminOverview = {
   notifications: Notification[];
   unreadCount: number;
   auditLog: AuditEntry[];
+  /** Contact details shown on the website. */
+  contact: ContactInfo;
   settings: {
     methods: MethodConfig[];
     minUsd: number;
@@ -109,6 +112,7 @@ export async function getAdminOverview(): Promise<AdminOverview> {
       ...(a as unknown as AuditEntry),
       id: Number(a.id),
     })),
+    contact: toContact(raw.contact),
     settings: {
       methods: ((settings.methods as Record<string, unknown>[]) ?? []).map(toMethodConfig),
       minUsd: Number(settings.minUsd),
@@ -363,4 +367,9 @@ export async function lookupMember(accountNumber: string): Promise<MemberLookup>
     card: toCard(raw.card),
     usedLast24h: Number(raw.usedLast24h ?? 0),
   };
+}
+
+/** Saves the website contact details (validated + audited in the database). */
+export async function setContact(contact: Record<string, string>): Promise<ContactInfo> {
+  return toContact(await rpc<unknown>("igw_admin_set_contact", { p_token: await token(), p_contact: contact }));
 }

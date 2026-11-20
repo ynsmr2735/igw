@@ -2,7 +2,7 @@
 
 import { useState, type FormEvent } from "react";
 import { ArrowUpRight, CheckCircle2, CreditCard, ExternalLink, Loader2 } from "lucide-react";
-import { CARD_TIER_STYLE, type CardTier, type MemberCard, type WithdrawalCenter } from "@/lib/cards";
+import { CARD_TIER_STYLE, formatValidThru, type CardTier, type MemberCard, type WithdrawalCenter } from "@/lib/cards";
 import { formatDate, formatMoney } from "@/lib/format";
 import { Badge, Card, STATUS_TONE, SectionTitle, postJson, type Toast } from "@/components/wallet-ui";
 
@@ -22,33 +22,49 @@ const secondaryButton =
 
 const limitText = (limit: number | null) => (limit === null ? "Unlimited" : `${formatMoney(limit)} / 24 h`);
 
-/** The member's card, drawn as a payment card. */
+/**
+ * The member's IGW withdrawal card: holder name, last 4 digits, VALID THRU, tier and limit.
+ * Deliberately no CVV / full number: this is a membership card for withdrawals on this site,
+ * not a payment card that can be used at shops.
+ */
 export function CardVisual({ card }: { card: MemberCard }) {
   const style = CARD_TIER_STYLE[card.tier];
-  const active = card.status === "active";
+  const expired = card.status === "expired" || (card.status === "active" && card.expired);
+  const usable = card.status === "active" && !expired;
+  const badge = usable ? "ACTIVE" : expired ? "EXPIRED" : "INACTIVE";
   return (
     <div
-      className={`relative aspect-[1.586] w-full max-w-[340px] overflow-hidden rounded-[22px] bg-gradient-to-br p-5 shadow-xl ${
-        active ? `${style.gradient} ${style.text}` : "from-slate-300 to-slate-400 text-slate-700"
+      className={`relative flex aspect-[1.586] w-full max-w-[340px] flex-col overflow-hidden rounded-[22px] bg-gradient-to-br p-5 shadow-xl ${
+        usable ? `${style.gradient} ${style.text}` : "from-slate-300 to-slate-400 text-slate-700"
       }`}
       data-testid="member-card"
     >
       <div className="absolute -right-10 -top-10 h-40 w-40 rounded-full bg-white/10" />
-      <div className="relative flex items-start justify-between">
-        <p className="text-[11px] font-black uppercase tracking-[0.2em] opacity-80">Insta Global Wallet</p>
-        <Badge tone={active ? "green" : "slate"}>{active ? "ACTIVE" : "INACTIVE"}</Badge>
-      </div>
-      <p className="relative mt-[14%] font-mono text-lg font-bold tracking-[0.2em]">•••• •••• •••• {card.cardNumber.slice(-4)}</p>
-      <div className="relative mt-auto flex items-end justify-between pt-4">
+      <div className="relative flex items-start justify-between gap-2">
         <div>
-          <p className="text-[9px] font-bold uppercase tracking-[0.18em] opacity-70">Card</p>
-          <p className="text-[15px] font-black">{card.tierName}</p>
+          <p className="text-[10px] font-black uppercase tracking-[0.2em] opacity-80">Insta Global Wallet</p>
+          <p className="text-[13px] font-black">{card.tierName}</p>
         </div>
-        <div className="text-right">
-          <p className="text-[9px] font-bold uppercase tracking-[0.18em] opacity-70">Daily limit</p>
-          <p className="text-[13px] font-black">{card.dailyLimit === null ? "Unlimited" : formatMoney(card.dailyLimit)}</p>
+        <Badge tone={usable ? "green" : expired ? "amber" : "slate"}>{badge}</Badge>
+      </div>
+      <p className="relative mt-auto font-mono text-[17px] font-bold tracking-[0.2em]" data-testid="card-number">
+        •••• •••• •••• {card.cardNumber.slice(-4)}
+      </p>
+      <div className="relative mt-3 flex items-end justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[8px] font-bold uppercase tracking-[0.18em] opacity-70">Card holder</p>
+          <p className="truncate text-[13px] font-black uppercase tracking-[0.08em]" data-testid="card-holder">
+            {card.holderName || "—"}
+          </p>
+        </div>
+        <div className="shrink-0 text-right">
+          <p className="text-[8px] font-bold uppercase tracking-[0.18em] opacity-70">Valid thru</p>
+          <p className="font-mono text-[13px] font-black" data-testid="card-valid-thru">{formatValidThru(card.validUntil)}</p>
         </div>
       </div>
+      <p className="relative mt-2 text-[10px] font-bold opacity-80">
+        Daily limit: {card.dailyLimit === null ? "Unlimited" : formatMoney(card.dailyLimit)}
+      </p>
     </div>
   );
 }
@@ -64,7 +80,8 @@ export default function WithdrawSection({
   onChanged: () => Promise<void>;
   notify: (toast: Toast) => void;
 }) {
-  const [tier, setTier] = useState<CardTier>("standard");
+  // An expired card: preselect the same card so renewing is one click.
+  const [tier, setTier] = useState<CardTier>(center.card?.status === "expired" ? center.card.tier : "standard");
   const [note, setNote] = useState("");
   const [address, setAddress] = useState("");
   const [amount, setAmount] = useState("");
@@ -176,7 +193,12 @@ export default function WithdrawSection({
         </div>
 
         <div className="min-w-0 space-y-4">
-          {card && !active && (
+          {card && card.status === "expired" && (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] text-amber-900" data-testid="card-expired">
+              Your {card.tierName} card expired ({formatValidThru(card.validUntil)}). Request it again below; once an admin renews it, it is valid for another 3 years.
+            </div>
+          )}
+          {card && card.status === "inactive" && (
             <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-[12px] text-rose-800" data-testid="card-inactive">
               Your {card.tierName} card has been deactivated{card.deactivationReason ? `: ${card.deactivationReason}` : ""}. You cannot withdraw until an admin activates a card again.
             </div>

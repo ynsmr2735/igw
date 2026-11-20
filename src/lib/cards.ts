@@ -24,10 +24,16 @@ export type MemberCard = {
   cardNumber: string;
   tier: CardTier;
   tierName: string;
-  status: "active" | "inactive";
+  /** "expired" only in the member view (active card past VALID THRU). */
+  status: "active" | "inactive" | "expired";
   /** USD per 24 h; null = unlimited. */
   dailyLimit: number | null;
   activatedAt: string | null;
+  /** "VALID THRU": 3 years from (re)activation. */
+  validUntil: string | null;
+  expired: boolean;
+  /** Member's full name as registered (printed on the card). */
+  holderName: string;
   deactivatedAt: string | null;
   deactivationReason: string | null;
   updatedAt: string;
@@ -74,6 +80,8 @@ export type WithdrawalCenter = {
   lastCardRequest: CardRequest | null;
   tiers: TierInfo[];
   canWithdraw: boolean;
+  /** Card is active but past its VALID THRU date — an admin must renew it. */
+  cardExpired: boolean;
   dailyLimit: number | null;
   usedLast24h: number;
   /** null = unlimited */
@@ -88,7 +96,13 @@ const numOrNull = (v: unknown) => (v === null || v === undefined ? null : Number
 export function toCard(raw: unknown): MemberCard | null {
   if (!raw || typeof raw !== "object") return null;
   const c = raw as Record<string, unknown>;
-  return { ...(c as unknown as MemberCard), dailyLimit: numOrNull(c.dailyLimit) };
+  return {
+    ...(c as unknown as MemberCard),
+    dailyLimit: numOrNull(c.dailyLimit),
+    validUntil: typeof c.validUntil === "string" ? c.validUntil : null,
+    expired: c.expired === true,
+    holderName: typeof c.holderName === "string" ? c.holderName : "",
+  };
 }
 
 export function toCardRequest(raw: unknown): CardRequest | null {
@@ -113,10 +127,19 @@ export function toWithdrawalCenter(raw: Record<string, unknown> | null | undefin
       dailyLimit: numOrNull(t.dailyLimit),
     })),
     canWithdraw: r.canWithdraw === true,
+    cardExpired: r.cardExpired === true,
     dailyLimit: numOrNull(r.dailyLimit),
     usedLast24h: num(r.usedLast24h),
     remainingToday: numOrNull(r.remainingToday),
     minUsd: num(r.minUsd),
     withdrawals: ((r.withdrawals as Record<string, unknown>[]) ?? []).map(toWithdrawal),
   };
+}
+
+/** "MM/YY" for the card's VALID THRU line (UTC month, as printed on cards). */
+export function formatValidThru(iso: string | null): string {
+  if (!iso) return "--/--";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "--/--";
+  return `${String(d.getUTCMonth() + 1).padStart(2, "0")}/${String(d.getUTCFullYear() % 100).padStart(2, "0")}`;
 }
