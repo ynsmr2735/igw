@@ -1,4 +1,4 @@
-import { requiredChecksPass, type DepositVerification, type VerificationSource } from "@/lib/payment-methods";
+import { realPaymentExceptAmount, requiredChecksPass, type DepositVerification, type VerificationSource } from "@/lib/payment-methods";
 
 /**
  * Verifies a BTC deposit against real Bitcoin MAINNET data from two independent
@@ -142,6 +142,7 @@ export async function verifyBtcDeposit(
     },
     {
       label: "Exact amount",
+      key: "amount" as const,
       ok: paidUnits === deposit.amountUnits,
       detail: `Expected ${deposit.amountUnits} sats, received ${paidUnits} sats`,
     },
@@ -179,6 +180,7 @@ export async function verifyBtcDeposit(
     confirmations,
     requiredConfirmations,
     matched: requiredChecksPass(checks),
+    matchedExceptAmount: realPaymentExceptAmount(checks, paidUnits),
     checks,
     sources,
     checkedAt: new Date().toISOString(),

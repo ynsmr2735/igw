@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import { signOutAction } from "@/app/auth/actions";
-import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AuditEntry } from "@/lib/admin";
+import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AmountMismatch, AuditEntry } from "@/lib/admin";
 import {
   isBlocked,
   loadLastSeen,
@@ -126,6 +126,7 @@ function DepositRow({
   const [error, setError] = useState<string | null>(null);
   const pending = deposit.status === "reviewing";
   const info = METHOD_INFO[deposit.method];
+  const [rowMismatch, setRowMismatch] = useState(false);
 
   async function run(body: Record<string, unknown>, success: string) {
     setBusy(true);
@@ -137,6 +138,7 @@ function DepositRow({
       await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed.");
+      setRowMismatch(Boolean((err as { data?: { mismatch?: unknown } }).data?.mismatch));
     } finally {
       setBusy(false);
     }
@@ -262,10 +264,18 @@ function DepositRow({
       )}
 
       {deposit.rejectionReason && <p className="mt-2 text-rose-600">Reason: {deposit.rejectionReason}</p>}
+      {deposit.status === "approved" && deposit.creditedUsd != null && deposit.creditedUsd !== deposit.amountUsd && (
+        <p className="mt-2 font-bold text-amber-700">Credited {formatMoney(deposit.creditedUsd)} (amount received on-chain)</p>
+      )}
       {error && (
         <p role="alert" className="mt-2 rounded-xl border border-rose-200 bg-white px-3 py-2 font-semibold text-rose-600">
           {error}
         </p>
+      )}
+      {rowMismatch && pending && (
+        <button onClick={onOpen} className={`${button} mt-2 h-10 bg-amber-600 text-white hover:bg-amber-700`}>
+          Open details to approve the received amount
+        </button>
       )}
     </li>
   );
@@ -326,6 +336,8 @@ function DepositDetail({
   const [verification, setVerification] = useState<DepositVerification | null>(null);
   const [busy, setBusy] = useState<"verify" | "approve" | "reject" | null>(null);
   const [confirmApprove, setConfirmApprove] = useState(false);
+  const [mismatch, setMismatch] = useState<AmountMismatch | null>(null);
+  const [ownershipChecked, setOwnershipChecked] = useState(false);
   const [reason, setReason] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -351,16 +363,23 @@ function DepositDetail({
     }
   }
 
-  async function approve() {
+  async function approve(acceptReceived = false) {
     setBusy("approve");
     setError(null);
     try {
-      await admin({ action: "approve", id });
-      notify({ type: "ok", message: "Deposit approved and balance credited." });
+      const response = await admin<{ creditedUsd: number; verification: DepositVerification }>({ action: "approve", id, acceptReceived });
+      setVerification(response.verification);
+      setMismatch(null);
+      notify({ type: "ok", message: `Payment approved: ${formatMoney(response.creditedUsd)} added to the member's balance.` });
       await Promise.all([load(), onChanged()]);
       setConfirmApprove(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Approval failed.");
+      const data = (err as { data?: { verification?: DepositVerification; mismatch?: AmountMismatch | null } }).data;
+      if (data?.verification) setVerification(data.verification);
+      setMismatch(data?.mismatch ?? null);
+      setOwnershipChecked(false);
+      // An amount mismatch is explained in its own box; other failures show the real reason.
+      setError(data?.mismatch ? null : err instanceof Error ? err.message : "Approval failed.");
     } finally {
       setBusy(null);
     }
@@ -480,12 +499,11 @@ function DepositDetail({
                 <p className="text-[13px] font-black">Decision</p>
                 {reviewable && (
                   <div className="mt-3">
-                    {!confirmApprove ? (
+                    {mismatch ? null : !confirmApprove ? (
                       <button
-                        onClick={() => setConfirmApprove(true)}
-                        disabled={busy !== null || !verification?.matched}
+                        onClick={() => { setConfirmApprove(true); setMismatch(null); setError(null); }}
+                        disabled={busy !== null}
                         className={`${button} w-full bg-emerald-600 text-white hover:bg-emerald-700`}
-                        title={verification?.matched ? "" : "Run a successful blockchain check first"}
                       >
                         <CheckCircle2 className="h-4 w-4" /> Approve payment
                       </button>
@@ -500,10 +518,11 @@ function DepositDetail({
                           <div className="sm:col-span-2 break-all"><dt className="inline opacity-70">TXID: </dt><dd className="inline font-mono">{deposit.txid}</dd></div>
                         </dl>
                         <p className="mt-2 text-[12px] text-emerald-900">
-                          The blockchain is checked again before the balance changes.
+                          Your decision. The transaction is checked on the blockchain at this moment; the balance changes only if
+                          the payment is found. If it is not found, the request stays pending and you see the exact reason.
                         </p>
                         <div className="mt-3 flex flex-wrap gap-2">
-                          <button onClick={approve} disabled={busy !== null} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
+                          <button onClick={() => approve(false)} disabled={busy !== null} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
                             {busy === "approve" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
                             Yes, approve
                           </button>
@@ -513,10 +532,45 @@ function DepositDetail({
                         </div>
                       </div>
                     )}
-                    {!verification?.matched && (
-                      <p className="mt-2 text-[11px] text-slate-500">Approval is available after a successful blockchain check.</p>
+                    {mismatch && (
+                      <div className="mt-3 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-[12px] text-amber-900" data-testid="amount-mismatch">
+                        <p className="text-[13px] font-black">Payment found — but the amount differs</p>
+                        <dl className="mt-2 grid gap-x-4 gap-y-1 sm:grid-cols-2">
+                          <div><dt className="inline opacity-70">Requested: </dt><dd className="inline font-bold">{mismatch.expectedCrypto} {mismatch.asset} ({formatMoney(mismatch.requestedUsd)})</dd></div>
+                          <div><dt className="inline opacity-70">Received on-chain: </dt><dd className="inline font-bold">{mismatch.receivedCrypto} {mismatch.asset}</dd></div>
+                        </dl>
+                        <p className="mt-2">
+                          Common cause: the sender&apos;s exchange deducted a withdrawal fee. You can credit the amount that actually
+                          arrived ({formatMoney(mismatch.creditUsd)}). Make sure this payment belongs to this member (e.g. ask for a
+                          screenshot of the withdrawal) — a payment that exactly matches another member&apos;s request is refused.
+                        </p>
+                        <label className="mt-2 flex items-start gap-2 font-bold">
+                          <input type="checkbox" checked={ownershipChecked} onChange={(event) => setOwnershipChecked(event.target.checked)} className="mt-0.5 h-4 w-4" />
+                          I checked that this payment belongs to {deposit.user.name}.
+                        </label>
+                        <button
+                          onClick={() => approve(true)}
+                          disabled={busy !== null || !ownershipChecked}
+                          className={`${button} mt-3 w-full bg-amber-600 text-white hover:bg-amber-700`}
+                        >
+                          {busy === "approve" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                          Approve received amount ({formatMoney(mismatch.creditUsd)})
+                        </button>
+                        <button
+                          onClick={() => { setMismatch(null); setConfirmApprove(false); }}
+                          disabled={busy !== null}
+                          className={`${button} mt-2 w-full border border-slate-200 bg-white text-slate-700`}
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     )}
                   </div>
+                )}
+                {error && (
+                  <p role="alert" className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600" data-testid="decision-error">
+                    {error}
+                  </p>
                 )}
                 {rejectable && (
                   <div className="mt-4">
@@ -560,7 +614,7 @@ function DepositDetail({
           </div>
         )}
 
-        {error && (
+        {error && !(deposit && (reviewable || rejectable)) && (
           <p role="alert" className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
             {error}
           </p>

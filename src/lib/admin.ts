@@ -2,6 +2,8 @@ import { getSessionToken } from "@/lib/auth/session";
 import { validateBitcoinAddress } from "@/lib/btc/address";
 import { verifyBtcDeposit } from "@/lib/btc/chain";
 import {
+  creditForUnits,
+  formatUnits,
   toMethodConfig,
   type DepositVerification,
   type MethodConfig,
@@ -164,20 +166,77 @@ export async function checkDepositOnChain(id: number): Promise<DepositVerificati
  * browser cannot supply or skip the verification. The database credits the
  * balance once, atomically, and refuses a second approval.
  */
-export async function approveDeposit(id: number): Promise<{ deposit: AdminDeposit; verification: DepositVerification }> {
-  await assertSchema();
-  const verification = await checkDepositOnChain(id);
-  if (!verification.matched) {
-    // The request stays PENDING: nothing is rejected automatically. The admin can retry later or reject.
-    const failed = verification.checks.filter((c) => !c.ok && !c.advisory).map((c) => `${c.label}: ${c.detail}`).join(" · ");
-    throw new RpcError(`Not approved — payment not verified on the blockchain. ${failed}. The request stays pending; the balance was not changed.`);
+export type AmountMismatch = {
+  method: PaymentMethod;
+  requestedUsd: number;
+  creditUsd: number;
+  expectedCrypto: string;
+  receivedCrypto: string;
+  asset: string;
+};
+
+/** Approval refused; carries the blockchain result so the admin sees exactly why. */
+export class ApprovalError extends RpcError {
+  constructor(
+    message: string,
+    public verification: DepositVerification,
+    public mismatch: AmountMismatch | null = null,
+  ) {
+    super(message);
   }
-  const result = await serviceRpc<{ deposit: Record<string, unknown> }>("igw_admin_approve", {
+}
+
+/**
+ * Manual approval by the admin. The server checks the transaction on the request's
+ * blockchain at that moment (the browser cannot supply or skip this) and the database
+ * credits the balance once, atomically. A real payment whose amount differs from the
+ * request is credited only if the admin explicitly accepts the amount received.
+ * A payment that cannot be found on the blockchain is never credited; the request
+ * then stays pending (nothing is rejected automatically).
+ */
+export async function approveDeposit(
+  id: number,
+  options: { acceptReceived?: boolean } = {},
+): Promise<{ deposit: AdminDeposit; verification: DepositVerification; creditedUsd: number }> {
+  await assertSchema();
+  const deposit = await getDeposit(id);
+  const verification = await checkDepositOnChain(id);
+  let acceptReceived = false;
+  if (!verification.matched) {
+    if (verification.matchedExceptAmount) {
+      const mismatch: AmountMismatch = {
+        method: deposit.method,
+        requestedUsd: deposit.amountUsd,
+        creditUsd: creditForUnits(deposit.method, verification.paidUnits, deposit.usdRate),
+        expectedCrypto: deposit.amountCrypto,
+        receivedCrypto: formatUnits(deposit.method, verification.paidUnits),
+        asset: deposit.asset,
+      };
+      if (!options.acceptReceived) {
+        throw new ApprovalError(
+          `The payment was found on the blockchain, but the amount differs: expected ${mismatch.expectedCrypto} ${mismatch.asset}, ` +
+            `received ${mismatch.receivedCrypto} ${mismatch.asset}. Approve the amount received (${mismatch.creditUsd.toFixed(2)} USD) or reject.`,
+          verification,
+          mismatch,
+        );
+      }
+      acceptReceived = true;
+    } else {
+      // The request stays PENDING: nothing is rejected automatically. The admin can retry later or reject.
+      const failed = verification.checks.filter((c) => !c.ok && !c.advisory).map((c) => `${c.label}: ${c.detail}`).join(" · ");
+      throw new ApprovalError(
+        `Not approved — payment not verified on the blockchain. ${failed}. The request stays pending; the balance was not changed.`,
+        verification,
+      );
+    }
+  }
+  const result = await serviceRpc<{ deposit: Record<string, unknown>; creditedUsd: number }>("igw_admin_approve", {
     p_token: await token(),
     p_id: id,
     p_verification: verification,
+    p_accept_received: acceptReceived,
   });
-  return { deposit: toAdminDeposit(result.deposit), verification };
+  return { deposit: toAdminDeposit(result.deposit), verification, creditedUsd: Number(result.creditedUsd) };
 }
 
 export async function rejectDeposit(id: number, reason: string): Promise<AdminDeposit> {

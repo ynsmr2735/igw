@@ -1,4 +1,4 @@
-import { requiredChecksPass, type DepositVerification, type VerificationSource } from "@/lib/payment-methods";
+import { realPaymentExceptAmount, requiredChecksPass, type DepositVerification, type VerificationSource } from "@/lib/payment-methods";
 import { USDT_TRC20_CONTRACT, tronAccountHex } from "@/lib/tron/address";
 
 /**
@@ -232,6 +232,7 @@ export async function verifyUsdtTrc20Deposit(
     },
     {
       label: "Exact amount",
+      key: "amount" as const,
       ok: paidUnits === deposit.amountUnits,
       detail: `Expected ${fmt(deposit.amountUnits)} USDT, received ${fmt(Math.max(paidUnits, 0))} USDT`,
     },
@@ -276,6 +277,7 @@ export async function verifyUsdtTrc20Deposit(
     confirmations,
     requiredConfirmations,
     matched: requiredChecksPass(checks),
+    matchedExceptAmount: realPaymentExceptAmount(checks, paidUnits),
     checks,
     sources: nodes.map(({ success: _s, usdtEvent: _u, ...rest }) => rest),
     checkedAt: new Date().toISOString(),

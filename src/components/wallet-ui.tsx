@@ -183,6 +183,9 @@ export async function postJson<T>(url: string, body: unknown, loginNext = "/dash
     throw new Error("Your session has ended. Please sign in again.");
   }
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
-  if (!response.ok) throw new Error(data.error ?? "Something went wrong. Please try again.");
+  if (!response.ok) {
+    // Keep the server's JSON (e.g. blockchain result) on the error for the caller.
+    throw Object.assign(new Error(data.error ?? "Something went wrong. Please try again."), { data, status: response.status });
+  }
   return data;
 }

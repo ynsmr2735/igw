@@ -1,5 +1,6 @@
 import { errorResponse, readJson, toId } from "@/lib/api";
 import {
+  ApprovalError,
   approveDeposit,
   checkDepositOnChain,
   getAdminOverview,
@@ -59,7 +60,18 @@ export async function POST(request: Request) {
       case "approve": {
         const id = toId(body.id);
         if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
-        return Response.json({ ok: true, ...(await approveDeposit(id)) });
+        try {
+          return Response.json({ ok: true, ...(await approveDeposit(id, { acceptReceived: body.acceptReceived === true })) });
+        } catch (error) {
+          // Real reason + the blockchain result, so the admin sees exactly what is missing.
+          if (error instanceof ApprovalError) {
+            return Response.json(
+              { error: error.message, verification: error.verification, mismatch: error.mismatch },
+              { status: error.mismatch ? 409 : 400 },
+            );
+          }
+          throw error;
+        }
       }
       case "reject": {
         const id = toId(body.id);

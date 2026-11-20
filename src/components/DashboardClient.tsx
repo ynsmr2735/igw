@@ -232,8 +232,13 @@ function DepositSection({
             const selected = m.method === chosen;
             const available = Boolean(m.address) && m.enabled;
             return (
-              <button
+              <div
                 key={m.method}
+                className={`overflow-hidden rounded-2xl border-2 transition ${
+                  selected ? "border-[#7F00FF] bg-purple-50/60" : "border-slate-200 bg-white hover:border-purple-200"
+                }`}
+              >
+              <button
                 type="button"
                 role="radio"
                 aria-checked={selected}
@@ -242,9 +247,7 @@ function DepositSection({
                   setChosen(m.method);
                   setError(null);
                 }}
-                className={`flex items-center gap-3 rounded-2xl border-2 p-4 text-left transition ${
-                  selected ? "border-[#7F00FF] bg-purple-50/60" : "border-slate-200 bg-white hover:border-purple-200"
-                }`}
+                className="flex w-full items-center gap-3 p-4 text-left"
               >
                 <span
                   className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-[12px] font-black ${
@@ -259,6 +262,25 @@ function DepositSection({
                 </span>
                 {!available && <Badge tone="slate">{m.address ? "Disabled" : "Unavailable"}</Badge>}
               </button>
+              {/* The admin's current address for this method, always visible (set in Admin -> Payment methods). */}
+              <div className="border-t border-slate-100 px-4 pb-3 pt-2.5" data-testid={`address-${m.method}`}>
+                <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                  {m.method === "usdt_trc20" ? "USDT TRC20 address (TRON network only)" : "BTC address (Bitcoin network)"}
+                </p>
+                {m.address ? (
+                  <div className="mt-1 flex items-center gap-2">
+                    <code className="min-w-0 flex-1 break-all text-[12px] font-bold text-slate-700">{m.address}</code>
+                    <CopyButton
+                      value={m.address}
+                      label="Copy"
+                      onCopied={(ok) => notify(ok ? { type: "ok", message: `${METHOD_INFO[m.method].short} address copied. Enter the amount below to get the exact amount to send.` } : { type: "error", message: "Could not copy." })}
+                    />
+                  </div>
+                ) : (
+                  <p className="mt-1 text-[12px] text-slate-500">Not available yet</p>
+                )}
+              </div>
+              </div>
             );
           })}
         </div>

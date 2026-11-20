@@ -222,6 +222,10 @@ begin
 end;
 $$;
 alter table public.deposit_requests add column if not exists method text not null default 'btc';
+-- igw-rpc-7: amount actually credited (can differ from amount_usd when the admin
+-- approves a real payment of a different amount).
+alter table public.deposit_requests add column if not exists credited_usd numeric(14, 2);
+update public.deposit_requests set credited_usd = amount_usd where status = 'approved' and credited_usd is null;
 alter table public.deposit_requests drop constraint if exists deposit_requests_network_check;
 alter table public.deposit_requests drop constraint if exists deposit_requests_method_check;
 alter table public.deposit_requests add constraint deposit_requests_method_check
@@ -888,6 +892,7 @@ as $$
     'submitDeadline', d.expires_at + interval '30 minutes',
     'createdAt', d.created_at,
     'submittedAt', d.submitted_at,
+    'creditedUsd', d.credited_usd,
     'reviewedAt', d.reviewed_at,
     'rejectionReason', d.rejection_reason,
     'verification', d.verification
@@ -1039,6 +1044,8 @@ drop function if exists public.igw_wallet_action(text, text, numeric, bigint, bi
 drop function if exists public.igw_deposit_create(text, numeric, numeric, text);
 drop function if exists public.igw_admin_set_btc_address(text, text);
 drop function if exists public.igw_admin_set_deposits_enabled(text, boolean);
+-- igw-rpc-7: approve gets p_accept_received.
+drop function if exists public.igw_admin_approve(text, bigint, jsonb);
 
 create or replace function public.igw_health()
 returns jsonb
@@ -1047,7 +1054,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-6');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-7');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1806,7 +1813,9 @@ $$;
 -- re-checks it, and this function verifies the result matches this exact
 -- request (method, address, exact amount, token contract, confirmations).
 -- Row lock + status check make a second approval impossible.
-create or replace function public.igw_admin_approve(p_token text, p_id bigint, p_verification jsonb)
+create or replace function public.igw_admin_approve(
+  p_token text, p_id bigint, p_verification jsonb, p_accept_received boolean default false
+)
 returns jsonb
 language plpgsql
 security definer
@@ -1817,6 +1826,9 @@ declare
   v_request public.deposit_requests%rowtype;
   v_required integer;
   v_wallet public.wallets%rowtype;
+  v_paid bigint := coalesce((p_verification->>'paidUnits')::bigint, -1);
+  v_credit numeric(14, 2);
+  v_other text;
 begin
   select * into v_request from public.deposit_requests where id = p_id for update;
   if not found then
@@ -1829,42 +1841,77 @@ begin
     raise exception 'Only deposits under review can be approved (status: %).', replace(v_request.status, '_', ' ');
   end if;
   v_required := igw_private.setting(igw_private.method_key(v_request.method, 'confirmations'))::integer;
+  -- The payment must be REAL: found on the request's own blockchain, to this request's
+  -- address, (USDT) from the official token contract, with enough confirmations.
   if p_verification is null
-     or coalesce((p_verification->>'matched')::boolean, false) is not true
      or p_verification->>'method' is distinct from v_request.method
      or p_verification->>'txid' is distinct from v_request.txid
      or p_verification->>'address' is distinct from v_request.deposit_address
-     or coalesce((p_verification->>'paidUnits')::bigint, -1) <> v_request.amount_units
      or coalesce((p_verification->>'confirmations')::integer, 0) < v_required
      or (v_request.method = 'usdt_trc20'
-         and p_verification->>'contract' is distinct from 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t') then
+         and p_verification->>'contract' is distinct from 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t')
+     or v_paid <= 0 then
     raise exception 'Blockchain verification does not match this request. The deposit was not approved.';
   end if;
 
+  if v_paid = v_request.amount_units then
+    if coalesce((p_verification->>'matched')::boolean, false) is not true then
+      raise exception 'Blockchain verification does not match this request. The deposit was not approved.';
+    end if;
+    v_credit := v_request.amount_usd;
+  else
+    -- Different amount (e.g. the exchange deducted a fee): only by an explicit admin
+    -- decision, and only if every other check passed.
+    if not coalesce(p_accept_received, false)
+       or coalesce((p_verification->>'matchedExceptAmount')::boolean, false) is not true then
+      raise exception 'The amount received differs from this request. The deposit was not approved.';
+    end if;
+    -- Never give one member the payment that exactly matches another member's request.
+    select reference into v_other
+    from public.deposit_requests
+    where method = v_request.method and amount_units = v_paid and id <> v_request.id
+      and status in ('awaiting_payment', 'reviewing')
+    limit 1;
+    if v_other is not null then
+      raise exception 'This payment exactly matches another member''s request (%). It was not approved.', v_other;
+    end if;
+    v_credit := case v_request.method
+      when 'usdt_trc20' then floor(v_paid / 10000.0) / 100
+      else floor(v_paid * v_request.usd_rate / 1000000.0) / 100
+    end;
+    if v_credit <= 0 then
+      raise exception 'The amount received is too small to credit.';
+    end if;
+  end if;
+
   update public.wallets
-  set balance = balance + v_request.amount_usd
+  set balance = balance + v_credit
   where user_id = v_request.user_id and currency = 'USD'
   returning * into v_wallet;
 
   update public.transactions
-  set status = 'completed', description = description || ' · TXID ' || left(v_request.txid, 12) || '…'
+  set status = 'completed', amount = v_credit,
+      description = igw_private.method_asset(v_request.method) || ' deposit · '
+        || igw_private.format_units(v_request.method, v_paid) || ' ' || igw_private.method_asset(v_request.method)
+        || ' · TXID ' || left(v_request.txid, 12) || '…'
   where deposit_request_id = v_request.id and status = 'pending';
   if not found then
     insert into public.transactions (
       wallet_id, type, direction, amount, currency, counterparty, note, status,
       reference, description, deposit_request_id
     ) values (
-      v_wallet.id, 'deposit', 'in', v_request.amount_usd, 'USD',
+      v_wallet.id, 'deposit', 'in', v_credit, 'USD',
       case v_request.method when 'usdt_trc20' then 'Tether (USDT TRC20)' else 'Bitcoin (BTC)' end, '', 'completed',
       v_request.reference,
       igw_private.method_asset(v_request.method) || ' deposit · '
-        || igw_private.format_units(v_request.method, v_request.amount_units) || ' ' || igw_private.method_asset(v_request.method),
+        || igw_private.format_units(v_request.method, v_paid) || ' ' || igw_private.method_asset(v_request.method),
       v_request.id
     );
   end if;
 
   update public.deposit_requests
-  set status = 'approved', reviewed_at = now(), reviewed_by = v_admin, verification = p_verification
+  set status = 'approved', reviewed_at = now(), reviewed_by = v_admin, verification = p_verification,
+      credited_usd = v_credit
   where id = v_request.id
   returning * into v_request;
 
@@ -1874,15 +1921,18 @@ begin
 
   perform igw_private.audit(v_admin, 'deposit_approved', 'deposit_request', v_request.reference,
     jsonb_build_object('requestId', v_request.id, 'method', v_request.method, 'accountNumber', v_request.account_number,
-                       'amountUsd', v_request.amount_usd, 'amountUnits', v_request.amount_units,
+                       'amountUsd', v_request.amount_usd, 'creditedUsd', v_credit,
+                       'amountUnits', v_request.amount_units, 'receivedUnits', v_paid,
+                       'differentAmountAccepted', v_paid <> v_request.amount_units,
                        'txid', v_request.txid, 'confirmations', p_verification->'confirmations'));
   perform igw_private.notify(
     v_request.user_id, 'deposit_approved', 'Payment approved',
-    format('Your payment has been approved and added to your balance: %s USD (ref. %s).', v_request.amount_usd, v_request.reference),
-    jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'amountUsd', v_request.amount_usd)
+    format('Your payment has been approved and added to your balance: %s USD (ref. %s).', v_credit, v_request.reference),
+    jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'amountUsd', v_credit)
   );
 
-  return jsonb_build_object('ok', true, 'deposit', igw_private.admin_deposit_row(v_request), 'newBalance', v_wallet.balance);
+  return jsonb_build_object('ok', true, 'deposit', igw_private.admin_deposit_row(v_request), 'newBalance', v_wallet.balance,
+                            'creditedUsd', v_credit);
 end;
 $$;
 
@@ -2099,7 +2149,7 @@ declare
   -- callable only with the secret service role key held by the server.
   service_functions text[] := array[
     'public.igw_deposit_create(text, text, numeric, numeric, text)',
-    'public.igw_admin_approve(text, bigint, jsonb)',
+    'public.igw_admin_approve(text, bigint, jsonb, boolean)',
     'public.igw_service_ping()'
   ];
 begin

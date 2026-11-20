@@ -39,6 +39,8 @@ export type Deposit = {
   submittedAt: string | null;
   reviewedAt: string | null;
   rejectionReason: string | null;
+  /** USD actually credited (approved requests). */
+  creditedUsd?: number | null;
   userName?: string | null;
 };
 
@@ -118,6 +120,7 @@ export function toDeposit(raw: Record<string, unknown>): Deposit {
     asset: raw.method === "usdt_trc20" ? "USDT" : "BTC",
     network: raw.method === "usdt_trc20" ? "tron" : "mainnet",
     amountUsd: num(raw.amountUsd),
+    creditedUsd: raw.creditedUsd == null ? null : num(raw.creditedUsd),
     usdRate: num(raw.usdRate),
     amountUnits: num(raw.amountUnits),
     amountCrypto: String(raw.amountCrypto ?? ""),
