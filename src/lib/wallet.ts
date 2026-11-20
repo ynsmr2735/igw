@@ -1,5 +1,5 @@
 import { getSessionToken } from "@/lib/auth/session";
-import { RpcError, rpc } from "@/lib/supabase";
+import { AuthError, rpc } from "@/lib/supabase";
 import { CURRENCIES, initialsOf } from "./format";
 
 export {
@@ -133,7 +133,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
 
 export async function executeAction(payload: ActionPayload): Promise<{ convertedAmount?: number }> {
   const token = await getSessionToken();
-  if (!token) throw new RpcError("You must be signed in");
+  if (!token) throw new AuthError();
 
   const result = await rpc<{ ok: boolean; converted_amount?: number | string }>("igw_wallet_action", {
     p_token: token,

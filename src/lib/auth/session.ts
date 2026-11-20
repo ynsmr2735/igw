@@ -2,7 +2,12 @@ import { cookies } from "next/headers";
 import { rpc } from "@/lib/supabase";
 
 export const SESSION_COOKIE = "igw_session";
-export const SESSION_MAX_AGE = 60 * 60 * 24 * 7; // 7 days, same as the database
+/**
+ * Cookie lifetime = the database's absolute session limit (30 days).
+ * The database also ends a session after 7 days without activity and slides
+ * that window forward on use, so active users stay signed in across reloads.
+ */
+export const SESSION_MAX_AGE = 60 * 60 * 24 * 30;
 
 /** Session tokens are 64 hex chars (32 random bytes from the database). */
 export const SESSION_TOKEN_PATTERN = /^[0-9a-f]{64}$/;

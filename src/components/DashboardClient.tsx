@@ -5,7 +5,6 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ArrowDownLeft,
   ArrowLeftRight,
-  ArrowRight,
   ArrowUpRight,
   Bell,
   Check,
@@ -29,7 +28,6 @@ import {
   Send,
   Settings,
   ShieldCheck,
-  Smartphone,
   Sparkles,
   TrendingDown,
   TrendingUp,
@@ -179,8 +177,14 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
     return () => clearTimeout(timer);
   }, [toast]);
 
+  /** Session ended (signed out elsewhere, expired or revoked): go to sign-in. */
+  function handleSignedOut() {
+    window.location.assign("/login?next=/dashboard");
+  }
+
   async function refresh() {
     const response = await fetch("/api/dashboard", { cache: "no-store" });
+    if (response.status === 401) return handleSignedOut();
     if (response.ok) setData((await response.json()) as DashboardData);
   }
 
@@ -251,7 +255,8 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const result = (await response.json()) as { ok?: boolean; error?: string };
+      if (response.status === 401) return handleSignedOut();
+      const result = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string };
       if (!response.ok || !result.ok) throw new Error(result.error ?? "Transaction failed");
       await refresh();
       setAction(null);
@@ -279,6 +284,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "toggleCard", cardId }),
       });
+      if (response.status === 401) return handleSignedOut();
       if (!response.ok) throw new Error("Card could not be updated");
       await refresh();
       setToast({ type: "ok", message: "Card status updated." });
@@ -327,7 +333,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
   };
 
   return (
-    <div className="min-h-screen bg-[#f7f7fb] text-[#10152b]">
+    <div lang="en" className="min-h-screen bg-[#f7f7fb] text-[#10152b]">
       {/* Sidebar */}
       <aside
         className={`fixed inset-y-0 left-0 z-50 flex w-[264px] flex-col border-r border-white/5 bg-[#10152b] text-white transition-transform duration-300 lg:translate-x-0 ${
@@ -383,7 +389,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
             <div className="absolute -right-6 -top-6 h-20 w-20 rounded-full bg-white/15 blur-xl" />
             <div className="relative">
               <Sparkles className="h-5 w-5 text-white" />
-              <p className="mt-3 text-[13px] font-bold">IGW Global Plus</p>
+              <p className="mt-3 text-[13px] font-bold">IGW {data.user.plan}</p>
               <p className="mt-1 text-[11px] leading-5 text-white/75">
                 Enjoy unlimited transfers and special exchange rates.
               </p>

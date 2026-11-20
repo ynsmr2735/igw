@@ -84,11 +84,22 @@ create table if not exists public.transactions (
   created_at timestamptz not null default now()
 );
 
+-- expires_at slides forward on activity (idle timeout, 7 days);
+-- created_at + 30 days is the absolute limit.
 create table if not exists public.sessions (
   token_hash text primary key,
   user_id uuid not null,
   created_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
   expires_at timestamptz not null
+);
+alter table public.sessions add column if not exists last_seen_at timestamptz not null default now();
+
+-- Failed sign-in attempts, used to throttle password guessing per email.
+create table if not exists public.login_attempts (
+  id bigint generated always as identity primary key,
+  email text not null,
+  attempted_at timestamptz not null default now()
 );
 
 create index if not exists wallets_user_idx on public.wallets(user_id);
@@ -96,6 +107,10 @@ create index if not exists cards_user_idx on public.cards(user_id);
 create index if not exists transactions_wallet_idx on public.transactions(wallet_id);
 create index if not exists recipients_user_idx on public.recipients(user_id);
 create index if not exists sessions_user_idx on public.sessions(user_id);
+create index if not exists sessions_expires_idx on public.sessions(expires_at);
+create index if not exists login_attempts_email_idx on public.login_attempts(email, attempted_at);
+create index if not exists login_attempts_time_idx on public.login_attempts(attempted_at);
+create index if not exists profiles_created_idx on public.profiles(created_at);
 
 -- ---------------------------------------------------------------------------
 -- Migration from earlier versions (Supabase Auth / direct DATABASE_URL)
@@ -181,6 +196,7 @@ alter table public.recipients enable row level security;
 alter table public.transactions enable row level security;
 alter table public.exchange_rates enable row level security;
 alter table public.sessions enable row level security;
+alter table public.login_attempts enable row level security;
 
 drop policy if exists "profiles own" on public.profiles;
 drop policy if exists "wallets own" on public.wallets;
@@ -190,7 +206,7 @@ drop policy if exists "transactions own" on public.transactions;
 drop policy if exists "rates readable" on public.exchange_rates;
 
 revoke all on public.profiles, public.wallets, public.cards, public.recipients,
-  public.transactions, public.exchange_rates, public.sessions
+  public.transactions, public.exchange_rates, public.sessions, public.login_attempts
   from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -221,7 +237,30 @@ as $$
   where p_token is not null
     and s.token_hash = igw_private.token_hash(p_token)
     and s.expires_at > now()
+    and s.created_at > now() - interval '30 days'
   limit 1;
+$$;
+
+-- Resolves the session and slides its idle expiry forward (at most once an
+-- hour, so normal page views do not write on every request).
+create or replace function igw_private.touch_session(p_token text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.session_user_id(p_token);
+begin
+  if v_uid is not null then
+    update public.sessions
+      set last_seen_at = now(),
+          expires_at = least(now() + interval '7 days', created_at + interval '30 days')
+      where token_hash = igw_private.token_hash(p_token)
+        and last_seen_at < now() - interval '1 hour';
+  end if;
+  return v_uid;
+end;
 $$;
 
 create or replace function igw_private.create_session(p_user_id uuid)
@@ -233,7 +272,8 @@ as $$
 declare
   v_token text := encode(gen_random_bytes(32), 'hex');
 begin
-  delete from public.sessions where user_id = p_user_id and expires_at <= now();
+  delete from public.sessions
+    where expires_at <= now() or created_at <= now() - interval '30 days';
   insert into public.sessions (token_hash, user_id, expires_at)
     values (igw_private.token_hash(v_token), p_user_id, now() + interval '7 days');
   return v_token;
@@ -279,7 +319,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-1');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-2');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -309,6 +349,10 @@ begin
   if exists (select 1 from public.profiles where email = v_email) then
     return jsonb_build_object('ok', false, 'error', 'An account with this email already exists. Please sign in.');
   end if;
+  -- The anon key is public, so throttle mass account creation.
+  if (select count(*) from public.profiles where created_at > now() - interval '1 minute') >= 20 then
+    return jsonb_build_object('ok', false, 'error', 'Too many sign-ups right now. Please try again in a minute.');
+  end if;
 
   insert into public.profiles (full_name, email, password_hash)
     values (v_name, v_email, crypt(v_password, gen_salt('bf', 10)))
@@ -330,23 +374,37 @@ security definer
 set search_path = public, extensions
 as $$
 declare
+  v_email text := lower(trim(coalesce(p_email, '')));
   v_id uuid;
   v_hash text;
+  v_valid boolean := false;
 begin
+  -- At most 5 failed attempts per email in 15 minutes (unknown emails too,
+  -- so the lockout does not reveal which emails are registered).
+  if (select count(*) from public.login_attempts
+      where email = v_email and attempted_at > now() - interval '15 minutes') >= 5 then
+    return jsonb_build_object('ok', false, 'error',
+      'Too many failed sign-in attempts. Please wait 15 minutes and try again.');
+  end if;
+
   select id, password_hash into v_id, v_hash
   from public.profiles
-  where email = lower(trim(coalesce(p_email, '')));
+  where email = v_email;
 
-  if v_hash is null or v_hash not like '$2%' then
+  if v_hash is not null and v_hash like '$2%' then
+    v_valid := crypt(coalesce(p_password, ''), v_hash) = v_hash;
+  else
     -- Same work as a real check so timing does not reveal unknown emails.
     perform crypt(coalesce(p_password, ''), gen_salt('bf', 10));
+  end if;
+
+  if not v_valid then
+    delete from public.login_attempts where attempted_at < now() - interval '1 day';
+    insert into public.login_attempts (email) values (v_email);
     return jsonb_build_object('ok', false, 'error', 'Email or password is incorrect.');
   end if;
 
-  if crypt(coalesce(p_password, ''), v_hash) <> v_hash then
-    return jsonb_build_object('ok', false, 'error', 'Email or password is incorrect.');
-  end if;
-
+  delete from public.login_attempts where email = v_email;
   return jsonb_build_object('ok', true, 'token', igw_private.create_session(v_id));
 end;
 $$;
@@ -363,25 +421,32 @@ $$;
 
 create or replace function public.igw_me(p_token text)
 returns jsonb
-language sql
-stable
+language plpgsql
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('id', p.id, 'name', p.full_name, 'email', p.email, 'plan', p.plan)
-  from public.profiles p
-  where p.id = igw_private.session_user_id(p_token);
+declare
+  v_uid uuid := igw_private.touch_session(p_token);
+begin
+  if v_uid is null then
+    return null;
+  end if;
+  return (
+    select jsonb_build_object('id', p.id, 'name', p.full_name, 'email', p.email, 'plan', p.plan)
+    from public.profiles p
+    where p.id = v_uid
+  );
+end;
 $$;
 
 create or replace function public.igw_dashboard(p_token text)
 returns jsonb
 language plpgsql
-stable
 security definer
 set search_path = public, extensions
 as $$
 declare
-  v_uid uuid := igw_private.session_user_id(p_token);
+  v_uid uuid := igw_private.touch_session(p_token);
 begin
   if v_uid is null then
     return jsonb_build_object('ok', false, 'error', 'You must be signed in');
@@ -461,7 +526,7 @@ security definer
 set search_path = public, extensions
 as $$
 declare
-  v_uid uuid := igw_private.session_user_id(p_token);
+  v_uid uuid := igw_private.touch_session(p_token);
   v_amount numeric(14, 2);
   v_note text := left(coalesce(p_note, ''), 200);
   v_wallet public.wallets%rowtype;
@@ -474,7 +539,8 @@ declare
   v_pair text;
 begin
   if v_uid is null then
-    raise exception 'You must be signed in';
+    -- SQLSTATE 28000 lets the app tell "not signed in" apart from other errors.
+    raise exception using errcode = '28000', message = 'You must be signed in';
   end if;
 
   if p_action in ('toggleCard', 'toggle_card') then
@@ -486,6 +552,7 @@ begin
     return jsonb_build_object('ok', true);
   end if;
 
+  if coalesce(p_amount, 0) > 1000000000 then raise exception 'Amount is too large'; end if;
   v_amount := round(coalesce(p_amount, 0), 2);
   if v_amount <= 0 then raise exception 'Enter a valid amount'; end if;
 

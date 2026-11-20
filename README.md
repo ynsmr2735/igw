@@ -8,7 +8,9 @@ English-language multi-currency wallet built with Next.js App Router and Supabas
 - No Supabase Auth: there are no `auth.users` rows and no email confirmation.
 - Sign-up (`igw_sign_up`) writes the user into `public.profiles`, with the password stored as a **bcrypt hash** in `profiles.password_hash`. In the same call it creates four starter wallets, a virtual card and saved recipients, and returns a session token.
 - The user is signed in right away and redirected to `/dashboard`.
-- Sessions are random 32-byte tokens kept in an `httpOnly` cookie (`igw_session`, 7 days). Only the SHA-256 hash of the token is stored in `public.sessions`. Sign-out deletes the session.
+- Sessions are random 32-byte tokens kept in an `httpOnly`, `SameSite=Lax`, `Secure` cookie (`igw_session`). Only the SHA-256 hash of the token is stored in `public.sessions`.
+- A session ends after **7 days without activity** (the window slides forward while the user is active) and after **30 days** at most. Sign-out deletes the session in the database, so the old cookie stops working everywhere.
+- Sign-in allows **5 failed attempts per email per 15 minutes**; sign-up is limited to 20 new accounts per minute overall.
 
 ## Security model
 
@@ -20,16 +22,17 @@ The anon key is public by design, so:
 
 ## Setup
 
-1. In the Supabase SQL Editor run the whole [`supabase/schema.sql`](supabase/schema.sql). It works on a new project and migrates earlier versions of this schema in place.
-2. In Vercel -> Project Settings -> Environment Variables add:
+1. In the Supabase SQL Editor run the whole [`supabase/schema.sql`](supabase/schema.sql). It works on a new project and migrates every earlier version in place.
+   Projects that already ran the previous version can instead run [`supabase/migrations/20261120000000_auth_hardening.sql`](supabase/migrations/20261120000000_auth_hardening.sql); the result is identical.
+2. In Vercel -> Project Settings -> Environment Variables add (both from the **same** Supabase project):
 
 ```bash
 NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon or publishable key>
 ```
 
-   `DATABASE_URL` and `AUTH_SECRET` are no longer used and can be removed.
-3. Redeploy and open `/api/health`: it should return `{"ok":true,"supabase":"ok","schema":"igw-rpc-1"}`.
+   `DATABASE_URL` and `AUTH_SECRET` are no longer used and can be removed. `NEXT_PUBLIC_*` values are baked in at build time, so redeploy after changing them.
+3. Redeploy and open `/api/health`: it should return `{"ok":true,"supabase":"ok","schema":"igw-rpc-2"}`.
 
 ## Local development
 
@@ -65,5 +68,6 @@ npm run dev
 
 ## Notes
 
-- There is no rate limiting on sign-in yet; add one before real use.
 - Passwords are limited to 72 bytes (bcrypt limit).
+- There is no email verification and no password reset: both need an email-sending service, which this project does not have configured.
+- Accounts created by the old Supabase-Auth version have no password hash and cannot sign in; delete those rows from `public.profiles` so the people can sign up again.

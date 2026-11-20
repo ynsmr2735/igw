@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { AuthForm } from "@/components/AuthForm";
+import { safeNextPath } from "@/lib/auth/redirect";
 import { getSessionUser } from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
@@ -7,7 +8,7 @@ export const dynamic = "force-dynamic";
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ next?: string }>;
+  searchParams: Promise<{ next?: string | string[] }>;
 }) {
   const params = await searchParams;
 
@@ -18,7 +19,8 @@ export default async function LoginPage({
     // Supabase not reachable / not configured: still show the form, the action reports the reason.
     console.error("Session check failed:", error);
   }
-  if (signedIn) redirect("/dashboard");
+  const next = safeNextPath(params.next);
+  if (signedIn) redirect(next);
 
-  return <AuthForm mode="login" next={params.next ?? "/dashboard"} />;
+  return <AuthForm mode="login" next={next} />;
 }

@@ -32,6 +32,14 @@ export class SetupError extends Error {
   }
 }
 
+/** The session token is missing, expired or revoked (HTTP 401 for the app). */
+export class AuthError extends Error {
+  constructor(message = "You must be signed in") {
+    super(message);
+    this.name = "AuthError";
+  }
+}
+
 /** A normal error raised by a database function, e.g. "Insufficient balance". */
 export class RpcError extends Error {
   constructor(message: string) {
@@ -84,9 +92,22 @@ export async function rpc<T>(fn: string, args: Record<string, unknown> = {}): Pr
 
   if (response.ok) return body as T;
 
-  const info = (body ?? {}) as { code?: string; message?: string; hint?: string };
+  const info = (body && typeof body === "object" ? body : {}) as {
+    code?: string;
+    message?: string;
+    hint?: string;
+  };
+
+  // Raised on purpose by igw_wallet_action when the session is not valid.
+  if (info.code === "28000") throw new AuthError(info.message || undefined);
+
   console.error(`Supabase RPC ${fn} failed (${response.status}):`, body);
 
+  if (response.status >= 500) {
+    throw new SetupError(
+      `Supabase is not responding (HTTP ${response.status}). The project may be paused or restarting.`,
+    );
+  }
   if (response.status === 401 || /api key|jwt/i.test(info.message ?? "")) {
     throw new SetupError("NEXT_PUBLIC_SUPABASE_ANON_KEY is wrong or belongs to another project.");
   }

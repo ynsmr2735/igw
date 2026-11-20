@@ -22,16 +22,14 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
   const [accepted, setAccepted] = useState(isSignup);
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#f7f7fb] text-[#10152b]">
+    <main lang="en" className="relative min-h-screen overflow-hidden bg-[#f7f7fb] text-[#10152b]">
       <div className="pointer-events-none absolute -left-32 -top-40 h-[520px] w-[520px] rounded-full bg-purple-300/40 blur-[120px]" />
       <div className="pointer-events-none absolute -bottom-40 -right-24 h-[480px] w-[480px] rounded-full bg-cyan-300/40 blur-[120px]" />
 
       <div className="relative mx-auto grid min-h-screen max-w-[1400px] items-center gap-10 px-5 py-10 lg:grid-cols-[1.05fr_0.95fr] lg:px-12">
         {/* Brand panel */}
         <div className="hidden lg:block">
-          <Link href="/">
-            <Brand />
-          </Link>
+          <Brand />
           <div className="relative mt-14 max-w-lg">
             <span className="inline-flex items-center gap-2 rounded-full border border-purple-200 bg-white/80 px-3.5 py-1.5 text-[11px] font-bold uppercase tracking-[0.14em] text-[#7F00FF]">
               <LockKeyhole className="h-3.5 w-3.5" /> Secure by design
@@ -75,9 +73,7 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
         {/* Form panel */}
         <div className="relative mx-auto w-full max-w-[480px]">
           <div className="mb-7 lg:hidden">
-            <Link href="/">
-              <Brand />
-            </Link>
+            <Brand />
           </div>
 
           <div className="rounded-[30px] border border-white bg-white/90 p-7 igw-shadow sm:p-9">
@@ -116,8 +112,10 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                       autoComplete="name"
                       required
                       minLength={2}
+                      maxLength={120}
+                      defaultValue={state.values?.name ?? ""}
                       placeholder="Deniz Arslan"
-                      className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-4 text-[13px] font-semibold text-slate-800 transition focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
+                      className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-4 text-base font-semibold text-slate-800 transition focus:border-purple-400 sm:text-[13px] focus:ring-2 focus:ring-purple-100"
                     />
                   </div>
                 </div>
@@ -133,10 +131,16 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                     id="email"
                     name="email"
                     type="email"
+                    inputMode="email"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                     autoComplete="email"
                     required
+                    maxLength={180}
+                    defaultValue={state.values?.email ?? ""}
                     placeholder="you@example.com"
-                    className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-4 text-[13px] font-semibold text-slate-800 transition focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
+                    className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-4 text-base font-semibold text-slate-800 transition focus:border-purple-400 sm:text-[13px] focus:ring-2 focus:ring-purple-100"
                   />
                 </div>
               </div>
@@ -158,9 +162,10 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                     type={showPassword ? "text" : "password"}
                     autoComplete={isSignup ? "new-password" : "current-password"}
                     required
-                    minLength={8}
+                    minLength={isSignup ? 8 : undefined}
+                    maxLength={72}
                     placeholder={isSignup ? "At least 8 characters" : "••••••••"}
-                    className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-11 text-[13px] font-semibold text-slate-800 transition focus:border-purple-400 focus:ring-2 focus:ring-purple-100"
+                    className="h-12 w-full rounded-xl border border-slate-200 bg-white pl-10 pr-11 text-base font-semibold text-slate-800 transition focus:border-purple-400 sm:text-[13px] focus:ring-2 focus:ring-purple-100"
                   />
                   <button
                     type="button"
@@ -189,7 +194,7 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
               )}
 
               {state.error && (
-                <p className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
+                <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
                   {state.error}
                 </p>
               )}
