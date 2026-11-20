@@ -12,7 +12,8 @@ Multi-user USD wallet built with Next.js App Router and Supabase: 8-digit accoun
 | Admin review | Admin checks the TXID on the blockchain (mempool.space + blockstream.info): right address, exact satoshi amount, paid within the quote window, enough confirmations, both explorers agree. Only then can it be approved; the balance is credited once, atomically. Or rejected with a reason. The member is notified either way. |
 | Transfers | Recipient's 8-digit account number → masked name shown for confirmation → confirm. Atomic, row-locked, idempotent (a retry or double click never sends twice), unique `TRF…` reference, both sides get a history entry and a notification. |
 | History | Reference, type, amount, date, status and description for deposits, transfers sent/received (withdrawals are prepared as a type, the feature is "coming soon"). |
-| Admin panel | `/admin`: notifications (new requests highlighted), deposit requests by status with user details, blockchain check, approve/reject, all transactions, deposit address settings. Members get a 404. |
+| Admin panel | `/admin`: notifications (new requests highlighted, read/unread, auto-refresh every 10 s, pending count in the tab title), **BTC payment requests** (All / Pending / Approved / Rejected / Awaiting payment) with **APPROVE / REJECT** on every pending row, request details with blockchain check, all transactions, **BTC payment settings** (add/change the address, last update date and admin, payment method **Active/Inactive**), **Audit log**. Members get a 404. |
+| Audit log | Every admin action — address changes (old → new), enabling/disabling BTC payments, approvals (TXID, confirmations), rejections (reason) — is stored in `admin_audit_log` with the admin and time. |
 
 ## How it is secured
 
@@ -26,7 +27,7 @@ Multi-user USD wallet built with Next.js App Router and Supabase: 8-digit accoun
 
 ## Setup
 
-1. **Database** — in the Supabase SQL Editor of the project your site uses, run the whole [`supabase/schema.sql`](supabase/schema.sql) (fresh or existing project; idempotent; keeps existing balances). Projects that ran the previous version can run [`supabase/migrations/20261120000100_wallet_btc_transfers.sql`](supabase/migrations/20261120000100_wallet_btc_transfers.sql) instead — the result is identical.
+1. **Database** — in the Supabase SQL Editor of the project your site uses, run the whole [`supabase/schema.sql`](supabase/schema.sql) (fresh or existing project; idempotent; keeps existing balances). Projects that already ran an earlier version can instead run, in order, only the migrations they have not run yet (the result is identical): [`20261120000000_auth_hardening.sql`](supabase/migrations/20261120000000_auth_hardening.sql), [`20261120000100_wallet_btc_transfers.sql`](supabase/migrations/20261120000100_wallet_btc_transfers.sql), [`20261120000200_btc_settings_audit.sql`](supabase/migrations/20261120000200_btc_settings_audit.sql) (payment method on/off, member name on requests, audit log).
 2. **Environment variables** (Vercel → Settings → Environment Variables), all from the same Supabase project:
 
    ```bash
@@ -42,13 +43,13 @@ Multi-user USD wallet built with Next.js App Router and Supabase: 8-digit accoun
    3. Sign in with the email or the username `enkyryyss`; the **Admin panel** link appears in the sidebar.
    To remove: `select igw_private.revoke_admin('admin-email@example.com');`
 4. **Deposit address** — in `/admin` → Settings enter the Bitcoin **Mainnet** address that should receive deposits (`bc1…`, `1…` or `3…`; checksum verified, testnet refused). Until then members see "deposits are not available yet".
-5. Open `/api/health`: expect `{"ok":true,"supabase":"ok","schema":"igw-rpc-3","serviceKey":"configured"}`.
+5. Open `/api/health`: expect `{"ok":true,"supabase":"ok","schema":"igw-rpc-4","serviceKey":"configured"}`.
 
 Defaults (change in the SQL Editor, table `public.app_settings`): 2 confirmations, min 10 USD, max 10,000 USD, quote valid 60 minutes.
 
 ## Database
 
-Tables: `profiles` (+ `account_number`, `username`), `wallets`, `transactions` (+ `reference`, `status`, `description`), `deposit_requests`, `transfers`, `notifications`, `admin_roles`, `app_settings`, `sessions`, `login_attempts`, `transfer_lookups`. Legacy demo tables `cards`, `recipients`, `exchange_rates` are kept (unused) so no data is lost; non-USD demo wallets are kept but hidden.
+Tables: `profiles` (+ `account_number`, `username`), `wallets`, `transactions` (+ `reference`, `status`, `description`), `deposit_requests` (+ `user_name`), `transfers`, `notifications`, `admin_roles`, `admin_audit_log`, `app_settings` (incl. `btc_address`, `btc_deposits_enabled`), `sessions`, `login_attempts`, `transfer_lookups`. Legacy demo tables `cards`, `recipients`, `exchange_rates` are kept (unused) so no data is lost; non-USD demo wallets are kept but hidden.
 
 ## Not included (needs your decision / services)
 

@@ -50,7 +50,7 @@ export function shortHash(value: string, size = 10): string {
 
 export const DEPOSIT_STATUS_LABEL: Record<string, string> = {
   awaiting_payment: "Awaiting payment",
-  reviewing: "Under review",
+  reviewing: "Pending review",
   approved: "Approved",
   rejected: "Rejected",
   expired: "Expired",

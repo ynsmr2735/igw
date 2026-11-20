@@ -31,6 +31,7 @@ export type Deposit = {
   submittedAt: string | null;
   reviewedAt: string | null;
   rejectionReason: string | null;
+  userName?: string | null;
 };
 
 export type Transaction = {
@@ -58,7 +59,10 @@ export type Notification = {
 };
 
 export type DepositConfig = {
+  /** Payment method switched on in the admin panel. */
+  enabled: boolean;
   btcAddress: string | null;
+  addressUpdatedAt: string | null;
   network: "mainnet";
   minUsd: number;
   maxUsd: number;
@@ -167,7 +171,9 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     deposits: ((data.deposits as Record<string, unknown>[]) ?? []).map(toDeposit),
     openDeposit: data.openDeposit ? toDeposit(data.openDeposit as Record<string, unknown>) : null,
     depositConfig: {
+      enabled: config.enabled !== false,
       btcAddress: (config.btcAddress as string | null) ?? null,
+      addressUpdatedAt: (config.addressUpdatedAt as string | null) ?? null,
       network: "mainnet",
       minUsd: num(config.minUsd),
       maxUsd: num(config.maxUsd),

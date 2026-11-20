@@ -9,6 +9,7 @@ import {
   markAdminNotificationsRead,
   rejectDeposit,
   setBtcAddress,
+  setDepositsEnabled,
 } from "@/lib/admin";
 
 export const dynamic = "force-dynamic";
@@ -51,6 +52,10 @@ export async function POST(request: Request) {
         return Response.json({ ok: true, transactions: await listAllTransactions() });
       case "setBtcAddress":
         return Response.json({ ok: true, btcAddress: await setBtcAddress(String(body.address ?? "")) });
+      case "setDepositsEnabled": {
+        if (typeof body.enabled !== "boolean") return Response.json({ error: "enabled must be true or false" }, { status: 400 });
+        return Response.json({ ok: true, enabled: await setDepositsEnabled(body.enabled) });
+      }
       case "readNotifications": {
         const ids = Array.isArray(body.ids) ? body.ids.map(toId).filter((id): id is number => id !== null) : null;
         await markAdminNotificationsRead(ids);

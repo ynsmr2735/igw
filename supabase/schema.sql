@@ -266,6 +266,31 @@ begin
 end;
 $$;
 
+-- BTC payment method switch, managed in the admin panel (igw-rpc-4).
+insert into public.app_settings (key, value) values ('btc_deposits_enabled', 'true')
+on conflict (key) do nothing;
+
+-- Member's name at the time of the request.
+alter table public.deposit_requests add column if not exists user_name text;
+update public.deposit_requests d
+set user_name = p.full_name
+from public.profiles p
+where p.id = d.user_id and d.user_name is null;
+
+-- Audit trail: every admin action (address changes, enable/disable, approvals,
+-- rejections) is recorded here. The app only ever inserts into this table.
+create table if not exists public.admin_audit_log (
+  id bigint generated always as identity primary key,
+  admin_id uuid references public.profiles(id) on delete set null,
+  admin_label text not null,
+  action text not null,
+  target_type text,
+  target_id text,
+  details jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+create index if not exists admin_audit_log_time_idx on public.admin_audit_log(created_at desc);
+
 -- ---------------------------------------------------------------------------
 -- Migration from earlier versions (Supabase Auth / direct DATABASE_URL)
 -- ---------------------------------------------------------------------------
@@ -368,7 +393,8 @@ alter table public.deposit_requests enable row level security;
 alter table public.transfers enable row level security;
 alter table public.transfer_lookups enable row level security;
 alter table public.notifications enable row level security;
-revoke all on public.admin_roles, public.app_settings, public.deposit_requests, public.transfers, public.transfer_lookups, public.notifications
+alter table public.admin_audit_log enable row level security;
+revoke all on public.admin_roles, public.app_settings, public.deposit_requests, public.transfers, public.transfer_lookups, public.notifications, public.admin_audit_log
   from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -542,6 +568,20 @@ begin
 end;
 $$;
 
+create or replace function igw_private.audit(
+  p_admin uuid, p_action text, p_target_type text, p_target_id text, p_details jsonb default '{}'::jsonb
+)
+returns void
+language sql
+security definer
+set search_path = public, extensions
+as $$
+  insert into public.admin_audit_log (admin_id, admin_label, action, target_type, target_id, details)
+  select p_admin,
+         coalesce((select coalesce(username, email) from public.profiles where id = p_admin), 'system'),
+         p_action, p_target_type, p_target_id, coalesce(p_details, '{}'::jsonb);
+$$;
+
 create or replace function igw_private.notify(
   p_user_id uuid, p_kind text, p_title text, p_body text, p_data jsonb default '{}'::jsonb
 )
@@ -599,6 +639,7 @@ as $$
     'id', d.id,
     'reference', d.reference,
     'accountNumber', d.account_number,
+    'userName', d.user_name,
     'amountUsd', d.amount_usd,
     'btcUsdRate', d.btc_usd_rate,
     'rateSource', d.rate_source,
@@ -767,7 +808,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-3');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-4');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -965,7 +1006,7 @@ begin
         select * from public.deposit_requests
         where user_id = v_uid
         order by created_at desc, id desc
-        limit 10
+        limit 50
       ) d
     ), '[]'::jsonb),
     'openDeposit', (
@@ -976,7 +1017,9 @@ begin
       limit 1
     ),
     'depositConfig', jsonb_build_object(
+      'enabled', coalesce(igw_private.setting('btc_deposits_enabled'), 'true') = 'true',
       'btcAddress', igw_private.setting('btc_address'),
+      'addressUpdatedAt', (select updated_at from public.app_settings where key = 'btc_address'),
       'network', 'mainnet',
       'minUsd', igw_private.setting('deposit_min_usd')::numeric,
       'maxUsd', igw_private.setting('deposit_max_usd')::numeric,
@@ -1046,6 +1089,9 @@ begin
   if v_address is null then
     raise exception 'Bitcoin deposits are not available yet: no deposit address has been configured.';
   end if;
+  if coalesce(igw_private.setting('btc_deposits_enabled'), 'true') <> 'true' then
+    raise exception 'Bitcoin deposits are temporarily disabled. Please try again later.';
+  end if;
   if p_amount_usd is null or p_amount_usd <> round(p_amount_usd, 2) then
     raise exception 'Enter an amount in USD with at most 2 decimal places.';
   end if;
@@ -1070,10 +1116,10 @@ begin
   end loop;
 
   insert into public.deposit_requests (
-    reference, user_id, account_number, amount_usd, btc_usd_rate, rate_source,
+    reference, user_id, account_number, user_name, amount_usd, btc_usd_rate, rate_source,
     amount_sats, btc_address, expires_at
   )
-  select igw_private.new_reference('DEP'), v_uid, p.account_number, v_amount,
+  select igw_private.new_reference('DEP'), v_uid, p.account_number, p.full_name, v_amount,
          round(p_btc_usd_rate, 2), left(coalesce(p_rate_source, 'unknown'), 80),
          v_sats, v_address, now() + make_interval(mins => v_minutes)
   from public.profiles p
@@ -1164,9 +1210,9 @@ begin
     )
   );
   perform igw_private.notify(
-    v_uid, 'deposit_submitted', 'Deposit under review',
-    format('Your deposit of %s USD (ref. %s) will be reviewed by our team. Your balance is updated only after the payment is confirmed on the Bitcoin network and approved.',
-           v_request.amount_usd, v_request.reference),
+    v_uid, 'deposit_submitted', 'Payment request created',
+    format('Your payment request was created successfully (ref. %s, %s USD). It will be finalized after review by an admin. Your balance is updated only after the payment is confirmed on the Bitcoin network.',
+           v_request.reference, v_request.amount_usd),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference)
   );
 
@@ -1409,8 +1455,19 @@ begin
             order by created_at desc, id desc limit 50) n
     ), '[]'::jsonb),
     'unreadCount', (select count(*) from public.notifications where user_id = v_admin and read_at is null),
+    'auditLog', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id', a.id, 'admin', a.admin_label, 'action', a.action, 'targetType', a.target_type,
+        'targetId', a.target_id, 'details', a.details, 'createdAt', a.created_at
+      ) order by a.created_at desc, a.id desc)
+      from (select * from public.admin_audit_log order by created_at desc, id desc limit 100) a
+    ), '[]'::jsonb),
     'settings', jsonb_build_object(
+      'enabled', coalesce(igw_private.setting('btc_deposits_enabled'), 'true') = 'true',
       'btcAddress', igw_private.setting('btc_address'),
+      'btcAddressUpdatedAt', (select updated_at from public.app_settings where key = 'btc_address'),
+      'btcAddressUpdatedBy', (select coalesce(p.username, p.email) from public.app_settings s
+                              join public.profiles p on p.id = s.updated_by where s.key = 'btc_address'),
       'network', 'mainnet',
       'requiredConfirmations', igw_private.setting('btc_required_confirmations')::int,
       'minUsd', igw_private.setting('deposit_min_usd')::numeric,
@@ -1534,8 +1591,12 @@ begin
   set read_at = now()
   where kind = 'deposit_submitted' and read_at is null and (data->>'requestId')::bigint = v_request.id;
 
+  perform igw_private.audit(v_admin, 'deposit_approved', 'deposit_request', v_request.reference,
+    jsonb_build_object('requestId', v_request.id, 'accountNumber', v_request.account_number,
+                       'amountUsd', v_request.amount_usd, 'amountSats', v_request.amount_sats,
+                       'txid', v_request.txid, 'confirmations', p_verification->'confirmations'));
   perform igw_private.notify(
-    v_request.user_id, 'deposit_approved', 'Deposit approved',
+    v_request.user_id, 'deposit_approved', 'Payment approved',
     format('%s USD has been added to your balance (ref. %s).', v_request.amount_usd, v_request.reference),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'amountUsd', v_request.amount_usd)
   );
@@ -1579,8 +1640,11 @@ begin
   set read_at = now()
   where kind = 'deposit_submitted' and read_at is null and (data->>'requestId')::bigint = v_request.id;
 
+  perform igw_private.audit(v_admin, 'deposit_rejected', 'deposit_request', v_request.reference,
+    jsonb_build_object('requestId', v_request.id, 'accountNumber', v_request.account_number,
+                       'amountUsd', v_request.amount_usd, 'txid', v_request.txid, 'reason', v_reason));
   perform igw_private.notify(
-    v_request.user_id, 'deposit_rejected', 'Deposit rejected',
+    v_request.user_id, 'deposit_rejected', 'Payment rejected',
     format('Your deposit of %s USD (ref. %s) was rejected. Reason: %s', v_request.amount_usd, v_request.reference, v_reason),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'reason', v_reason)
   );
@@ -1621,6 +1685,7 @@ as $$
 declare
   v_admin uuid := igw_private.require_admin(p_token);
   v_address text := trim(coalesce(p_address, ''));
+  v_previous text := igw_private.setting('btc_address');
 begin
   if v_address !~ '^(bc1[02-9ac-hj-np-z]{11,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$' then
     raise exception 'Enter a valid Bitcoin mainnet address.';
@@ -1629,6 +1694,8 @@ begin
   values ('btc_address', v_address, now(), v_admin)
   on conflict (key) do update set value = excluded.value, updated_at = now(), updated_by = v_admin;
 
+  perform igw_private.audit(v_admin, 'btc_address_changed', 'setting', 'btc_address',
+    jsonb_build_object('previous', v_previous, 'new', v_address));
   perform igw_private.notify_admins(
     'settings_changed', 'BTC deposit address changed',
     format('The deposit address was set to %s by %s.', v_address,
@@ -1636,6 +1703,25 @@ begin
     jsonb_build_object('btcAddress', v_address)
   );
   return jsonb_build_object('ok', true, 'btcAddress', v_address);
+end;
+$$;
+
+create or replace function public.igw_admin_set_deposits_enabled(p_token text, p_enabled boolean)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_value text := case when coalesce(p_enabled, false) then 'true' else 'false' end;
+begin
+  insert into public.app_settings (key, value, updated_at, updated_by)
+  values ('btc_deposits_enabled', v_value, now(), v_admin)
+  on conflict (key) do update set value = excluded.value, updated_at = now(), updated_by = v_admin;
+  perform igw_private.audit(v_admin, case when v_value = 'true' then 'btc_deposits_enabled' else 'btc_deposits_disabled' end,
+    'setting', 'btc_deposits_enabled', jsonb_build_object('enabled', v_value = 'true'));
+  return jsonb_build_object('ok', true, 'enabled', v_value = 'true');
 end;
 $$;
 
@@ -1664,6 +1750,7 @@ declare
     'public.igw_admin_deposits(text, text, integer)',
     'public.igw_admin_deposit(text, bigint)',
     'public.igw_admin_reject(text, bigint, text)',
+    'public.igw_admin_set_deposits_enabled(text, boolean)',
     'public.igw_admin_transactions(text, integer)'
   ];
   -- Trusted inputs (BTC price, blockchain verification, deposit address):

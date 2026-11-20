@@ -158,7 +158,7 @@ function DepositSection({
       open &&
       (await run(
         { action: "submit", requestId: open.id, txid: txid.trim() },
-        "Thank you! Your deposit will be reviewed by our team.",
+        "Your payment request has been created successfully. It will be finalized after review by an admin.",
       ))
     ) {
       setTxid("");
@@ -185,7 +185,13 @@ function DepositSection({
         </div>
       )}
 
-      {config.btcAddress && !open && (
+      {config.btcAddress && !config.enabled && !open && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800" data-testid="deposits-disabled">
+          Bitcoin deposits are temporarily disabled. Please try again later.
+        </div>
+      )}
+
+      {config.btcAddress && config.enabled && !open && (
         <form onSubmit={createQuote} className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
             <label htmlFor="deposit-amount" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
@@ -300,11 +306,12 @@ function DepositSection({
               <Clock className="h-5 w-5" />
             </span>
             <div className="min-w-0">
-              <p className="text-[14px] font-black">Your payment is under review</p>
+              <p className="text-[14px] font-black">Your payment request has been created successfully</p>
               <p className="mt-1 text-[12px] leading-5 text-slate-600">
-                Our team will verify your Bitcoin payment on the blockchain. Your balance is updated only after approval —
-                you will get a notification.
+                It will be finalized after review by an admin. The payment is verified on the Bitcoin blockchain; your
+                balance is updated only after approval and you will get a notification.
               </p>
+              <p className="mt-2"><Badge tone="purple">Status: Pending review</Badge></p>
               <dl className="mt-3 grid gap-x-6 gap-y-1 text-[12px] sm:grid-cols-2">
                 <div><dt className="inline text-slate-500">Reference: </dt><dd className="inline font-mono font-bold">{open.reference}</dd></div>
                 <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(open.amountUsd)} · {open.amountBtc} BTC</dd></div>
@@ -323,14 +330,15 @@ function DepositSection({
 
       {data.deposits.length > 0 && (
         <div className="mt-6">
-          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Recent deposit requests</p>
-          <ul className="divide-y divide-slate-100 rounded-2xl border border-slate-100">
+          <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-400">Payment history</p>
+          <ul className="divide-y divide-slate-100 rounded-2xl border border-slate-100" data-testid="payment-history">
             {data.deposits.map((deposit: Deposit) => (
               <li key={deposit.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 text-[12px]">
                 <span className="font-mono text-slate-500">{deposit.reference}</span>
                 <span className="font-bold">{formatMoney(deposit.amountUsd)}</span>
                 <span className="text-slate-500">{deposit.amountBtc} BTC</span>
                 <span className="text-slate-400">{formatDate(deposit.createdAt)}</span>
+                {deposit.txid && <span className="font-mono text-slate-400">TXID {deposit.txid.slice(0, 10)}…</span>}
                 <span className="ml-auto"><Badge tone={STATUS_TONE[deposit.status]}>{DEPOSIT_STATUS_LABEL[deposit.status]}</Badge></span>
                 {deposit.rejectionReason && <p className="w-full text-rose-600">Reason: {deposit.rejectionReason}</p>}
               </li>

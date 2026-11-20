@@ -70,10 +70,11 @@ export function CopyButton({
   );
 }
 
-export function QrCode({ value, size = 200, label }: { value: string; size?: number; label: string }) {
+export function QrCode({ value, size = 240, label }: { value: string; size?: number; label: string }) {
   const { path, size: modules } = useMemo(() => qrSvgPath(encodeQr(value)), [value]);
-  // Whole pixels per module (min. 4) keep edges sharp on 1x screens, so cameras read it reliably.
-  const pixels = modules * Math.max(4, Math.floor(size / modules));
+  // Whole pixels per module (min. 5) keep edges sharp on 1x screens, so cameras read it reliably,
+  // also for long Taproot (bc1p…) addresses.
+  const pixels = modules * Math.max(5, Math.floor(size / modules));
   return (
     <svg
       role="img"

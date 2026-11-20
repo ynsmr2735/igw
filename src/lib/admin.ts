@@ -29,14 +29,28 @@ export type AdminOverview = {
   };
   notifications: Notification[];
   unreadCount: number;
+  auditLog: AuditEntry[];
   settings: {
+    enabled: boolean;
     btcAddress: string | null;
+    btcAddressUpdatedAt: string | null;
+    btcAddressUpdatedBy: string | null;
     network: "mainnet";
     requiredConfirmations: number;
     minUsd: number;
     maxUsd: number;
     quoteMinutes: number;
   };
+};
+
+export type AuditEntry = {
+  id: number;
+  admin: string;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  details: Record<string, unknown>;
+  createdAt: string;
 };
 
 export type AdminTransaction = Transaction & { user: { name: string; email: string; accountNumber: string } };
@@ -72,8 +86,15 @@ export async function getAdminOverview(): Promise<AdminOverview> {
       read: Boolean(n.read),
     })),
     unreadCount: Number(raw.unreadCount ?? 0),
+    auditLog: ((raw.auditLog as Record<string, unknown>[]) ?? []).map((a) => ({
+      ...(a as unknown as AuditEntry),
+      id: Number(a.id),
+    })),
     settings: {
+      enabled: settings.enabled !== false,
       btcAddress: (settings.btcAddress as string | null) ?? null,
+      btcAddressUpdatedAt: (settings.btcAddressUpdatedAt as string | null) ?? null,
+      btcAddressUpdatedBy: (settings.btcAddressUpdatedBy as string | null) ?? null,
       network: "mainnet",
       requiredConfirmations: Number(settings.requiredConfirmations),
       minUsd: Number(settings.minUsd),
@@ -162,6 +183,15 @@ export async function setBtcAddress(address: string): Promise<string> {
     p_address: check.address,
   });
   return result.btcAddress;
+}
+
+/** Turns the BTC payment method on or off for members (recorded in the audit log). */
+export async function setDepositsEnabled(enabled: boolean): Promise<boolean> {
+  const result = await rpc<{ enabled: boolean }>("igw_admin_set_deposits_enabled", {
+    p_token: await token(),
+    p_enabled: enabled,
+  });
+  return Boolean(result.enabled);
 }
 
 export async function markAdminNotificationsRead(ids: number[] | null): Promise<void> {

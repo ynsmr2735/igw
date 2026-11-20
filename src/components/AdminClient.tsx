@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronRight,
   ExternalLink,
+  History,
   Inbox,
   Loader2,
   LogOut,
@@ -22,7 +23,7 @@ import {
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import { signOutAction } from "@/app/auth/actions";
-import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminTransaction } from "@/lib/admin";
+import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminTransaction, AuditEntry } from "@/lib/admin";
 import type { DepositVerification } from "@/lib/btc/chain";
 import {
   DEPOSIT_STATUS_LABEL,
@@ -35,22 +36,179 @@ import {
 } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, ToastView, postJson, type Toast } from "@/components/wallet-ui";
 
-type View = "notifications" | "deposits" | "transactions" | "settings";
+type View = "notifications" | "deposits" | "transactions" | "settings" | "audit";
 
 const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "notifications", label: "Notifications", icon: Bell },
-  { id: "deposits", label: "Deposit requests", icon: Inbox },
+  { id: "deposits", label: "BTC payment requests", icon: Inbox },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
-  { id: "settings", label: "Settings", icon: Settings },
+  { id: "settings", label: "BTC payment settings", icon: Settings },
+  { id: "audit", label: "Audit log", icon: History },
 ];
 
 const FILTERS: { id: string | null; label: string }[] = [
-  { id: "reviewing", label: "Pending review" },
-  { id: "awaiting_payment", label: "Awaiting payment" },
+  { id: null, label: "All requests" },
+  { id: "reviewing", label: "Pending" },
   { id: "approved", label: "Approved" },
   { id: "rejected", label: "Rejected" },
-  { id: null, label: "All" },
+  { id: "awaiting_payment", label: "Awaiting payment" },
 ];
+
+const AUDIT_LABEL: Record<string, string> = {
+  btc_address_changed: "BTC address changed",
+  btc_deposits_enabled: "BTC payments enabled",
+  btc_deposits_disabled: "BTC payments disabled",
+  deposit_approved: "Payment approved",
+  deposit_rejected: "Payment rejected",
+};
+
+function auditSummary(entry: AuditEntry): string {
+  const d = entry.details as Record<string, unknown>;
+  switch (entry.action) {
+    case "btc_address_changed":
+      return `${d.previous ? `${String(d.previous)} → ` : ""}${String(d.new)}`;
+    case "deposit_approved":
+      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · ${String(d.confirmations)} conf.`;
+    case "deposit_rejected":
+      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
+    default:
+      return entry.targetId ?? "";
+  }
+}
+
+/** One row of the payment request list, with APPROVE / REJECT for pending requests. */
+function DepositRow({
+  deposit,
+  onOpen,
+  onChanged,
+  notify,
+}: {
+  deposit: AdminDeposit;
+  onOpen: () => void;
+  onChanged: () => Promise<void>;
+  notify: (toast: Toast) => void;
+}) {
+  const [mode, setMode] = useState<"none" | "approve" | "reject">("none");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pending = deposit.status === "reviewing";
+
+  async function run(body: Record<string, unknown>, success: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await admin(body);
+      notify({ type: "ok", message: success });
+      setMode("none");
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Action failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li
+      className={`rounded-2xl border p-4 text-[12px] ${pending ? "border-purple-300 bg-purple-50/50" : "border-slate-100 bg-white"}`}
+      data-testid="deposit-row"
+      data-reference={deposit.reference}
+    >
+      <div className="grid gap-2 sm:grid-cols-[1.3fr_1fr_1.2fr_auto] sm:items-center">
+        <div className="min-w-0">
+          <p className="truncate font-black">{deposit.userName ?? deposit.user.name}</p>
+          <p className="font-mono text-slate-500">{formatAccountNumber(deposit.user.accountNumber)}</p>
+          <p className="font-mono text-slate-400">{deposit.reference}</p>
+        </div>
+        <div>
+          <p className="font-black">{formatMoney(deposit.amountUsd)}</p>
+          <p className="font-mono text-slate-500">{deposit.amountBtc} BTC</p>
+        </div>
+        <div className="min-w-0">
+          <p className="truncate font-mono text-slate-500" title={deposit.txid ?? ""}>
+            TXID: {deposit.txid ? shortHash(deposit.txid, 8) : "—"}
+          </p>
+          <p className="text-slate-400">{formatDate(deposit.submittedAt ?? deposit.createdAt)}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+          <Badge tone={STATUS_TONE[deposit.status]}>{DEPOSIT_STATUS_LABEL[deposit.status]}</Badge>
+          <button onClick={onOpen} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-bold text-slate-600 hover:text-[#7F00FF]">
+            Details
+          </button>
+        </div>
+      </div>
+
+      {pending && mode === "none" && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button onClick={() => setMode("approve")} className={`${button} h-10 bg-emerald-600 text-white hover:bg-emerald-700`}>
+            <CheckCircle2 className="h-4 w-4" /> APPROVE
+          </button>
+          <button onClick={() => setMode("reject")} className={`${button} h-10 bg-rose-600 text-white hover:bg-rose-700`}>
+            <XCircle className="h-4 w-4" /> REJECT
+          </button>
+        </div>
+      )}
+
+      {pending && mode === "approve" && (
+        <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+          <p className="font-bold text-emerald-900">
+            Approve {formatMoney(deposit.amountUsd)} for account {formatAccountNumber(deposit.user.accountNumber)}? The transaction is
+            verified on the Bitcoin blockchain first (address, exact amount, confirmations, TXID not used before); the balance
+            changes only if every check passes.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              onClick={() => run({ action: "approve", id: deposit.id }, `Payment ${deposit.reference} approved and balance credited.`)}
+              disabled={busy}
+              className={`${button} h-10 bg-emerald-600 text-white hover:bg-emerald-700`}
+            >
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+              Verify &amp; approve
+            </button>
+            <button onClick={() => { setMode("none"); setError(null); }} disabled={busy} className={`${button} h-10 border border-slate-200 bg-white text-slate-700`}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pending && mode === "reject" && (
+        <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 p-3">
+          <label htmlFor={`reason-${deposit.id}`} className="font-bold text-rose-900">Reason for rejection (sent to the member)</label>
+          <textarea
+            id={`reason-${deposit.id}`}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            rows={2}
+            maxLength={500}
+            className="mt-1.5 w-full rounded-xl border border-rose-200 bg-white p-2.5 text-base focus:outline-none focus:ring-2 focus:ring-rose-100 sm:text-[13px]"
+          />
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              onClick={() => run({ action: "reject", id: deposit.id, reason }, `Payment ${deposit.reference} rejected.`)}
+              disabled={busy || reason.trim().length < 3}
+              className={`${button} h-10 bg-rose-600 text-white hover:bg-rose-700`}
+            >
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <XCircle className="h-4 w-4" />}
+              Confirm rejection
+            </button>
+            <button onClick={() => { setMode("none"); setError(null); }} disabled={busy} className={`${button} h-10 border border-slate-200 bg-white text-slate-700`}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {deposit.rejectionReason && <p className="mt-2 text-rose-600">Reason: {deposit.rejectionReason}</p>}
+      {error && (
+        <p role="alert" className="mt-2 rounded-xl border border-rose-200 bg-white px-3 py-2 font-semibold text-rose-600">
+          {error}
+        </p>
+      )}
+    </li>
+  );
+}
 
 const button =
   "inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-[13px] font-bold transition disabled:cursor-not-allowed disabled:opacity-50";
@@ -343,6 +501,20 @@ export default function AdminClient({
   const [toast, setToast] = useState<Toast>(null);
   const [address, setAddress] = useState("");
   const [saving, setSaving] = useState(false);
+  const [toggling, setToggling] = useState(false);
+
+  async function toggleDeposits() {
+    setToggling(true);
+    try {
+      const response = await admin<{ enabled: boolean }>({ action: "setDepositsEnabled", enabled: !overview.settings.enabled });
+      setToast({ type: "ok", message: response.enabled ? "BTC payments are now active." : "BTC payments are now inactive." });
+      await refresh();
+    } catch (err) {
+      setToast({ type: "error", message: err instanceof Error ? err.message : "Could not change the setting." });
+    } finally {
+      setToggling(false);
+    }
+  }
 
   useEffect(() => {
     if (!toast) return;
@@ -359,12 +531,17 @@ export default function AdminClient({
     setDeposits(d.deposits);
   }, []);
 
+  // New requests appear without a reload while the admin panel is open.
   useEffect(() => {
     const timer = setInterval(() => {
       if (document.visibilityState === "visible") refresh().catch(() => {});
-    }, 20000);
+    }, 10000);
     return () => clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    document.title = overview.counts.reviewing > 0 ? `(${overview.counts.reviewing}) Admin · Insta Global Wallet` : "Admin · Insta Global Wallet";
+  }, [overview.counts.reviewing]);
 
   useEffect(() => {
     if (view === "transactions" && transactions === null) {
@@ -476,14 +653,14 @@ export default function AdminClient({
         <main className="mx-auto max-w-[1200px] space-y-6 px-4 py-6 sm:px-8">
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {[
-              ["Pending review", overview.counts.reviewing],
-              ["Awaiting payment", overview.counts.awaitingPayment],
-              ["Members", overview.counts.users],
-              ["Total balances", formatMoney(overview.counts.totalBalance)],
-            ].map(([label, value]) => (
-              <div key={String(label)} className="rounded-2xl border border-slate-100 bg-white p-4 igw-shadow-soft">
+              ["Pending payments", overview.counts.reviewing, "pending", "text-[#7F00FF]"],
+              ["Approved payments", overview.counts.approved, "approved", "text-emerald-600"],
+              ["Rejected payments", overview.counts.rejected, "rejected", "text-rose-600"],
+              ["Members", overview.counts.users, "members", ""],
+            ].map(([label, value, key, tone]) => (
+              <div key={String(key)} className="rounded-2xl border border-slate-100 bg-white p-4 igw-shadow-soft" data-testid={`count-${key}`}>
                 <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{label}</p>
-                <p className="mt-1 text-xl font-black">{value}</p>
+                <p className={`mt-1 text-xl font-black ${tone}`}>{value}</p>
               </div>
             ))}
           </div>
@@ -543,7 +720,7 @@ export default function AdminClient({
 
           {view === "deposits" && (
             <Card>
-              <SectionTitle eyebrow="BTC" title="Deposit requests" />
+              <SectionTitle eyebrow="BTC" title="BTC payment requests" />
               <div className="-mx-1 mb-4 flex gap-2 overflow-x-auto px-1 pb-1">
                 {FILTERS.map((f) => (
                   <button
@@ -561,26 +738,7 @@ export default function AdminClient({
               ) : (
                 <ul className="space-y-2.5">
                   {visibleDeposits.map((d) => (
-                    <li key={d.id}>
-                      <button
-                        onClick={() => setOpenId(d.id)}
-                        className={`grid w-full gap-2 rounded-2xl border p-4 text-left text-[12px] transition hover:border-purple-300 sm:grid-cols-[1.3fr_1fr_1fr_auto] sm:items-center ${
-                          d.status === "reviewing" ? "border-purple-300 bg-purple-50/50" : "border-slate-100 bg-white"
-                        }`}
-                        data-testid="deposit-row"
-                      >
-                        <span className="min-w-0">
-                          <span className="block truncate font-black">{d.user.name}</span>
-                          <span className="block font-mono text-slate-500">{formatAccountNumber(d.user.accountNumber)} · {d.reference}</span>
-                        </span>
-                        <span>
-                          <span className="block font-black">{formatMoney(d.amountUsd)}</span>
-                          <span className="block font-mono text-slate-500">{d.amountBtc} BTC</span>
-                        </span>
-                        <span className="text-slate-500">{formatDate(d.submittedAt ?? d.createdAt)}</span>
-                        <span><Badge tone={STATUS_TONE[d.status]}>{DEPOSIT_STATUS_LABEL[d.status]}</Badge></span>
-                      </button>
-                    </li>
+                    <DepositRow key={d.id} deposit={d} onOpen={() => setOpenId(d.id)} onChanged={refresh} notify={setToast} />
                   ))}
                 </ul>
               )}
@@ -620,24 +778,50 @@ export default function AdminClient({
 
           {view === "settings" && (
             <Card>
-              <SectionTitle eyebrow="Configuration" title="BTC deposits" action={<Badge tone="amber">Bitcoin Mainnet</Badge>} />
-              <div className="space-y-4 text-[13px]">
+              <SectionTitle eyebrow="Configuration" title="BTC payment settings" action={<Badge tone="amber">Bitcoin Mainnet</Badge>} />
+              <div className="space-y-5 text-[13px]">
+                <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 p-4">
+                  <div className="min-w-0 flex-1">
+                    <p className="font-black">Bitcoin (BTC) payment method</p>
+                    <p className="mt-0.5 text-[12px] text-slate-500">
+                      When inactive, members cannot create new BTC payment requests. Requests already created can still be completed and reviewed.
+                    </p>
+                  </div>
+                  <Badge tone={overview.settings.enabled ? "green" : "red"}>{overview.settings.enabled ? "Active" : "Inactive"}</Badge>
+                  <button
+                    onClick={toggleDeposits}
+                    disabled={toggling}
+                    role="switch"
+                    aria-checked={overview.settings.enabled}
+                    aria-label="BTC payment method active"
+                    className={`relative h-8 w-14 shrink-0 rounded-full transition ${overview.settings.enabled ? "bg-emerald-500" : "bg-slate-300"}`}
+                  >
+                    <span className={`absolute top-1 h-6 w-6 rounded-full bg-white shadow transition-all ${overview.settings.enabled ? "left-7" : "left-1"}`} />
+                  </button>
+                </div>
+
                 <div>
                   <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Current deposit address</p>
                   {overview.settings.btcAddress ? (
-                    <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                      <code className="min-w-0 flex-1 break-all font-bold" data-testid="current-address">{overview.settings.btcAddress}</code>
-                      <CopyButton value={overview.settings.btcAddress} />
-                    </div>
+                    <>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                        <code className="min-w-0 flex-1 break-all font-bold" data-testid="current-address">{overview.settings.btcAddress}</code>
+                        <CopyButton value={overview.settings.btcAddress} />
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-500" data-testid="address-updated">
+                        Last updated: {overview.settings.btcAddressUpdatedAt ? formatDate(overview.settings.btcAddressUpdatedAt) : "—"}
+                        {overview.settings.btcAddressUpdatedBy ? ` by ${overview.settings.btcAddressUpdatedBy}` : ""}
+                      </p>
+                    </>
                   ) : (
                     <p className="mt-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-amber-800">
-                      Not configured — members cannot deposit until you set an address.
+                      Not configured — members cannot deposit until you add an address.
                     </p>
                   )}
                 </div>
                 <div>
                   <label htmlFor="btc-address" className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                    New deposit address (Bitcoin Mainnet: bc1…, 1… or 3…)
+                    {overview.settings.btcAddress ? "Change address" : "Add address"} (Bitcoin Mainnet: bc1…, 1… or 3…)
                   </label>
                   <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
                     <input
@@ -651,11 +835,12 @@ export default function AdminClient({
                     />
                     <button onClick={saveAddress} disabled={saving || address.length < 26} className={`${button} igw-gradient text-white`}>
                       {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
-                      Save address
+                      {overview.settings.btcAddress ? "Update address" : "Add address"}
                     </button>
                   </div>
                   <p className="mt-1.5 text-[11px] text-slate-500">
-                    The checksum is verified and testnet addresses are refused. Open requests keep the address they were given.
+                    The checksum is verified and testnet addresses are refused. New payment requests and the QR code use the new
+                    address immediately; requests already created keep the address they were shown.
                   </p>
                 </div>
                 <dl className="grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-4">
@@ -665,6 +850,28 @@ export default function AdminClient({
                   <div><dt className="text-[11px] text-slate-500">Quote valid</dt><dd className="font-bold">{overview.settings.quoteMinutes} min</dd></div>
                 </dl>
               </div>
+            </Card>
+          )}
+
+          {view === "audit" && (
+            <Card>
+              <SectionTitle eyebrow="Security" title="Audit log" />
+              {overview.auditLog.length === 0 ? (
+                <p className="rounded-2xl bg-slate-50 p-6 text-center text-[13px] text-slate-500">No admin actions yet.</p>
+              ) : (
+                <ul className="divide-y divide-slate-100 text-[12px]" data-testid="audit-log">
+                  {overview.auditLog.map((entry) => (
+                    <li key={entry.id} className="grid gap-1 py-3 sm:grid-cols-[150px_120px_1fr] sm:items-start">
+                      <span className="text-slate-500">{formatDate(entry.createdAt)}</span>
+                      <span className="font-bold">@{entry.admin}</span>
+                      <span className="min-w-0">
+                        <span className="block font-black">{AUDIT_LABEL[entry.action] ?? entry.action}</span>
+                        <span className="block text-slate-500 [overflow-wrap:anywhere]">{auditSummary(entry)}</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </Card>
           )}
         </main>
