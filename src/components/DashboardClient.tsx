@@ -40,7 +40,6 @@ import {
   Badge,
   Card,
   CopyButton,
-  Countdown,
   QrCode,
   STATUS_TONE,
   SectionTitle,
@@ -206,7 +205,7 @@ function DepositSection({
       open &&
       (await run(
         { action: "submit", requestId: open.id, txid: txid.trim() },
-        "Your payment request has been created successfully. It will be finalized after review by an admin.",
+        "Your payment request has been received. Awaiting admin review.",
       ))
     ) {
       setTxid("");
@@ -265,7 +264,13 @@ function DepositSection({
         </div>
       )}
 
-      {!open && !methodConfig?.address && (
+      {!open && config.methods.length === 0 && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800">
+          Deposits are temporarily unavailable. Please try again later.
+        </div>
+      )}
+
+      {!open && config.methods.length > 0 && !methodConfig?.address && (
         <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800" data-testid="method-unavailable">
           {info.name} deposits are not available yet: the administrator has not configured a deposit address.
         </div>
@@ -299,8 +304,8 @@ function DepositSection({
             <p className="mt-2 text-[11px] text-slate-500">
               Min {formatMoney(config.minUsd)} · max {formatMoney(config.maxUsd)}.{" "}
               {method === "usdt_trc20"
-                ? `1 USDT = 1 USD. A unique amount of cents (0.01–0.99) is added to identify your payment and is credited too. Valid for ${config.quoteMinutes} minutes.`
-                : `The BTC amount is calculated from the live BTC/USD price and locked for ${config.quoteMinutes} minutes.`}
+                ? "1 USDT = 1 USD. A unique amount of cents (0.01–0.99) is added to identify your payment and is credited too."
+                : `The BTC amount is calculated from the live BTC/USD price. Please pay within ${config.quoteMinutes} minutes so the price still matches.`}
             </p>
           </div>
           <button type="submit" disabled={busy || !amount} className={primaryButton}>
@@ -351,7 +356,8 @@ function DepositSection({
 
             <MethodWarning method={method} amountCrypto={open.amountCrypto} confirmations={confirmations} />
             <p className="text-[12px] text-slate-600">
-              Pay within <b><Countdown until={open.expiresAt} /></b> minutes. Reference: <span className="font-mono">{open.reference}</span>.
+              Reference: <span className="font-mono">{open.reference}</span> · created {formatDate(open.createdAt)}. After paying, enter the
+              transaction ID and press <b>I&apos;ve paid</b>. The request stays open until then (or until you cancel it).
             </p>
 
             <form onSubmit={submitPayment} className="space-y-3">
@@ -398,11 +404,10 @@ function DepositSection({
               <Clock className="h-5 w-5" />
             </span>
             <div className="min-w-0">
-              <p className="text-[14px] font-black">Your payment request has been created successfully</p>
+              <p className="text-[14px] font-black">Your payment request has been received. Awaiting admin review.</p>
               <p className="mt-1 text-[12px] leading-5 text-slate-600">
-                It will be finalized after review by an admin. The payment is verified on the{" "}
-                {method === "usdt_trc20" ? "TRON blockchain" : "Bitcoin blockchain"}; your balance is updated only after
-                approval and you will get a notification.
+                An admin checks your payment on the {method === "usdt_trc20" ? "TRON blockchain" : "Bitcoin blockchain"} and decides
+                manually. Your balance changes only after the admin approves it; you will get a notification either way.
               </p>
               <p className="mt-2"><Badge tone="purple">Status: Pending review</Badge></p>
               <dl className="mt-3 grid gap-x-6 gap-y-1 text-[12px] sm:grid-cols-2">

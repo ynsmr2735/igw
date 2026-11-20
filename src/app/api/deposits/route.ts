@@ -4,6 +4,7 @@ import { isPaymentMethod } from "@/lib/payment-methods";
 import { cancelDeposit, createDeposit, submitDeposit } from "@/lib/wallet";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 30;
 
 /**
  * Deposits (BTC or USDT TRC20).

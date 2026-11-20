@@ -1,11 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeftRight,
   Bell,
   CheckCircle2,
+  Clock,
   ChevronRight,
   ExternalLink,
   History,
@@ -23,7 +24,18 @@ import {
 } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import { signOutAction } from "@/app/auth/actions";
-import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminTransaction, AuditEntry } from "@/lib/admin";
+import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AuditEntry } from "@/lib/admin";
+import {
+  isBlocked,
+  loadLastSeen,
+  loadSoundSettings,
+  playChime,
+  saveLastSeen,
+  saveSoundSettings,
+  unlockAudio,
+  type SoundSettings,
+} from "@/lib/admin-sound";
+import type { StatusItem } from "@/lib/system";
 import { METHOD_INFO, methodInfo, type DepositVerification, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import {
   DEPOSIT_STATUS_LABEL,
@@ -47,11 +59,11 @@ const navItems: { id: View; label: string; icon: LucideIcon }[] = [
 ];
 
 const FILTERS: { id: string | null; label: string }[] = [
-  { id: null, label: "All requests" },
+  { id: null, label: "All payments" },
   { id: "reviewing", label: "Pending" },
   { id: "approved", label: "Approved" },
   { id: "rejected", label: "Rejected" },
-  { id: "awaiting_payment", label: "Awaiting payment" },
+  { id: "awaiting_payment", label: "Not paid yet" },
 ];
 
 const METHOD_FILTERS: { id: PaymentMethod | null; label: string }[] = [
@@ -95,11 +107,15 @@ function auditSummary(entry: AuditEntry): string {
 /** One row of the payment request list, with APPROVE / REJECT for pending requests. */
 function DepositRow({
   deposit,
+  isNew,
+  onSeen,
   onOpen,
   onChanged,
   notify,
 }: {
   deposit: AdminDeposit;
+  isNew: boolean;
+  onSeen: () => void;
   onOpen: () => void;
   onChanged: () => Promise<void>;
   notify: (toast: Toast) => void;
@@ -128,10 +144,25 @@ function DepositRow({
 
   return (
     <li
-      className={`rounded-2xl border p-4 text-[12px] ${pending ? "border-purple-300 bg-purple-50/50" : "border-slate-100 bg-white"}`}
+      className={`rounded-2xl border p-4 text-[12px] ${
+        isNew
+          ? "border-amber-400 bg-amber-50 shadow-[0_0_0_3px_rgba(245,158,11,0.18)]"
+          : pending
+            ? "border-purple-300 bg-purple-50/50"
+            : "border-slate-100 bg-white"
+      }`}
       data-testid="deposit-row"
       data-reference={deposit.reference}
+      data-new={isNew ? "true" : undefined}
     >
+      {isNew && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <Badge tone="amber">NEW PAYMENT REQUEST</Badge>
+          <button onClick={onSeen} className="text-[11px] font-bold text-amber-700 hover:underline">
+            Mark as seen
+          </button>
+        </div>
+      )}
       <div className="grid gap-2 sm:grid-cols-[1.3fr_1fr_1.2fr_auto] sm:items-center">
         <div className="min-w-0">
           <p className="truncate font-black">{deposit.userName ?? deposit.user.name}</p>
@@ -153,6 +184,12 @@ function DepositRow({
             TXID: {deposit.txid ? shortHash(deposit.txid, 8) : "—"}
           </p>
           <p className="text-slate-400">{formatDate(deposit.submittedAt ?? deposit.createdAt)}</p>
+          {deposit.reviewedAt && (
+            <p className="text-slate-400">
+              {deposit.status === "approved" ? "Approved" : "Decided"} {formatDate(deposit.reviewedAt)}
+              {deposit.reviewedBy ? ` by ${deposit.reviewedBy}` : ""}
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:justify-end">
           <Badge tone={STATUS_TONE[deposit.status]}>{DEPOSIT_STATUS_LABEL[deposit.status]}</Badge>
@@ -255,9 +292,15 @@ function VerificationView({ verification }: { verification: DepositVerification 
       <ul className="mt-3 space-y-2 text-[12px]">
         {verification.checks.map((check) => (
           <li key={check.label} className="flex items-start gap-2">
-            {check.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />}
+            {check.ok ? (
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+            ) : check.advisory ? (
+              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+            ) : (
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+            )}
             <span className="min-w-0">
-              <span className="font-bold">{check.label}</span>
+              <span className="font-bold">{check.label}{!check.ok && check.advisory ? " (warning — does not block approval)" : ""}</span>
               <span className="block break-all text-slate-600">{check.detail}</span>
             </span>
           </li>
@@ -655,12 +698,150 @@ function PaymentMethodCard({
   );
 }
 
+/** Setup status (database version, server keys). Problems here are why payments cannot work. */
+function StatusPanel({ status, onRecheck, full }: { status: StatusItem[]; onRecheck: () => Promise<void>; full?: boolean }) {
+  const [busy, setBusy] = useState(false);
+  const [chain, setChain] = useState<{ btc: { ok: boolean; detail: string }; tron: { ok: boolean; detail: string } } | null>(null);
+  const problems = status.filter((s) => !s.ok && s.required);
+  const items = full ? status : problems;
+  if (!full && problems.length === 0) return null;
+
+  async function recheck() {
+    setBusy(true);
+    try {
+      await onRecheck();
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function testChain() {
+    setBusy(true);
+    try {
+      setChain(await admin<{ btc: { ok: boolean; detail: string }; tron: { ok: boolean; detail: string } }>({ action: "testChain" }));
+    } catch (err) {
+      setChain({ btc: { ok: false, detail: err instanceof Error ? err.message : "failed" }, tron: { ok: false, detail: "" } });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      className={`rounded-2xl border p-4 text-[12px] ${problems.length ? "border-rose-300 bg-rose-50" : "border-emerald-200 bg-emerald-50"}`}
+      data-testid={full ? "status-panel" : "setup-problems"}
+      role={problems.length ? "alert" : undefined}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <p className={`text-[13px] font-black ${problems.length ? "text-rose-700" : "text-emerald-800"}`}>
+          {problems.length ? "Setup problem — payments cannot work until this is fixed" : "System status: OK"}
+        </p>
+        <button onClick={recheck} disabled={busy} className="ml-auto rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-bold text-slate-600">
+          {busy ? "Checking…" : "Check again"}
+        </button>
+        {full && (
+          <button onClick={testChain} disabled={busy} className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-bold text-slate-600">
+            Test blockchain connections
+          </button>
+        )}
+      </div>
+      <ul className="mt-2 space-y-1.5">
+        {items.map((s) => (
+          <li key={s.key} className="flex items-start gap-2" data-status={s.key} data-ok={s.ok ? "true" : "false"}>
+            {s.ok ? (
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+            ) : s.required ? (
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+            ) : (
+              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+            )}
+            <span className="min-w-0 [overflow-wrap:anywhere]">
+              <b>{s.label}</b> — {s.detail}
+            </span>
+          </li>
+        ))}
+        {chain &&
+          [
+            ["Bitcoin explorers", chain.btc],
+            ["TronGrid (USDT TRC20)", chain.tron],
+          ].map(([label, r]) => {
+            const result = r as { ok: boolean; detail: string };
+            return (
+              <li key={String(label)} className="flex items-start gap-2" data-testid="chain-test">
+                {result.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" /> : <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />}
+                <span className="min-w-0 [overflow-wrap:anywhere]"><b>{String(label)}</b> — {result.detail}</span>
+              </li>
+            );
+          })}
+      </ul>
+    </div>
+  );
+}
+
+/** Sound alert settings (stored in this browser). */
+function SoundControls({
+  sound,
+  onChange,
+  blocked,
+  onUnlock,
+}: {
+  sound: SoundSettings;
+  onChange: (next: SoundSettings) => void;
+  blocked: boolean;
+  onUnlock: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-white p-3 text-[12px]" data-testid="sound-controls">
+      <Bell className="h-4 w-4 text-[#7F00FF]" />
+      <span className="font-bold">Sound alert for new payment requests</span>
+      <button
+        role="switch"
+        aria-checked={sound.enabled}
+        aria-label="Sound alerts"
+        onClick={() => onChange({ ...sound, enabled: !sound.enabled })}
+        className={`relative h-7 w-12 shrink-0 rounded-full transition ${sound.enabled ? "bg-emerald-500" : "bg-slate-300"}`}
+      >
+        <span className={`absolute top-1 h-5 w-5 rounded-full bg-white shadow transition-all ${sound.enabled ? "left-6" : "left-1"}`} />
+      </button>
+      <label className="flex items-center gap-2">
+        <span className="text-slate-500">Volume</span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={5}
+          value={Math.round(sound.volume * 100)}
+          aria-label="Alert volume"
+          onChange={(event) => onChange({ ...sound, volume: Number(event.target.value) / 100 })}
+          className="w-28 accent-[#7F00FF]"
+        />
+        <span className="w-9 text-right font-mono">{Math.round(sound.volume * 100)}%</span>
+      </label>
+      <button
+        onClick={async () => {
+          await onUnlock();
+          playChime(sound.volume);
+        }}
+        className="rounded-lg border border-slate-200 px-2.5 py-1.5 font-bold text-slate-600 hover:text-[#7F00FF]"
+      >
+        Test sound
+      </button>
+      {sound.enabled && blocked && (
+        <button onClick={onUnlock} className="rounded-lg bg-amber-100 px-2.5 py-1.5 font-bold text-amber-800" data-testid="sound-blocked">
+          Browser blocked sound — click to enable
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function AdminClient({
   initialOverview,
   initialDeposits,
+  initialStatus,
 }: {
   initialOverview: AdminOverview;
   initialDeposits: AdminDeposit[];
+  initialStatus: StatusItem[];
 }) {
   const [overview, setOverview] = useState(initialOverview);
   const [deposits, setDeposits] = useState(initialDeposits);
@@ -671,6 +852,20 @@ export default function AdminClient({
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [methodFilter, setMethodFilter] = useState<PaymentMethod | null>(null);
+  const [status, setStatus] = useState(initialStatus);
+  // requestId -> notificationId of payment requests this admin has not seen yet
+  const [newRequests, setNewRequests] = useState<Map<number, number>>(
+    () =>
+      new Map(
+        initialOverview.notifications
+          .filter((n) => n.kind === "deposit_submitted" && !n.read && typeof n.data?.requestId === "number")
+          .map((n) => [Number(n.data.requestId), n.id] as [number, number]),
+      ),
+  );
+  const [sound, setSound] = useState<SoundSettings>({ enabled: true, volume: 0.7 });
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  const soundRef = useRef(sound);
+  const lastSeenRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -687,13 +882,107 @@ export default function AdminClient({
     setDeposits(d.deposits);
   }, []);
 
-  // New requests appear without a reload while the admin panel is open.
+  const recheckStatus = useCallback(async () => {
+    const response = await admin<{ status: StatusItem[] }>({ action: "status" });
+    setStatus(response.status);
+  }, []);
+
+  // Sound settings + unlocking audio on the first interaction (browser autoplay rules).
   useEffect(() => {
-    const timer = setInterval(() => {
-      if (document.visibilityState === "visible") refresh().catch(() => {});
-    }, 10000);
-    return () => clearInterval(timer);
+    const saved = loadSoundSettings();
+    setSound(saved);
+    soundRef.current = saved;
+    lastSeenRef.current = loadLastSeen();
+    setAudioBlocked(isBlocked());
+    const unlock = () => {
+      unlockAudio().then((ok) => setAudioBlocked(!ok));
+    };
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, []);
+
+  function changeSound(next: SoundSettings) {
+    setSound(next);
+    soundRef.current = next;
+    saveSoundSettings(next);
+  }
+
+  // Polling (Vercel has no WebSocket server and the browser never talks to the
+  // database directly): every 5 s while visible, every 15 s in the background.
+  // The sound plays once per new request: the highest announced request id is
+  // remembered in this browser, so refreshes and other tabs do not repeat it.
+  const poll = useCallback(async () => {
+    const { poll: p } = await admin<{ poll: AdminPoll }>({ action: "poll" });
+    setNewRequests(new Map(p.newRequests.map((n) => [n.requestId, n.notificationId] as [number, number])));
+    setOverview((o) => ({
+      ...o,
+      unreadCount: p.unreadCount,
+      counts: { ...o.counts, reviewing: p.reviewing, approved: p.approved, rejected: p.rejected, new: p.newRequests.length },
+    }));
+    const latest = p.latestRequestNotificationId ?? 0;
+    const stored = loadLastSeen();
+    const seen = Math.max(lastSeenRef.current ?? -1, stored ?? -1);
+    if (seen < 0) {
+      // First visit in this browser: existing requests are not "new" for the sound.
+      lastSeenRef.current = latest;
+      saveLastSeen(latest);
+      return;
+    }
+    if (latest > seen) {
+      lastSeenRef.current = latest;
+      saveLastSeen(latest);
+      const fresh = p.newRequests.filter((n) => n.notificationId > seen);
+      if (soundRef.current.enabled && !playChime(soundRef.current.volume)) setAudioBlocked(true);
+      const last = fresh[fresh.length - 1];
+      setToast({
+        type: "ok",
+        message: last
+          ? `New payment request: ${last.userName} · ${formatMoney(last.amountUsd)} · ${methodInfo(last.method).short}`
+          : "New payment request",
+      });
+      await refresh();
+    } else {
+      lastSeenRef.current = seen;
+    }
   }, [refresh]);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = async () => {
+      try {
+        await poll();
+      } catch {
+        /* network hiccup: try again next tick */
+      }
+      if (!stopped) timer = setTimeout(tick, document.visibilityState === "visible" ? 5000 : 15000);
+    };
+    tick();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [poll]);
+
+  async function markSeen(requestId: number) {
+    const notificationId = newRequests.get(requestId);
+    if (notificationId === undefined) return;
+    setNewRequests((m) => {
+      const next = new Map(m);
+      next.delete(requestId);
+      return next;
+    });
+    try {
+      await admin({ action: "readNotifications", ids: [notificationId] });
+    } catch {
+      /* not critical */
+    }
+    refresh().catch(() => {});
+  }
 
   useEffect(() => {
     document.title = overview.counts.reviewing > 0 ? `(${overview.counts.reviewing}) Admin · Insta Global Wallet` : "Admin · Insta Global Wallet";
@@ -795,6 +1084,16 @@ export default function AdminClient({
         </header>
 
         <main className="mx-auto max-w-[1200px] space-y-6 px-4 py-6 sm:px-8">
+          <StatusPanel status={status} onRecheck={recheckStatus} />
+          {sound.enabled && audioBlocked && (
+            <button
+              onClick={() => unlockAudio().then((ok) => setAudioBlocked(!ok))}
+              className="w-full rounded-2xl border border-amber-300 bg-amber-50 p-3 text-left text-[12px] font-bold text-amber-800"
+              data-testid="sound-blocked-banner"
+            >
+              Sound alerts are blocked by the browser until you interact with the page. Click here to enable them.
+            </button>
+          )}
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
             {[
               ["New payments", overview.counts.new, "new", "text-amber-600"],
@@ -873,6 +1172,13 @@ export default function AdminClient({
           {view === "deposits" && (
             <Card>
               <SectionTitle eyebrow="BTC · USDT TRC20" title="Payment requests" />
+              <div className="mb-4">
+                <SoundControls sound={sound} onChange={changeSound} blocked={audioBlocked} onUnlock={() => unlockAudio().then((ok) => setAudioBlocked(!ok))} />
+              </div>
+              <p className="mb-3 text-[11px] text-slate-500">
+                Every request is decided manually: nothing is approved or rejected automatically, and requests never expire.
+                Approval is possible only after the payment is verified on its blockchain.
+              </p>
               <div className="-mx-1 mb-2 flex gap-2 overflow-x-auto px-1 pb-1" role="group" aria-label="Payment method filter">
                 {METHOD_FILTERS.map((f) => (
                   <button
@@ -902,7 +1208,18 @@ export default function AdminClient({
               ) : (
                 <ul className="space-y-2.5">
                   {visibleDeposits.map((d) => (
-                    <DepositRow key={d.id} deposit={d} onOpen={() => setOpenId(d.id)} onChanged={refresh} notify={setToast} />
+                    <DepositRow
+                      key={d.id}
+                      deposit={d}
+                      isNew={newRequests.has(d.id)}
+                      onSeen={() => markSeen(d.id)}
+                      onOpen={() => {
+                        markSeen(d.id);
+                        setOpenId(d.id);
+                      }}
+                      onChanged={refresh}
+                      notify={setToast}
+                    />
                   ))}
                 </ul>
               )}
@@ -942,6 +1259,7 @@ export default function AdminClient({
 
           {view === "settings" && (
             <div className="space-y-6">
+              <StatusPanel status={status} onRecheck={recheckStatus} full />
               <div className="grid gap-6 xl:grid-cols-2">
                 {overview.settings.methods.map((config) => (
                   <PaymentMethodCard key={config.method} config={config} onChanged={refresh} notify={setToast} />

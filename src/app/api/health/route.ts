@@ -1,3 +1,4 @@
+import { EXPECTED_SCHEMA } from "@/lib/payment-methods";
 import { SetupError, isServiceKeyConfigured, isSupabaseConfigured, rpc } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -18,6 +19,8 @@ export async function GET() {
       ok: true,
       supabase: "ok",
       schema: result?.schema ?? "unknown",
+      expectedSchema: EXPECTED_SCHEMA,
+      schemaOk: result?.schema === EXPECTED_SCHEMA,
       // Needed for deposits and admin approvals.
       serviceKey: serviceKey ? "configured" : "missing: set SUPABASE_SERVICE_ROLE_KEY",
       // Optional: higher TronGrid rate limit for USDT TRC20 checks.

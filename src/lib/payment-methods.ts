@@ -6,6 +6,9 @@
 
 export type PaymentMethod = "btc" | "usdt_trc20";
 
+/** Database version this code needs (public.igw_health()). Run supabase/schema.sql if it differs. */
+export const EXPECTED_SCHEMA = "igw-rpc-6";
+
 export const PAYMENT_METHODS: PaymentMethod[] = ["btc", "usdt_trc20"];
 
 export type MethodInfo = {
@@ -95,6 +98,11 @@ export function toMethodConfig(raw: Record<string, unknown>): MethodConfig {
   };
 }
 
+export type VerificationCheck = { label: string; ok: boolean; detail: string; advisory?: boolean };
+
+/** True when every required (non-advisory) check passed. */
+export const requiredChecksPass = (checks: VerificationCheck[]) => checks.filter((c) => !c.advisory).every((c) => c.ok);
+
 /** Result of a blockchain check (BTC or USDT TRC20). Stored with approved requests. */
 export type VerificationSource = {
   source: string;
@@ -105,6 +113,8 @@ export type VerificationSource = {
   blockHeight: number | null;
   blockTime: string | null;
   confirmations: number;
+  /** Why the source could not answer (HTTP status, timeout). */
+  error?: string;
 };
 
 export type DepositVerification = {
@@ -118,8 +128,10 @@ export type DepositVerification = {
   paidUnits: number;
   confirmations: number;
   requiredConfirmations: number;
+  /** All REQUIRED checks passed. Only then can an admin approve; nothing is ever approved automatically. */
   matched: boolean;
-  checks: { label: string; ok: boolean; detail: string }[];
+  /** advisory: shown to the admin as a warning, does not block approval. */
+  checks: VerificationCheck[];
   sources: VerificationSource[];
   checkedAt: string;
 };

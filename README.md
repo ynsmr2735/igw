@@ -15,6 +15,8 @@ Multi-user USD wallet built with Next.js App Router and Supabase: 8-digit accoun
 | Transfers | Recipient's 8-digit account number → masked name shown for confirmation → confirm. Atomic, row-locked, idempotent (a retry or double click never sends twice), unique `TRF…` reference, both sides get a history entry and a notification. |
 | History | Reference, type, amount, date, status and description for deposits, transfers sent/received (withdrawals are prepared as a type, the feature is "coming soon"). |
 | Admin panel | `/admin`: notifications (new requests highlighted, read/unread, auto-refresh every 10 s, pending count in the tab title), **Payment requests** (BTC + USDT TRC20; filter by method and by All / Pending / Approved / Rejected / Awaiting payment) with **APPROVE / REJECT** on every pending row, request details with blockchain check, all transactions, **Payment methods** (one card per method: add/change the address, last update date and admin, **Active/Inactive**), **Audit log**. Counters: new, pending, approved, rejected payments (per method). Members get a 404. |
+| Manual review | Nothing is approved or rejected automatically and requests never expire. A request stays **pending** until an admin presses APPROVE (only possible after the payment is verified on its blockchain) or REJECT (with a reason). A late payment is shown to the admin as a warning, not a rejection. |
+| Sound alerts | The admin panel checks for new requests every 5 s (15 s in a background tab) and plays a chime once per new "I've paid" request; new requests are highlighted (**NEW PAYMENT REQUEST**, *Mark as seen*). On/off and volume per browser; if the browser blocks audio, the panel asks for a click. (Vercel has no WebSocket server and the browser never talks to the database directly, so polling is used.) |
 | Audit log | Every admin action — address changes per method (old → new), enabling/disabling a payment method, approvals (method, TXID, confirmations), rejections (reason) — is stored in `admin_audit_log` with the admin and time. |
 
 ## How it is secured
@@ -29,7 +31,7 @@ Multi-user USD wallet built with Next.js App Router and Supabase: 8-digit accoun
 
 ## Setup
 
-1. **Database** — in the Supabase SQL Editor of the project your site uses, run the whole [`supabase/schema.sql`](supabase/schema.sql) (fresh or existing project; idempotent; keeps existing balances). Projects that already ran an earlier version can instead run, in order, only the migrations they have not run yet (the result is identical): [`20261120000000_auth_hardening.sql`](supabase/migrations/20261120000000_auth_hardening.sql), [`20261120000100_wallet_btc_transfers.sql`](supabase/migrations/20261120000100_wallet_btc_transfers.sql), [`20261120000200_btc_settings_audit.sql`](supabase/migrations/20261120000200_btc_settings_audit.sql) (payment method on/off, member name on requests, audit log), [`20261120000300_usdt_trc20.sql`](supabase/migrations/20261120000300_usdt_trc20.sql) (USDT TRC20; existing requests become method `btc` and keep all their data).
+1. **Database** — in the Supabase SQL Editor of the project your site uses, run the whole [`supabase/schema.sql`](supabase/schema.sql) (fresh or existing project; idempotent; keeps existing balances). Projects that already ran an earlier version can instead run, in order, only the migrations they have not run yet (the result is identical): [`20261120000000_auth_hardening.sql`](supabase/migrations/20261120000000_auth_hardening.sql), [`20261120000100_wallet_btc_transfers.sql`](supabase/migrations/20261120000100_wallet_btc_transfers.sql), [`20261120000200_btc_settings_audit.sql`](supabase/migrations/20261120000200_btc_settings_audit.sql) (payment method on/off, member name on requests, audit log), [`20261120000300_usdt_trc20.sql`](supabase/migrations/20261120000300_usdt_trc20.sql) (USDT TRC20; existing requests become method `btc` and keep all their data), [`20261120000400_manual_review.sql`](supabase/migrations/20261120000400_manual_review.sql) (manual review only, sound alerts). **If unsure which ones ran, run the whole `schema.sql`.**
 2. **Environment variables** (Vercel → Settings → Environment Variables), all from the same Supabase project:
 
    ```bash
@@ -49,7 +51,7 @@ Multi-user USD wallet built with Next.js App Router and Supabase: 8-digit accoun
    - **Bitcoin (BTC)**: your Bitcoin **Mainnet** address (`bc1…`, `1…` or `3…`; checksum verified, testnet refused).
    - **Tether (USDT TRC20)**: your **TRON** wallet address that can receive USDT TRC20 (`T…`, 34 characters; Base58Check verified; the USDT contract address itself is refused).
    Until an address is set, members see "… deposits are not available yet" for that method.
-5. Open `/api/health`: expect `{"ok":true,"supabase":"ok","schema":"igw-rpc-5","serviceKey":"configured",…}`.
+5. Open `/api/health`: expect `{"ok":true,"supabase":"ok","schema":"igw-rpc-6","schemaOk":true,"serviceKey":"configured",…}`. The admin panel (Payment methods) shows the same checks in a **System status** card, and a red banner on every admin page if the database version or the service key is wrong.
 
 Defaults (change in the SQL Editor, table `public.app_settings`): BTC 2 confirmations, USDT TRC20 20 confirmations (+ solidified), min 10 USD, max 10,000 USD, payment window 60 minutes.
 
@@ -61,7 +63,7 @@ Tables: `profiles` (+ `account_number`, `username`), `wallets`, `transactions` (
 
 - **Withdrawals**: prepared as a transaction type, the button shows "soon". Paying out BTC/USDT needs a custody/payout process.
 - **Email notifications**: notifications are in-app (dashboard and admin panel). Email would need an email-sending service.
-- **Automatic payment detection**: the admin triggers the blockchain check per request. Fully automatic crediting would need a background job.
+- **Automatic crediting**: intentionally not used — every payment is approved manually by an admin.
 - **Per-user deposit addresses**: all members pay to one admin address per method; unique amounts tell payments apart. Per-user addresses need an xpub/HD wallet setup.
 - Holding and transferring customer funds may require licences (e.g. money transmission, KYC/AML) depending on your jurisdiction.
 

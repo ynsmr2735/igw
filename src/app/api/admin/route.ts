@@ -7,13 +7,20 @@ import {
   listAllTransactions,
   listDeposits,
   markAdminNotificationsRead,
+  pollAdmin,
   rejectDeposit,
   setDepositAddress,
   setMethodEnabled,
 } from "@/lib/admin";
 import { isPaymentMethod } from "@/lib/payment-methods";
+import { testBitcoinExplorers } from "@/lib/btc/chain";
+import { getSystemStatus } from "@/lib/system";
+import { testTronGrid } from "@/lib/tron/chain";
+import { requireAdminSession } from "@/lib/admin";
 
 export const dynamic = "force-dynamic";
+// Approving waits for blockchain APIs; give the function enough time on Vercel.
+export const maxDuration = 60;
 
 /**
  * Admin API. Every action is authorised in the database (admin_roles) through
@@ -25,6 +32,16 @@ export async function POST(request: Request) {
 
   try {
     switch (body.action) {
+      case "poll":
+        return Response.json({ ok: true, poll: await pollAdmin() });
+      case "status":
+        await requireAdminSession();
+        return Response.json({ ok: true, status: await getSystemStatus() });
+      case "testChain": {
+        await requireAdminSession();
+        const [btc, tron] = await Promise.all([testBitcoinExplorers(), testTronGrid()]);
+        return Response.json({ ok: true, btc, tron });
+      }
       case "overview":
         return Response.json({ ok: true, overview: await getAdminOverview() });
       case "deposits":

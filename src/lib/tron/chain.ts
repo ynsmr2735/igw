@@ -1,4 +1,4 @@
-import type { DepositVerification, VerificationSource } from "@/lib/payment-methods";
+import { requiredChecksPass, type DepositVerification, type VerificationSource } from "@/lib/payment-methods";
 import { USDT_TRC20_CONTRACT, tronAccountHex } from "@/lib/tron/address";
 
 /**
@@ -8,14 +8,16 @@ import { USDT_TRC20_CONTRACT, tronAccountHex } from "@/lib/tron/address";
  *   - POST https://api.trongrid.io/walletsolidity/gettransactioninfobyid  (solidity node: only
  *     irreversible, "solidified" blocks)
  *   - POST https://api.trongrid.io/wallet/getnowblock                     (current block height)
- * An optional TRONGRID_API_KEY (server env) is sent as TRON-PRO-API-KEY for higher rate limits.
+ * TRONGRID_API_KEY (server env) is sent as TRON-PRO-API-KEY. TronGrid documents that mainnet
+ * requests without a key may be severely rate-limited or rejected, so set it in production.
  *
  * A deposit matches only if ALL hold:
  *   - the transaction executed successfully (receipt SUCCESS)
  *   - it emitted a Transfer event of the official USDT contract
  *     TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t (fake tokens named "USDT" do not count)
  *   - the transfers to the request's deposit address add up to exactly the requested amount
- *   - it was made within the quote window
+ *   - it was not made before the request was created (a late payment is only
+ *     flagged to the admin: requests never expire, the admin decides)
  *   - it has the required number of confirmations and is solidified (irreversible)
  *   - the full node and the solidity node report the same transfer
  */
@@ -54,22 +56,40 @@ function headers(): Record<string, string> {
   return h;
 }
 
-async function post(path: string, body: unknown): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(`${API}${path}`, {
-    method: "POST",
-    headers: headers(),
-    body: JSON.stringify(body),
-    cache: "no-store",
-    signal: AbortSignal.timeout(8000),
-  });
-  const text = await response.text();
-  let parsed: unknown = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    /* not JSON */
+type PostResult = { status: number; body: unknown; error?: string };
+
+/** POST to TronGrid; one retry after a short pause on rate limiting (403/429) or 5xx. */
+async function post(path: string, body: unknown): Promise<PostResult> {
+  for (let attempt = 0; ; attempt++) {
+    let result: PostResult;
+    try {
+      const response = await fetch(`${API}${path}`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify(body),
+        cache: "no-store",
+        signal: AbortSignal.timeout(6000),
+      });
+      const text = await response.text();
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        /* not JSON */
+      }
+      result = { status: response.status, body: parsed };
+      if (response.status !== 200) {
+        const message = (parsed as { Error?: string; error?: string } | null)?.Error ?? (parsed as { error?: string } | null)?.error;
+        const limited = response.status === 403 || response.status === 429;
+        result.error = `HTTP ${response.status}${limited ? " (rate limit — set TRONGRID_API_KEY)" : ""}${message ? `: ${String(message).slice(0, 120)}` : ""}`;
+      }
+    } catch (error) {
+      result = { status: 0, body: null, error: error instanceof Error && error.name === "TimeoutError" ? "timeout" : "unreachable" };
+    }
+    const retry = result.status === 0 || result.status === 403 || result.status === 429 || result.status >= 500;
+    if (!retry || attempt >= 1) return result;
+    await new Promise((resolve) => setTimeout(resolve, 1200));
   }
-  return { status: response.status, body: parsed };
 }
 
 const strip0x = (value: string) => value.toLowerCase().replace(/^0x/, "");
@@ -105,7 +125,7 @@ async function checkNode(
   };
   try {
     const res = await post(path, { value: txid });
-    if (res.status !== 200 || typeof res.body !== "object" || res.body === null) return empty;
+    if (res.status !== 200 || typeof res.body !== "object" || res.body === null) return { ...empty, error: res.error ?? "no answer" };
     const info = res.body as TronTxInfo;
     // Unknown (or not yet solidified) transactions return {}.
     if (!info.id) return { ...empty, reachable: true };
@@ -132,14 +152,18 @@ async function checkNode(
   }
 }
 
-async function currentBlock(): Promise<number | null> {
-  try {
-    const res = await post("/wallet/getnowblock", {});
-    const n = (res.body as { block_header?: { raw_data?: { number?: number } } } | null)?.block_header?.raw_data?.number;
-    return res.status === 200 && Number.isSafeInteger(n) ? (n as number) : null;
-  } catch {
-    return null;
-  }
+async function currentBlock(): Promise<{ height: number | null; error?: string }> {
+  const res = await post("/wallet/getnowblock", {});
+  const n = (res.body as { block_header?: { raw_data?: { number?: number } } } | null)?.block_header?.raw_data?.number;
+  return res.status === 200 && Number.isSafeInteger(n) ? { height: n as number } : { height: null, error: res.error ?? "no block height" };
+}
+
+/** Quick connectivity test for the admin status panel. */
+export async function testTronGrid(): Promise<{ ok: boolean; detail: string }> {
+  const block = await currentBlock();
+  return block.height !== null
+    ? { ok: true, detail: `TronGrid OK (block ${block.height})${process.env.TRONGRID_API_KEY?.trim() ? "" : " — no API key set"}` }
+    : { ok: false, detail: `TronGrid: ${block.error}` };
 }
 
 export async function verifyUsdtTrc20Deposit(
@@ -148,13 +172,19 @@ export async function verifyUsdtTrc20Deposit(
 ): Promise<DepositVerification> {
   const txid = deposit.txid.toLowerCase();
   const toHex = tronAccountHex(deposit.address);
-  const tip = await currentBlock();
-  const [full, solid] = toHex
+  // All three requests in parallel (keeps the admin's click fast).
+  const [block, fullRaw, solidRaw] = toHex
     ? await Promise.all([
-        checkNode("TronGrid full node", "/wallet/gettransactioninfobyid", txid, toHex, tip),
-        checkNode("TronGrid solidity node", "/walletsolidity/gettransactioninfobyid", txid, toHex, tip),
+        currentBlock(),
+        checkNode("TronGrid full node", "/wallet/gettransactioninfobyid", txid, toHex, null),
+        checkNode("TronGrid solidity node", "/walletsolidity/gettransactioninfobyid", txid, toHex, null),
       ])
-    : [null, null];
+    : [await currentBlock(), null, null];
+  const tip = block.height;
+  const withConfirmations = (n: NodeView | null) =>
+    n && n.blockHeight !== null && tip !== null && tip >= n.blockHeight ? { ...n, confirmations: tip - n.blockHeight + 1 } : n;
+  const full = withConfirmations(fullRaw);
+  const solid = withConfirmations(solidRaw);
   const nodes = [full, solid].filter((n): n is NodeView => n !== null);
   const paidUnits = full?.paidUnits ?? 0;
   const confirmations = full?.confirmations ?? 0;
@@ -174,7 +204,7 @@ export async function verifyUsdtTrc20Deposit(
       ok: Boolean(full?.reachable) && tip !== null,
       detail: full?.reachable && tip !== null
         ? `TronGrid answered (current block ${tip})`
-        : "TronGrid could not be reached. Try again later.",
+        : `TronGrid did not answer: ${full?.error ?? block.error ?? "no answer"}. Try again later.`,
     },
     {
       label: "Transaction found on TRON mainnet",
@@ -206,11 +236,17 @@ export async function verifyUsdtTrc20Deposit(
       detail: `Expected ${fmt(deposit.amountUnits)} USDT, received ${fmt(Math.max(paidUnits, 0))} USDT`,
     },
     {
-      label: "Paid within the quote window",
-      ok: blockTime !== null && blockTime >= created - CLOCK_SKEW_MS && blockTime <= expires + LATE_GRACE_MS,
+      label: "Paid after the request was created",
+      ok: blockTime !== null && blockTime >= created - CLOCK_SKEW_MS,
       detail: blockTime === null
         ? "Not in a block yet"
         : `Block time ${new Date(blockTime).toISOString()} (request ${new Date(created).toISOString()})`,
+    },
+    {
+      label: "Paid within the payment window",
+      advisory: true,
+      ok: blockTime !== null && blockTime <= expires + LATE_GRACE_MS,
+      detail: blockTime === null ? "Not in a block yet" : blockTime <= expires + LATE_GRACE_MS ? "In time" : "Paid after the payment window. Your decision.",
     },
     {
       label: `At least ${requiredConfirmations} confirmations`,
@@ -239,7 +275,7 @@ export async function verifyUsdtTrc20Deposit(
     paidUnits,
     confirmations,
     requiredConfirmations,
-    matched: checks.every((c) => c.ok),
+    matched: requiredChecksPass(checks),
     checks,
     sources: nodes.map(({ success: _s, usdtEvent: _u, ...rest }) => rest),
     checkedAt: new Date().toISOString(),

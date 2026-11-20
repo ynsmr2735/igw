@@ -7,7 +7,8 @@ import {
   type MethodConfig,
   type PaymentMethod,
 } from "@/lib/payment-methods";
-import { AuthError, RpcError, rpc, serviceRpc } from "@/lib/supabase";
+import { AuthError, RpcError, SetupError, rpc, serviceRpc } from "@/lib/supabase";
+import { assertSchema } from "@/lib/system";
 import { USDT_TRC20_CONTRACT, validateTronAddress } from "@/lib/tron/address";
 import { verifyUsdtTrc20Deposit } from "@/lib/tron/chain";
 import { toDeposit, toTransaction, type Deposit, type Notification, type Transaction } from "@/lib/wallet";
@@ -80,9 +81,14 @@ function toAdminDeposit(raw: Record<string, unknown>): AdminDeposit {
 }
 
 export async function getAdminOverview(): Promise<AdminOverview> {
+  await assertSchema();
   const raw = await rpc<Record<string, unknown>>("igw_admin_overview", { p_token: await token() });
   const counts = raw.counts as Record<string, unknown>;
   const settings = raw.settings as Record<string, unknown>;
+  // Old database (no per-method settings): say so instead of showing an empty page.
+  if (!Array.isArray(settings?.methods)) {
+    throw new SetupError("The database is on an older version. Run the whole supabase/schema.sql in the Supabase SQL Editor, then reload.");
+  }
   return {
     admin: raw.admin as AdminOverview["admin"],
     counts: {
@@ -122,6 +128,10 @@ export async function listDeposits(status: string | null): Promise<AdminDeposit[
 
 export async function getDeposit(id: number): Promise<AdminDepositDetail> {
   const raw = await rpc<Record<string, unknown>>("igw_admin_deposit", { p_token: await token(), p_id: id });
+  if (typeof raw.depositAddress !== "string" || !raw.method) {
+    // Never verify against an empty address because the database answered in an old format.
+    throw new SetupError("The database is on an older version. Run the whole supabase/schema.sql in the Supabase SQL Editor, then reload.");
+  }
   return {
     ...toAdminDeposit(raw),
     requiredConfirmations: Number(raw.requiredConfirmations),
@@ -155,10 +165,12 @@ export async function checkDepositOnChain(id: number): Promise<DepositVerificati
  * balance once, atomically, and refuses a second approval.
  */
 export async function approveDeposit(id: number): Promise<{ deposit: AdminDeposit; verification: DepositVerification }> {
+  await assertSchema();
   const verification = await checkDepositOnChain(id);
   if (!verification.matched) {
-    const failed = verification.checks.filter((c) => !c.ok).map((c) => c.label).join(", ");
-    throw new RpcError(`Payment not verified on the blockchain (${failed}). The deposit was not approved.`);
+    // The request stays PENDING: nothing is rejected automatically. The admin can retry later or reject.
+    const failed = verification.checks.filter((c) => !c.ok && !c.advisory).map((c) => `${c.label}: ${c.detail}`).join(" · ");
+    throw new RpcError(`Not approved — payment not verified on the blockchain. ${failed}. The request stays pending; the balance was not changed.`);
   }
   const result = await serviceRpc<{ deposit: Record<string, unknown> }>("igw_admin_approve", {
     p_token: await token(),
@@ -204,7 +216,8 @@ export async function setDepositAddress(method: PaymentMethod, address: string):
     }
     normalized = check.address;
   }
-  const result = await serviceRpc<{ address: string }>("igw_admin_set_deposit_address", {
+  await assertSchema();
+  const result = await rpc<{ address: string }>("igw_admin_set_deposit_address", {
     p_token: await token(),
     p_method: method,
     p_address: normalized,
@@ -220,6 +233,40 @@ export async function setMethodEnabled(method: PaymentMethod, enabled: boolean):
     p_enabled: enabled,
   });
   return Boolean(result.enabled);
+}
+
+/** Throws unless the session belongs to an admin (checked in the database). */
+export async function requireAdminSession(): Promise<void> {
+  await rpc("igw_admin_poll", { p_token: await token() });
+}
+
+export type AdminPoll = {
+  reviewing: number;
+  approved: number;
+  rejected: number;
+  unreadCount: number;
+  latestRequestNotificationId: number | null;
+  newRequests: { notificationId: number; requestId: number; reference: string; method: PaymentMethod; amountUsd: number; userName: string }[];
+};
+
+/** Light check every few seconds from the admin panel (sound alert, counters). */
+export async function pollAdmin(): Promise<AdminPoll> {
+  const raw = await rpc<Record<string, unknown>>("igw_admin_poll", { p_token: await token() });
+  return {
+    reviewing: Number(raw.reviewing ?? 0),
+    approved: Number(raw.approved ?? 0),
+    rejected: Number(raw.rejected ?? 0),
+    unreadCount: Number(raw.unreadCount ?? 0),
+    latestRequestNotificationId: raw.latestRequestNotificationId == null ? null : Number(raw.latestRequestNotificationId),
+    newRequests: ((raw.newRequests as Record<string, unknown>[]) ?? []).map((n) => ({
+      notificationId: Number(n.notificationId),
+      requestId: Number(n.requestId),
+      reference: String(n.reference ?? ""),
+      method: n.method === "usdt_trc20" ? "usdt_trc20" : "btc",
+      amountUsd: Number(n.amountUsd ?? 0),
+      userName: String(n.userName ?? ""),
+    })),
+  };
 }
 
 export async function markAdminNotificationsRead(ids: number[] | null): Promise<void> {

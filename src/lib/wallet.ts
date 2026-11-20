@@ -2,6 +2,7 @@ import { getSessionToken } from "@/lib/auth/session";
 import { getBtcUsdPrice } from "@/lib/btc/price";
 import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import { AuthError, RpcError, rpc, serviceRpc } from "@/lib/supabase";
+import { assertSchema } from "@/lib/system";
 
 export { formatDate, formatMoney, initialsOf } from "./format";
 
@@ -196,6 +197,7 @@ export async function getDashboardData(): Promise<DashboardData | null> {
  */
 export async function createDeposit(method: PaymentMethod, amountUsd: number): Promise<Deposit> {
   const token = await requireToken();
+  await assertSchema();
   let rate = 1;
   let source = "USDT 1:1";
   if (method === "btc") {

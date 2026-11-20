@@ -1,4 +1,4 @@
-import type { DepositVerification, VerificationSource } from "@/lib/payment-methods";
+import { requiredChecksPass, type DepositVerification, type VerificationSource } from "@/lib/payment-methods";
 
 /**
  * Verifies a BTC deposit against real Bitcoin MAINNET data from two independent
@@ -9,7 +9,8 @@ import type { DepositVerification, VerificationSource } from "@/lib/payment-meth
  * A deposit matches only if ALL hold:
  *   - the transaction exists and pays the request's address
  *   - exactly the requested number of satoshis (each open request has a unique amount)
- *   - it is not older than the request and was mined in time
+ *   - it was not made before the request was created (a late payment is only
+ *     flagged to the admin: requests never expire, the admin decides)
  *   - it has at least the required number of confirmations
  *   - no explorer reports something different
  */
@@ -39,7 +40,7 @@ const MINING_GRACE_MS = 3 * 60 * 60 * 1000;
 const CLOCK_SKEW_MS = 2 * 60 * 60 * 1000;
 
 async function getJson(url: string): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(8000) });
+  const response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(6000) });
   const text = await response.text();
   let body: unknown = text;
   try {
@@ -62,7 +63,9 @@ async function checkExplorer(
   try {
     const tx = await getJson(`${explorer.base}/tx/${txid}`);
     if (tx.status === 404 || tx.status === 400) return { ...empty, reachable: true };
-    if (tx.status !== 200 || typeof tx.body !== "object" || tx.body === null) return empty;
+    if (tx.status !== 200 || typeof tx.body !== "object" || tx.body === null) {
+      return { ...empty, error: `HTTP ${tx.status}${tx.status === 429 ? " (rate limit)" : ""}` };
+    }
     const data = tx.body as EsploraTx;
     if (data.txid !== txid || !Array.isArray(data.vout)) return empty;
 
@@ -88,8 +91,8 @@ async function checkExplorer(
       blockTime: confirmed && data.status.block_time ? new Date(data.status.block_time * 1000).toISOString() : null,
       confirmations,
     };
-  } catch {
-    return empty;
+  } catch (error) {
+    return { ...empty, error: error instanceof Error && error.name === "TimeoutError" ? "timeout" : "unreachable" };
   }
 }
 
@@ -118,7 +121,7 @@ export async function verifyBtcDeposit(
       ok: answered.length > 0,
       detail: answered.length
         ? `Answered: ${answered.map((s) => s.source).join(", ")}`
-        : "No explorer could be reached. Try again later.",
+        : `No explorer could be reached (${sources.map((s) => `${s.source}: ${s.error ?? "no answer"}`).join(", ")}). Try again later.`,
     },
     {
       label: "Transaction found on Bitcoin mainnet",
@@ -143,13 +146,21 @@ export async function verifyBtcDeposit(
       detail: `Expected ${deposit.amountUnits} sats, received ${paidUnits} sats`,
     },
     {
-      label: "Paid within the quote window",
-      ok: blockTime === null
-        ? false
-        : blockTime >= created - CLOCK_SKEW_MS && blockTime <= expires + MINING_GRACE_MS,
+      label: "Paid after the request was created",
+      ok: blockTime !== null && blockTime >= created - CLOCK_SKEW_MS,
       detail: blockTime === null
         ? "Not mined yet"
         : `Mined ${new Date(blockTime).toISOString()} (request ${new Date(created).toISOString()})`,
+    },
+    {
+      label: "Paid within the payment window",
+      advisory: true,
+      ok: blockTime !== null && blockTime <= expires + MINING_GRACE_MS,
+      detail: blockTime === null
+        ? "Not mined yet"
+        : blockTime <= expires + MINING_GRACE_MS
+          ? "In time"
+          : "Paid late: the BTC price may have changed since the quote. Your decision.",
     },
     {
       label: `At least ${requiredConfirmations} confirmations`,
@@ -167,9 +178,24 @@ export async function verifyBtcDeposit(
     paidUnits,
     confirmations,
     requiredConfirmations,
-    matched: checks.every((c) => c.ok),
+    matched: requiredChecksPass(checks),
     checks,
     sources,
     checkedAt: new Date().toISOString(),
   };
+}
+
+/** Quick connectivity test for the admin status panel. */
+export async function testBitcoinExplorers(): Promise<{ ok: boolean; detail: string }> {
+  const results = await Promise.all(
+    EXPLORERS.map(async (e) => {
+      try {
+        const r = await getJson(`${e.base}/blocks/tip/height`);
+        return r.status === 200 ? `${e.name} OK (block ${String(r.body)})` : `${e.name}: HTTP ${r.status}`;
+      } catch {
+        return `${e.name}: unreachable`;
+      }
+    }),
+  );
+  return { ok: results.some((r) => r.includes(" OK ")), detail: results.join(" · ") };
 }

@@ -689,6 +689,143 @@ as $$
 $$;
 
 -- Settings keys per payment method.
+-- Base58Check decode: payload (without the 4-byte checksum) or null if invalid.
+create or replace function igw_private.base58check_payload(p_text text)
+returns bytea
+language plpgsql
+immutable
+set search_path = public, extensions
+as $$
+declare
+  v_alphabet constant text := '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  v_num numeric := 0;
+  v_idx integer;
+  v_hex text := '';
+  v_raw bytea;
+  v_len integer;
+  i integer;
+begin
+  if p_text is null or p_text = '' or length(p_text) > 64 then
+    return null;
+  end if;
+  for i in 1..length(p_text) loop
+    v_idx := strpos(v_alphabet, substr(p_text, i, 1)) - 1;
+    if v_idx < 0 then
+      return null;
+    end if;
+    v_num := v_num * 58 + v_idx;
+  end loop;
+  while v_num > 0 loop
+    v_hex := lpad(to_hex(mod(v_num, 256)::integer), 2, '0') || v_hex;
+    v_num := div(v_num, 256);
+  end loop;
+  i := 1;
+  while i <= length(p_text) and substr(p_text, i, 1) = '1' loop
+    v_hex := '00' || v_hex;
+    i := i + 1;
+  end loop;
+  v_raw := decode(v_hex, 'hex');
+  v_len := length(v_raw);
+  if v_len < 5 then
+    return null;
+  end if;
+  if substring(extensions.digest(extensions.digest(substring(v_raw from 1 for v_len - 4), 'sha256'), 'sha256') from 1 for 4)
+     <> substring(v_raw from v_len - 3 for 4) then
+    return null;
+  end if;
+  return substring(v_raw from 1 for v_len - 4);
+end;
+$$;
+
+-- Bech32 (BIP173, segwit v0) / Bech32m (BIP350, v1+) mainnet address check.
+create or replace function igw_private.bech32_valid(p_address text)
+returns boolean
+language plpgsql
+immutable
+as $$
+declare
+  v_charset constant text := 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  v_gen constant bigint[] := array[996825010, 642813549, 513874426, 1027748829, 705979059];
+  v_addr text := lower(p_address);
+  v_data integer[] := '{}';
+  v_values integer[];
+  v_chk bigint := 1;
+  v_top bigint;
+  v_v integer;
+  v_version integer;
+  v_prog_len integer;
+  i integer;
+  j integer;
+begin
+  if p_address is null or p_address <> v_addr and p_address <> upper(p_address) then
+    return false; -- mixed case is invalid
+  end if;
+  if v_addr !~ '^bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}$' then
+    return false;
+  end if;
+  for i in 4..length(v_addr) loop
+    v_data := v_data || (strpos(v_charset, substr(v_addr, i, 1)) - 1);
+  end loop;
+  -- hrp_expand('bc') = [3, 3, 0, 2, 3]
+  v_values := array[3, 3, 0, 2, 3] || v_data;
+  foreach v_v in array v_values loop
+    v_top := v_chk >> 25;
+    v_chk := ((v_chk & 33554431) << 5) # v_v;
+    for j in 0..4 loop
+      if ((v_top >> j) & 1) = 1 then
+        v_chk := v_chk # v_gen[j + 1];
+      end if;
+    end loop;
+  end loop;
+  v_version := v_data[1];
+  if v_version > 16 then
+    return false;
+  end if;
+  if (v_version = 0 and v_chk <> 1) or (v_version > 0 and v_chk <> 734539939) then
+    return false;
+  end if;
+  -- witness program length in bytes (5-bit groups without version and 6 checksum chars)
+  v_prog_len := ((array_length(v_data, 1) - 7) * 5) / 8;
+  if v_prog_len < 2 or v_prog_len > 40 or (v_version = 0 and v_prog_len not in (20, 32)) then
+    return false;
+  end if;
+  return true;
+end;
+$$;
+
+-- Full address validation per payment method (mainnet only).
+create or replace function igw_private.deposit_address_valid(p_method text, p_address text)
+returns boolean
+language plpgsql
+immutable
+set search_path = public, extensions
+as $$
+declare
+  v_payload bytea;
+begin
+  if p_address is null or p_address = '' then
+    return false;
+  end if;
+  if p_method = 'usdt_trc20' then
+    if p_address !~ '^T[1-9A-HJ-NP-Za-km-z]{33}$' then
+      return false;
+    end if;
+    v_payload := igw_private.base58check_payload(p_address);
+    return v_payload is not null and length(v_payload) = 21 and get_byte(v_payload, 0) = 65; -- 0x41
+  elsif p_method = 'btc' then
+    if lower(left(p_address, 3)) = 'bc1' then
+      return igw_private.bech32_valid(p_address);
+    end if;
+    if p_address !~ '^[13][1-9A-HJ-NP-Za-km-z]{25,34}$' then
+      return false;
+    end if;
+    v_payload := igw_private.base58check_payload(p_address);
+    return v_payload is not null and length(v_payload) = 21 and get_byte(v_payload, 0) in (0, 5);
+  end if;
+  return false;
+end;
+$$;
+
 create or replace function igw_private.method_key(p_method text, p_what text)
 returns text
 language sql
@@ -777,18 +914,18 @@ as $$
   );
 $$;
 
--- Payment window: quote valid for deposit_quote_minutes; "I've paid" accepted
--- for 30 more minutes. After that an unpaid request expires.
+-- igw-rpc-6: payment requests are NEVER closed automatically: no timeout, no
+-- automatic approval or rejection. Only an admin (or the member, by cancelling
+-- an unpaid request) changes the status. Kept as a no-op for older callers.
 create or replace function igw_private.expire_deposits()
 returns void
-language sql
+language plpgsql
 security definer
 set search_path = public, extensions
 as $$
-  update public.deposit_requests
-  set status = 'expired'
-  where status = 'awaiting_payment'
-    and expires_at + interval '30 minutes' < now();
+begin
+  null;
+end;
 $$;
 
 -- New accounts start with a single USD balance of 0.00, tied to the account number.
@@ -910,7 +1047,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-5');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-6');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1292,11 +1429,8 @@ begin
   if v_request.status <> 'awaiting_payment' then
     raise exception 'This deposit request is %. Please create a new one.', replace(v_request.status, '_', ' ');
   end if;
-  if now() > v_request.expires_at + interval '30 minutes' then
-    raise exception 'This deposit request has expired. Please create a new one.';
-  end if;
   if v_txid !~ '^[0-9a-f]{64}$' then
-    raise exception 'Enter a valid Bitcoin transaction ID (64 hexadecimal characters).';
+    raise exception 'Enter a valid transaction ID (TXID / hash: 64 hexadecimal characters).';
   end if;
   if exists (select 1 from public.deposit_requests where txid = v_txid) then
     raise exception 'This transaction ID has already been submitted.';
@@ -1347,9 +1481,10 @@ begin
     )
   );
   perform igw_private.notify(
-    v_uid, 'deposit_submitted', 'Payment request created',
-    format('Your payment request was created successfully (ref. %s, %s USD). It will be finalized after review by an admin. Your balance is updated only after the payment is confirmed on the Bitcoin network.',
-           v_request.reference, v_request.amount_usd),
+    v_uid, 'deposit_submitted', 'Payment request received',
+    format('Your payment request has been received. Awaiting admin review. (ref. %s, %s USD, %s %s)',
+           v_request.reference, v_request.amount_usd,
+           igw_private.format_units(v_request.method, v_request.amount_units), igw_private.method_asset(v_request.method)),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference)
   );
 
@@ -1743,7 +1878,7 @@ begin
                        'txid', v_request.txid, 'confirmations', p_verification->'confirmations'));
   perform igw_private.notify(
     v_request.user_id, 'deposit_approved', 'Payment approved',
-    format('%s USD has been added to your balance (ref. %s).', v_request.amount_usd, v_request.reference),
+    format('Your payment has been approved and added to your balance: %s USD (ref. %s).', v_request.amount_usd, v_request.reference),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'amountUsd', v_request.amount_usd)
   );
 
@@ -1791,7 +1926,7 @@ begin
                        'amountUsd', v_request.amount_usd, 'txid', v_request.txid, 'reason', v_reason));
   perform igw_private.notify(
     v_request.user_id, 'deposit_rejected', 'Payment rejected',
-    format('Your deposit of %s USD (ref. %s) was rejected. Reason: %s', v_request.amount_usd, v_request.reference, v_reason),
+    format('Your payment request was rejected. Reason: %s (ref. %s, %s USD)', v_reason, v_request.reference, v_request.amount_usd),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'reason', v_reason)
   );
 
@@ -1822,8 +1957,10 @@ $$;
 
 -- SERVICE ROLE ONLY: the server validates the address checksum (mainnet only)
 -- before calling. Open requests keep the address they were shown.
--- SERVICE ROLE ONLY: the server validates the address checksum (BTC mainnet /
--- TRON mainnet) before calling. Requests already created keep their address.
+-- Admin session required (checked here). The server also verifies the address
+-- checksum (BTC mainnet / TRON mainnet) before calling. Since igw-rpc-6 this does
+-- not need the service role key, so addresses can be saved even before that key
+-- is configured. Requests already created keep their address.
 create or replace function public.igw_admin_set_deposit_address(p_token text, p_method text, p_address text)
 returns jsonb
 language plpgsql
@@ -1840,9 +1977,11 @@ begin
   if v_key is null then
     raise exception 'Unknown payment method.';
   end if;
-  if (v_method = 'btc' and v_address !~ '^(bc1[02-9ac-hj-np-z]{11,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$')
-     or (v_method = 'usdt_trc20' and v_address !~ '^T[1-9A-HJ-NP-Za-km-z]{33}$') then
-    raise exception 'Enter a valid % address.', case v_method when 'usdt_trc20' then 'TRON (TRC20)' else 'Bitcoin mainnet' end;
+  if v_address = '' then
+    raise exception 'Enter an address.';
+  end if;
+  if not igw_private.deposit_address_valid(v_method, v_address) then
+    raise exception 'Enter a valid % address (checksum verified).', case v_method when 'usdt_trc20' then 'TRON (TRC20)' else 'Bitcoin mainnet' end;
   end if;
   if v_method = 'usdt_trc20' and v_address = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t' then
     raise exception 'This is the USDT token contract, not a wallet address.';
@@ -1862,6 +2001,45 @@ begin
   );
   return jsonb_build_object('ok', true, 'method', v_method, 'address', v_address);
 end;
+$$;
+
+-- Lightweight check for the admin panel (every few seconds): counters and the
+-- payment requests the admin has not seen yet. Used for the sound alert.
+create or replace function public.igw_admin_poll(p_token text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+begin
+  return jsonb_build_object(
+    'reviewing', (select count(*) from public.deposit_requests where status = 'reviewing'),
+    'approved', (select count(*) from public.deposit_requests where status = 'approved'),
+    'rejected', (select count(*) from public.deposit_requests where status = 'rejected'),
+    'unreadCount', (select count(*) from public.notifications where user_id = v_admin and read_at is null),
+    'latestRequestNotificationId', (select max(id) from public.notifications
+                                    where user_id = v_admin and kind = 'deposit_submitted'),
+    'newRequests', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'notificationId', n.id, 'requestId', (n.data->>'requestId')::bigint, 'reference', n.data->>'reference',
+        'method', n.data->>'method', 'amountUsd', n.data->'amountUsd', 'userName', n.data->>'userName'
+      ) order by n.id)
+      from public.notifications n
+      where n.user_id = v_admin and n.kind = 'deposit_submitted' and n.read_at is null
+    ), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- Lets the server check that SUPABASE_SERVICE_ROLE_KEY is present AND correct.
+create or replace function public.igw_service_ping()
+returns jsonb
+language sql
+stable
+as $$
+  select jsonb_build_object('ok', true);
 $$;
 
 create or replace function public.igw_admin_set_method_enabled(p_token text, p_method text, p_enabled boolean)
@@ -1913,6 +2091,8 @@ declare
     'public.igw_admin_deposit(text, bigint)',
     'public.igw_admin_reject(text, bigint, text)',
     'public.igw_admin_set_method_enabled(text, text, boolean)',
+    'public.igw_admin_set_deposit_address(text, text, text)',
+    'public.igw_admin_poll(text)',
     'public.igw_admin_transactions(text, integer)'
   ];
   -- Trusted inputs (BTC price, blockchain verification, deposit address):
@@ -1920,7 +2100,7 @@ declare
   service_functions text[] := array[
     'public.igw_deposit_create(text, text, numeric, numeric, text)',
     'public.igw_admin_approve(text, bigint, jsonb)',
-    'public.igw_admin_set_deposit_address(text, text, text)'
+    'public.igw_service_ping()'
   ];
 begin
   foreach f in array anon_functions || service_functions loop
