@@ -5,7 +5,7 @@
  *   user's session themselves, and nothing else (see supabase/schema.sql).
  * - Secret service role key (SUPABASE_SERVICE_ROLE_KEY, server-only, never
  *   NEXT_PUBLIC_): required for functions that take trusted input from this
- *   server: BTC price quotes, blockchain-verified approvals, deposit address.
+ *   server: BTC price quotes for deposit requests.
  */
 
 /**

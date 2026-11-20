@@ -1,8 +1,6 @@
-import { errorResponse, readJson, toId } from "@/lib/api";
+import { errorResponse, readJson, toAmount, toId } from "@/lib/api";
 import {
-  ApprovalError,
   approveDeposit,
-  checkDepositOnChain,
   getAdminOverview,
   getDeposit,
   listAllTransactions,
@@ -14,14 +12,10 @@ import {
   setMethodEnabled,
 } from "@/lib/admin";
 import { isPaymentMethod } from "@/lib/payment-methods";
-import { testBitcoinExplorers } from "@/lib/btc/chain";
 import { getSystemStatus } from "@/lib/system";
-import { testTronGrid } from "@/lib/tron/chain";
 import { requireAdminSession } from "@/lib/admin";
 
 export const dynamic = "force-dynamic";
-// Approving waits for blockchain APIs; give the function enough time on Vercel.
-export const maxDuration = 60;
 
 /**
  * Admin API. Every action is authorised in the database (admin_roles) through
@@ -38,11 +32,6 @@ export async function POST(request: Request) {
       case "status":
         await requireAdminSession();
         return Response.json({ ok: true, status: await getSystemStatus() });
-      case "testChain": {
-        await requireAdminSession();
-        const [btc, tron] = await Promise.all([testBitcoinExplorers(), testTronGrid()]);
-        return Response.json({ ok: true, btc, tron });
-      }
       case "overview":
         return Response.json({ ok: true, overview: await getAdminOverview() });
       case "deposits":
@@ -52,26 +41,15 @@ export async function POST(request: Request) {
         if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
         return Response.json({ ok: true, deposit: await getDeposit(id) });
       }
-      case "verify": {
-        const id = toId(body.id);
-        if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
-        return Response.json({ ok: true, verification: await checkDepositOnChain(id) });
-      }
       case "approve": {
         const id = toId(body.id);
         if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
-        try {
-          return Response.json({ ok: true, ...(await approveDeposit(id, { acceptReceived: body.acceptReceived === true })) });
-        } catch (error) {
-          // Real reason + the blockchain result, so the admin sees exactly what is missing.
-          if (error instanceof ApprovalError) {
-            return Response.json(
-              { error: error.message, verification: error.verification, mismatch: error.mismatch },
-              { status: error.mismatch ? 409 : 400 },
-            );
-          }
-          throw error;
+        let credit: number | null = null;
+        if (body.creditUsd !== undefined && body.creditUsd !== null && body.creditUsd !== "") {
+          credit = toAmount(body.creditUsd);
+          if (credit === null) return Response.json({ error: "Enter a valid amount to credit (max. 2 decimals)." }, { status: 400 });
         }
+        return Response.json({ ok: true, ...(await approveDeposit(id, credit)) });
       }
       case "reject": {
         const id = toId(body.id);
