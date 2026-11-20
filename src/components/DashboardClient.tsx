@@ -34,6 +34,7 @@ import {
   formatDate,
   formatMoney,
 } from "@/lib/format";
+import { METHOD_INFO, type PaymentMethod } from "@/lib/payment-methods";
 import type { DashboardData, Deposit, TransferResult, Transaction } from "@/lib/wallet";
 import {
   Badge,
@@ -113,6 +114,41 @@ function TransactionItem({ tx }: { tx: Transaction }) {
 
 /* ---------------------------------------------------------------------------------------------- */
 
+function MethodWarning({ method, amountCrypto, confirmations }: { method: PaymentMethod; amountCrypto: string; confirmations: number }) {
+  if (method === "usdt_trc20") {
+    return (
+      <div className="space-y-3">
+        <div role="note" className="flex gap-3 rounded-2xl border-2 border-rose-300 bg-rose-50 p-4 text-[12px] leading-5 text-rose-900" data-testid="trc20-warning">
+          <svg viewBox="0 0 24 24" aria-hidden="true" className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+            <path d="M12 9v4M12 17h.01" />
+          </svg>
+          <div>
+            <p className="text-[13px] font-black">Send only USDT on the TRON (TRC20) network</p>
+            <p className="mt-1">
+              This address accepts only <b>USDT TRC20</b>. Sending USDT on another network (ERC20 / Ethereum, BEP20 / BSC,
+              Polygon, Solana…), or sending any other coin or token (TRX, USDC…), will be <b>lost permanently</b> and cannot be
+              credited or refunded.
+            </p>
+          </div>
+        </div>
+        <ul className="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] leading-5 text-amber-900">
+          <li>• Send <b>exactly {amountCrypto} USDT</b>. The cents are a unique identifier of your request. If your exchange deducts a withdrawal fee, add it so that exactly this amount arrives.</li>
+          <li>• In your wallet or exchange choose the network <b>TRON (TRC20)</b>.</li>
+          <li>• Your balance is credited after {confirmations} TRON confirmations and an admin review.</li>
+        </ul>
+      </div>
+    );
+  }
+  return (
+    <ul className="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] leading-5 text-amber-900">
+      <li>• Send <b>exactly {amountCrypto} BTC</b>. Pay the network fee on top; if your exchange deducts a withdrawal fee from the amount, add it so that exactly this amount arrives.</li>
+      <li>• Use the <b>Bitcoin network (Mainnet)</b> only. Payments on other networks (Lightning, BEP20, testnet…) cannot be recovered.</li>
+      <li>• Your balance is credited after {confirmations} network confirmations and an admin review.</li>
+    </ul>
+  );
+}
+
 function DepositSection({
   data,
   onChanged,
@@ -124,10 +160,17 @@ function DepositSection({
 }) {
   const config = data.depositConfig;
   const open = data.openDeposit;
+  const firstAvailable = config.methods.find((m) => m.enabled && m.address)?.method ?? "btc";
+  const [chosen, setChosen] = useState<PaymentMethod>(firstAvailable);
   const [amount, setAmount] = useState("");
   const [txid, setTxid] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const method: PaymentMethod = open?.method ?? chosen;
+  const info = METHOD_INFO[method];
+  const methodConfig = config.methods.find((m) => m.method === method);
+  const confirmations = methodConfig?.requiredConfirmations ?? 0;
 
   async function run(body: Record<string, unknown>, success: string) {
     setBusy(true);
@@ -147,7 +190,12 @@ function DepositSection({
 
   async function createQuote(event: FormEvent) {
     event.preventDefault();
-    if (await run({ action: "create", amountUsd: amount.trim() }, "Payment details created. Send the exact BTC amount.")) {
+    if (
+      await run(
+        { action: "create", method: chosen, amountUsd: amount.trim() },
+        `Payment details created. Send the exact ${info.asset} amount.`,
+      )
+    ) {
       setAmount("");
     }
   }
@@ -165,33 +213,71 @@ function DepositSection({
     }
   }
 
-  const paymentUri = open ? `bitcoin:${open.btcAddress}?amount=${open.amountBtc}` : "";
+  const paymentUri = open ? info.qrPayload(open.depositAddress, open.amountCrypto) : "";
 
   return (
     <Card id="deposit">
       <SectionTitle
         eyebrow="Add money"
-        title="Deposit with Bitcoin"
+        title="Deposit with crypto"
         action={
-          <Badge tone="amber">
-            <Coins className="mr-1 h-3 w-3" /> Network: Bitcoin Mainnet (BTC)
+          <Badge tone={method === "usdt_trc20" ? "red" : "amber"}>
+            <Coins className="mr-1 h-3 w-3" /> Network: {info.networkLabel}
           </Badge>
         }
       />
 
-      {!config.btcAddress && !open && (
-        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800">
-          Bitcoin deposits are not available yet: the administrator has not configured a deposit address.
+      {!open && (
+        <div role="radiogroup" aria-label="Payment method" className="mb-5 grid gap-3 sm:grid-cols-2">
+          {config.methods.map((m) => {
+            const selected = m.method === chosen;
+            const available = Boolean(m.address) && m.enabled;
+            return (
+              <button
+                key={m.method}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                data-testid={`method-${m.method}`}
+                onClick={() => {
+                  setChosen(m.method);
+                  setError(null);
+                }}
+                className={`flex items-center gap-3 rounded-2xl border-2 p-4 text-left transition ${
+                  selected ? "border-[#7F00FF] bg-purple-50/60" : "border-slate-200 bg-white hover:border-purple-200"
+                }`}
+              >
+                <span
+                  className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-[12px] font-black ${
+                    m.method === "usdt_trc20" ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
+                  }`}
+                >
+                  {m.method === "usdt_trc20" ? "₮" : "₿"}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] font-black">{METHOD_INFO[m.method].name}</span>
+                  <span className="block text-[11px] text-slate-500">Network: {m.networkLabel}</span>
+                </span>
+                {!available && <Badge tone="slate">{m.address ? "Disabled" : "Unavailable"}</Badge>}
+              </button>
+            );
+          })}
         </div>
       )}
 
-      {config.btcAddress && !config.enabled && !open && (
+      {!open && !methodConfig?.address && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800" data-testid="method-unavailable">
+          {info.name} deposits are not available yet: the administrator has not configured a deposit address.
+        </div>
+      )}
+
+      {!open && methodConfig?.address && !methodConfig.enabled && (
         <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[13px] text-amber-800" data-testid="deposits-disabled">
-          Bitcoin deposits are temporarily disabled. Please try again later.
+          {info.name} deposits are temporarily disabled. Please try again later.
         </div>
       )}
 
-      {config.btcAddress && config.enabled && !open && (
+      {!open && methodConfig?.address && methodConfig.enabled && (
         <form onSubmit={createQuote} className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
             <label htmlFor="deposit-amount" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
@@ -211,8 +297,10 @@ function DepositSection({
               />
             </div>
             <p className="mt-2 text-[11px] text-slate-500">
-              Min {formatMoney(config.minUsd)} · max {formatMoney(config.maxUsd)}. The BTC amount is calculated from the live
-              BTC/USD price and locked for {config.quoteMinutes} minutes.
+              Min {formatMoney(config.minUsd)} · max {formatMoney(config.maxUsd)}.{" "}
+              {method === "usdt_trc20"
+                ? `1 USDT = 1 USD. A unique amount of cents (0.01–0.99) is added to identify your payment and is credited too. Valid for ${config.quoteMinutes} minutes.`
+                : `The BTC amount is calculated from the live BTC/USD price and locked for ${config.quoteMinutes} minutes.`}
             </p>
           </div>
           <button type="submit" disabled={busy || !amount} className={primaryButton}>
@@ -226,46 +314,50 @@ function DepositSection({
         <div className="grid gap-6 lg:grid-cols-[auto_1fr]">
           <div className="flex flex-col items-center gap-3">
             <div className="rounded-3xl border border-slate-100 p-3 shadow-sm">
-              <QrCode value={paymentUri} label="Bitcoin payment QR code" />
+              <QrCode value={paymentUri} label={`${info.name} payment QR code`} />
             </div>
-            <p className="text-center text-[11px] text-slate-500">Scan with your Bitcoin wallet</p>
+            <p className="text-center text-[11px] text-slate-500">
+              {method === "usdt_trc20" ? "Scan the address with a TRON (TRC20) wallet" : "Scan with your Bitcoin wallet"}
+            </p>
           </div>
 
           <div className="min-w-0 space-y-4">
             <div className="rounded-2xl bg-[#10152b] p-4 text-white">
               <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-white/50">Send exactly</p>
               <div className="mt-1 flex flex-wrap items-center gap-3">
-                <p className="break-all font-mono text-xl font-black sm:text-2xl" data-testid="btc-amount">
-                  {open.amountBtc} BTC
+                <p className="break-all font-mono text-xl font-black sm:text-2xl" data-testid="crypto-amount">
+                  {open.amountCrypto} {info.asset}
                 </p>
-                <CopyButton value={open.amountBtc} label="Copy amount" dark onCopied={(ok) => notify(ok ? { type: "ok", message: "Amount copied." } : { type: "error", message: "Could not copy." })} />
+                <CopyButton value={open.amountCrypto} label="Copy amount" dark onCopied={(ok) => notify(ok ? { type: "ok", message: "Amount copied." } : { type: "error", message: "Could not copy." })} />
               </div>
               <p className="mt-1 text-[12px] text-white/60">
-                = {formatMoney(open.amountUsd)} at {formatMoney(open.btcUsdRate)} / BTC ({open.amountSats.toLocaleString("en-US")} sats)
+                {method === "usdt_trc20"
+                  ? <>= {formatMoney(open.amountUsd)} credited · Tether USDT on TRON (TRC20)</>
+                  : <>= {formatMoney(open.amountUsd)} at {formatMoney(open.usdRate)} / BTC ({open.amountUnits.toLocaleString("en-US")} sats)</>}
               </p>
             </div>
 
             <div>
-              <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">To this Bitcoin (Mainnet) address</p>
+              <p className="mb-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500">
+                To this {method === "usdt_trc20" ? "USDT TRC20 (TRON network)" : "Bitcoin (Mainnet)"} address
+              </p>
               <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                <code className="min-w-0 flex-1 break-all text-[13px] font-bold text-slate-800" data-testid="btc-address">
-                  {open.btcAddress}
+                <code className="min-w-0 flex-1 break-all text-[13px] font-bold text-slate-800" data-testid="deposit-address">
+                  {open.depositAddress}
                 </code>
-                <CopyButton value={open.btcAddress} label="Copy address" onCopied={(ok) => notify(ok ? { type: "ok", message: "Address copied." } : { type: "error", message: "Could not copy." })} />
+                <CopyButton value={open.depositAddress} label="Copy address" onCopied={(ok) => notify(ok ? { type: "ok", message: "Address copied." } : { type: "error", message: "Could not copy." })} />
               </div>
             </div>
 
-            <ul className="space-y-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] leading-5 text-amber-900">
-              <li>• Send <b>exactly {open.amountBtc} BTC</b>. Pay the network fee on top; if your exchange deducts a withdrawal fee from the amount, add it so that exactly this amount arrives.</li>
-              <li>• Use the <b>Bitcoin network (Mainnet)</b> only. Payments on other networks (Lightning, BEP20, testnet…) cannot be recovered.</li>
-              <li>• Pay within <b><Countdown until={open.expiresAt} /></b> minutes. Reference: <span className="font-mono">{open.reference}</span>.</li>
-              <li>• Your balance is credited after {config.requiredConfirmations} network confirmations and an admin review.</li>
-            </ul>
+            <MethodWarning method={method} amountCrypto={open.amountCrypto} confirmations={confirmations} />
+            <p className="text-[12px] text-slate-600">
+              Pay within <b><Countdown until={open.expiresAt} /></b> minutes. Reference: <span className="font-mono">{open.reference}</span>.
+            </p>
 
             <form onSubmit={submitPayment} className="space-y-3">
               <div>
                 <label htmlFor="txid" className="mb-1.5 block text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                  Transaction ID (TXID) of your payment
+                  Transaction ID (TXID / hash) of your payment
                 </label>
                 <input
                   id="txid"
@@ -308,13 +400,16 @@ function DepositSection({
             <div className="min-w-0">
               <p className="text-[14px] font-black">Your payment request has been created successfully</p>
               <p className="mt-1 text-[12px] leading-5 text-slate-600">
-                It will be finalized after review by an admin. The payment is verified on the Bitcoin blockchain; your
-                balance is updated only after approval and you will get a notification.
+                It will be finalized after review by an admin. The payment is verified on the{" "}
+                {method === "usdt_trc20" ? "TRON blockchain" : "Bitcoin blockchain"}; your balance is updated only after
+                approval and you will get a notification.
               </p>
               <p className="mt-2"><Badge tone="purple">Status: Pending review</Badge></p>
               <dl className="mt-3 grid gap-x-6 gap-y-1 text-[12px] sm:grid-cols-2">
                 <div><dt className="inline text-slate-500">Reference: </dt><dd className="inline font-mono font-bold">{open.reference}</dd></div>
-                <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(open.amountUsd)} · {open.amountBtc} BTC</dd></div>
+                <div><dt className="inline text-slate-500">Method: </dt><dd className="inline font-bold">{info.name}</dd></div>
+                <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(open.amountUsd)} · {open.amountCrypto} {info.asset}</dd></div>
+                <div><dt className="inline text-slate-500">Network: </dt><dd className="inline font-bold">{info.networkLabel}</dd></div>
                 <div className="sm:col-span-2"><dt className="inline text-slate-500">TXID: </dt><dd className="inline break-all font-mono">{open.txid}</dd></div>
               </dl>
             </div>
@@ -335,8 +430,9 @@ function DepositSection({
             {data.deposits.map((deposit: Deposit) => (
               <li key={deposit.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 text-[12px]">
                 <span className="font-mono text-slate-500">{deposit.reference}</span>
+                <Badge tone={deposit.method === "usdt_trc20" ? "green" : "amber"}>{METHOD_INFO[deposit.method].short}</Badge>
                 <span className="font-bold">{formatMoney(deposit.amountUsd)}</span>
-                <span className="text-slate-500">{deposit.amountBtc} BTC</span>
+                <span className="text-slate-500">{deposit.amountCrypto} {deposit.asset}</span>
                 <span className="text-slate-400">{formatDate(deposit.createdAt)}</span>
                 {deposit.txid && <span className="font-mono text-slate-400">TXID {deposit.txid.slice(0, 10)}…</span>}
                 <span className="ml-auto"><Badge tone={STATUS_TONE[deposit.status]}>{DEPOSIT_STATUS_LABEL[deposit.status]}</Badge></span>

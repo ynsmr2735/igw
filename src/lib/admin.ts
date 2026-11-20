@@ -1,7 +1,15 @@
 import { getSessionToken } from "@/lib/auth/session";
 import { validateBitcoinAddress } from "@/lib/btc/address";
-import { verifyDeposit, type DepositVerification } from "@/lib/btc/chain";
+import { verifyBtcDeposit } from "@/lib/btc/chain";
+import {
+  toMethodConfig,
+  type DepositVerification,
+  type MethodConfig,
+  type PaymentMethod,
+} from "@/lib/payment-methods";
 import { AuthError, RpcError, rpc, serviceRpc } from "@/lib/supabase";
+import { USDT_TRC20_CONTRACT, validateTronAddress } from "@/lib/tron/address";
+import { verifyUsdtTrc20Deposit } from "@/lib/tron/chain";
 import { toDeposit, toTransaction, type Deposit, type Notification, type Transaction } from "@/lib/wallet";
 
 /** Every function here is re-checked in the database against admin_roles. */
@@ -20,6 +28,9 @@ export type AdminDepositDetail = AdminDeposit & {
 export type AdminOverview = {
   admin: { name: string; email: string; username: string | null };
   counts: {
+    /** Unread "new payment request" notifications of this admin. */
+    new: number;
+    byMethod: Record<PaymentMethod, { reviewing: number; approved: number; rejected: number }>;
     reviewing: number;
     awaitingPayment: number;
     approved: number;
@@ -31,12 +42,7 @@ export type AdminOverview = {
   unreadCount: number;
   auditLog: AuditEntry[];
   settings: {
-    enabled: boolean;
-    btcAddress: string | null;
-    btcAddressUpdatedAt: string | null;
-    btcAddressUpdatedBy: string | null;
-    network: "mainnet";
-    requiredConfirmations: number;
+    methods: MethodConfig[];
     minUsd: number;
     maxUsd: number;
     quoteMinutes: number;
@@ -79,7 +85,12 @@ export async function getAdminOverview(): Promise<AdminOverview> {
   const settings = raw.settings as Record<string, unknown>;
   return {
     admin: raw.admin as AdminOverview["admin"],
-    counts: Object.fromEntries(Object.entries(counts).map(([k, v]) => [k, Number(v)])) as AdminOverview["counts"],
+    counts: {
+      ...(Object.fromEntries(
+        Object.entries(counts).filter(([k]) => k !== "byMethod").map(([k, v]) => [k, Number(v)]),
+      ) as Omit<AdminOverview["counts"], "byMethod">),
+      byMethod: (counts.byMethod ?? {}) as AdminOverview["counts"]["byMethod"],
+    },
     notifications: ((raw.notifications as Record<string, unknown>[]) ?? []).map((n) => ({
       ...(n as unknown as Notification),
       id: Number(n.id),
@@ -91,12 +102,7 @@ export async function getAdminOverview(): Promise<AdminOverview> {
       id: Number(a.id),
     })),
     settings: {
-      enabled: settings.enabled !== false,
-      btcAddress: (settings.btcAddress as string | null) ?? null,
-      btcAddressUpdatedAt: (settings.btcAddressUpdatedAt as string | null) ?? null,
-      btcAddressUpdatedBy: (settings.btcAddressUpdatedBy as string | null) ?? null,
-      network: "mainnet",
-      requiredConfirmations: Number(settings.requiredConfirmations),
+      methods: ((settings.methods as Record<string, unknown>[]) ?? []).map(toMethodConfig),
       minUsd: Number(settings.minUsd),
       maxUsd: Number(settings.maxUsd),
       quoteMinutes: Number(settings.quoteMinutes),
@@ -123,20 +129,24 @@ export async function getDeposit(id: number): Promise<AdminDepositDetail> {
   };
 }
 
-/** Checks the request's TXID on the Bitcoin blockchain (read-only, changes nothing). */
+/**
+ * Checks the request's TXID on the blockchain of ITS payment method (Bitcoin
+ * mainnet or TRON mainnet + official USDT contract). Read-only, changes nothing.
+ * Always uses the address stored with the request, not the current setting.
+ */
 export async function checkDepositOnChain(id: number): Promise<DepositVerification> {
   const deposit = await getDeposit(id);
   if (!deposit.txid) throw new RpcError("The user has not submitted a transaction ID yet.");
-  return verifyDeposit(
-    {
-      txid: deposit.txid,
-      btcAddress: deposit.btcAddress,
-      amountSats: deposit.amountSats,
-      createdAt: deposit.createdAt,
-      expiresAt: deposit.expiresAt,
-    },
-    deposit.requiredConfirmations,
-  );
+  const input = {
+    txid: deposit.txid,
+    address: deposit.depositAddress,
+    amountUnits: deposit.amountUnits,
+    createdAt: deposit.createdAt,
+    expiresAt: deposit.expiresAt,
+  };
+  return deposit.method === "usdt_trc20"
+    ? verifyUsdtTrc20Deposit(input, deposit.requiredConfirmations)
+    : verifyBtcDeposit(input, deposit.requiredConfirmations);
 }
 
 /**
@@ -175,20 +185,38 @@ export async function listAllTransactions(): Promise<AdminTransaction[]> {
   }));
 }
 
-export async function setBtcAddress(address: string): Promise<string> {
-  const check = validateBitcoinAddress(address);
-  if (!check.valid) throw new RpcError(`Invalid Bitcoin mainnet address: ${check.reason}.`);
-  const result = await serviceRpc<{ btcAddress: string }>("igw_admin_set_btc_address", {
+/**
+ * Sets the deposit address of one method after a full checksum check
+ * (Bitcoin mainnet / TRON mainnet). New requests use it; existing requests
+ * keep the address they were shown.
+ */
+export async function setDepositAddress(method: PaymentMethod, address: string): Promise<string> {
+  let normalized: string;
+  if (method === "btc") {
+    const check = validateBitcoinAddress(address);
+    if (!check.valid) throw new RpcError(`Invalid Bitcoin mainnet address: ${check.reason}.`);
+    normalized = check.address;
+  } else {
+    const check = validateTronAddress(address);
+    if (!check.valid) throw new RpcError(`Invalid TRON (TRC20) address: ${check.reason}.`);
+    if (check.address === USDT_TRC20_CONTRACT) {
+      throw new RpcError("This is the USDT token contract, not a wallet address.");
+    }
+    normalized = check.address;
+  }
+  const result = await serviceRpc<{ address: string }>("igw_admin_set_deposit_address", {
     p_token: await token(),
-    p_address: check.address,
+    p_method: method,
+    p_address: normalized,
   });
-  return result.btcAddress;
+  return result.address;
 }
 
-/** Turns the BTC payment method on or off for members (recorded in the audit log). */
-export async function setDepositsEnabled(enabled: boolean): Promise<boolean> {
-  const result = await rpc<{ enabled: boolean }>("igw_admin_set_deposits_enabled", {
+/** Turns one payment method on or off for members (recorded in the audit log). */
+export async function setMethodEnabled(method: PaymentMethod, enabled: boolean): Promise<boolean> {
+  const result = await rpc<{ enabled: boolean }>("igw_admin_set_method_enabled", {
     p_token: await token(),
+    p_method: method,
     p_enabled: enabled,
   });
   return Boolean(result.enabled);

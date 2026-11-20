@@ -1,3 +1,5 @@
+import type { DepositVerification, VerificationSource } from "@/lib/payment-methods";
+
 /**
  * Verifies a BTC deposit against real Bitcoin MAINNET data from two independent
  * Esplora-compatible explorers (no API key):
@@ -23,35 +25,10 @@ type EsploraTx = {
   status: { confirmed: boolean; block_height?: number; block_time?: number };
 };
 
-export type SourceResult = {
-  source: string;
-  reachable: boolean;
-  found: boolean;
-  paidSats: number;
-  confirmed: boolean;
-  blockHeight: number | null;
-  blockTime: string | null;
-  confirmations: number;
-};
-
-export type DepositVerification = {
-  txid: string;
-  address: string;
-  expectedSats: number;
-  paidSats: number;
-  confirmations: number;
-  requiredConfirmations: number;
-  matched: boolean;
-  checks: { label: string; ok: boolean; detail: string }[];
-  sources: SourceResult[];
-  checkedAt: string;
-  network: "mainnet";
-};
-
 export type DepositToVerify = {
   txid: string;
-  btcAddress: string;
-  amountSats: number;
+  address: string;
+  amountUnits: number;
   createdAt: string;
   expiresAt: string;
 };
@@ -77,9 +54,9 @@ async function checkExplorer(
   explorer: (typeof EXPLORERS)[number],
   txid: string,
   address: string,
-): Promise<SourceResult> {
-  const empty: SourceResult = {
-    source: explorer.name, reachable: false, found: false, paidSats: 0,
+): Promise<VerificationSource> {
+  const empty: VerificationSource = {
+    source: explorer.name, reachable: false, found: false, paidUnits: 0,
     confirmed: false, blockHeight: null, blockTime: null, confirmations: 0,
   };
   try {
@@ -89,7 +66,7 @@ async function checkExplorer(
     const data = tx.body as EsploraTx;
     if (data.txid !== txid || !Array.isArray(data.vout)) return empty;
 
-    const paidSats = data.vout
+    const paidUnits = data.vout
       .filter((out) => out.scriptpubkey_address === address)
       .reduce((sum, out) => sum + (Number.isSafeInteger(out.value) ? out.value : 0), 0);
     const confirmed = Boolean(data.status?.confirmed);
@@ -105,7 +82,7 @@ async function checkExplorer(
       source: explorer.name,
       reachable: true,
       found: true,
-      paidSats,
+      paidUnits,
       confirmed,
       blockHeight: confirmed ? data.status.block_height ?? null : null,
       blockTime: confirmed && data.status.block_time ? new Date(data.status.block_time * 1000).toISOString() : null,
@@ -116,20 +93,20 @@ async function checkExplorer(
   }
 }
 
-export async function verifyDeposit(
+export async function verifyBtcDeposit(
   deposit: DepositToVerify,
   requiredConfirmations: number,
 ): Promise<DepositVerification> {
   const txid = deposit.txid.toLowerCase();
-  const sources = await Promise.all(EXPLORERS.map((e) => checkExplorer(e, txid, deposit.btcAddress)));
+  const sources = await Promise.all(EXPLORERS.map((e) => checkExplorer(e, txid, deposit.address)));
   const answered = sources.filter((s) => s.reachable);
   const found = sources.filter((s) => s.found);
 
-  const best = found.reduce<SourceResult | null>(
+  const best = found.reduce<VerificationSource | null>(
     (acc, s) => (!acc || s.confirmations > acc.confirmations ? s : acc),
     null,
   );
-  const paidSats = best?.paidSats ?? 0;
+  const paidUnits = best?.paidUnits ?? 0;
   const confirmations = found.length ? Math.min(...found.map((s) => s.confirmations)) : 0;
   const blockTime = best?.blockTime ? new Date(best.blockTime).getTime() : null;
   const created = new Date(deposit.createdAt).getTime();
@@ -152,18 +129,18 @@ export async function verifyDeposit(
     },
     {
       label: "Explorers agree",
-      ok: found.every((s) => s.paidSats === paidSats && s.confirmed === found[0].confirmed),
-      detail: found.map((s) => `${s.source}: ${s.paidSats} sats, ${s.confirmations} conf.`).join(" · ") || "—",
+      ok: found.every((s) => s.paidUnits === paidUnits && s.confirmed === found[0].confirmed),
+      detail: found.map((s) => `${s.source}: ${s.paidUnits} sats, ${s.confirmations} conf.`).join(" · ") || "—",
     },
     {
       label: "Pays the deposit address",
-      ok: paidSats > 0,
-      detail: paidSats > 0 ? deposit.btcAddress : `No output to ${deposit.btcAddress}`,
+      ok: paidUnits > 0,
+      detail: paidUnits > 0 ? deposit.address : `No output to ${deposit.address}`,
     },
     {
       label: "Exact amount",
-      ok: paidSats === deposit.amountSats,
-      detail: `Expected ${deposit.amountSats} sats, received ${paidSats} sats`,
+      ok: paidUnits === deposit.amountUnits,
+      detail: `Expected ${deposit.amountUnits} sats, received ${paidUnits} sats`,
     },
     {
       label: "Paid within the quote window",
@@ -182,16 +159,17 @@ export async function verifyDeposit(
   ];
 
   return {
+    method: "btc",
+    network: "mainnet",
     txid,
-    address: deposit.btcAddress,
-    expectedSats: deposit.amountSats,
-    paidSats,
+    address: deposit.address,
+    expectedUnits: deposit.amountUnits,
+    paidUnits,
     confirmations,
     requiredConfirmations,
     matched: checks.every((c) => c.ok),
     checks,
     sources,
     checkedAt: new Date().toISOString(),
-    network: "mainnet",
   };
 }

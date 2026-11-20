@@ -6,8 +6,8 @@
 -- * Sessions are random tokens; only their SHA-256 hash is stored.
 -- * The anon key can NOT touch any table. It can only call the igw_* functions
 --   below, which check the password or session token themselves.
--- * Functions that accept trusted data (BTC price, blockchain verification,
---   deposit address) can only be called with the secret service role key,
+-- * Functions that accept trusted data (BTC price / USDT rate, blockchain
+--   verification, deposit addresses) can only be called with the secret service role key,
 --   which only the server has (SUPABASE_SERVICE_ROLE_KEY).
 -- * Admins are listed in public.admin_roles; grant the role in the SQL Editor:
 --     select igw_private.grant_admin('admin-email@example.com', 'enkyryyss');
@@ -179,12 +179,13 @@ create table if not exists public.deposit_requests (
   reference text not null unique,
   user_id uuid not null references public.profiles(id) on delete cascade,
   account_number text not null,
+  method text not null default 'btc',
   amount_usd numeric(14, 2) not null check (amount_usd > 0),
-  btc_usd_rate numeric(16, 2) not null check (btc_usd_rate > 0),
+  usd_rate numeric(16, 2) not null check (usd_rate > 0),
   rate_source text not null,
-  amount_sats bigint not null check (amount_sats > 0),
-  btc_address text not null,
-  network text not null default 'mainnet' check (network = 'mainnet'),
+  amount_units bigint not null check (amount_units > 0),
+  deposit_address text not null,
+  network text not null default 'mainnet',
   status text not null default 'awaiting_payment'
     check (status in ('awaiting_payment', 'reviewing', 'approved', 'rejected', 'expired', 'cancelled')),
   txid text check (txid ~ '^[0-9a-f]{64}$'),
@@ -196,14 +197,45 @@ create table if not exists public.deposit_requests (
   verification jsonb,
   created_at timestamptz not null default now()
 );
+-- igw-rpc-5: BTC-specific columns become generic for every payment method
+-- (renamed in place, so existing requests keep all their data).
+do $$
+begin
+  if exists (select 1 from information_schema.columns
+             where table_schema = 'public' and table_name = 'deposit_requests' and column_name = 'amount_sats') then
+    alter table public.deposit_requests rename column amount_sats to amount_units;
+  end if;
+  if exists (select 1 from information_schema.columns
+             where table_schema = 'public' and table_name = 'deposit_requests' and column_name = 'btc_usd_rate') then
+    alter table public.deposit_requests rename column btc_usd_rate to usd_rate;
+  end if;
+  if exists (select 1 from information_schema.columns
+             where table_schema = 'public' and table_name = 'deposit_requests' and column_name = 'btc_address') then
+    alter table public.deposit_requests rename column btc_address to deposit_address;
+  end if;
+  if exists (select 1 from pg_constraint where conname = 'deposit_requests_amount_sats_check') then
+    alter table public.deposit_requests rename constraint deposit_requests_amount_sats_check to deposit_requests_amount_units_check;
+  end if;
+  if exists (select 1 from pg_constraint where conname = 'deposit_requests_btc_usd_rate_check') then
+    alter table public.deposit_requests rename constraint deposit_requests_btc_usd_rate_check to deposit_requests_usd_rate_check;
+  end if;
+end;
+$$;
+alter table public.deposit_requests add column if not exists method text not null default 'btc';
+alter table public.deposit_requests drop constraint if exists deposit_requests_network_check;
+alter table public.deposit_requests drop constraint if exists deposit_requests_method_check;
+alter table public.deposit_requests add constraint deposit_requests_method_check
+  check ((method = 'btc' and network = 'mainnet') or (method = 'usdt_trc20' and network = 'tron'));
+
 -- At most one open request per user, every TXID claimed once, and each open
--- request has a unique satoshi amount (so nobody can claim someone else's payment).
+-- request of a method has a unique amount (so nobody can claim someone else's payment).
 create unique index if not exists deposit_requests_one_open_per_user
   on public.deposit_requests(user_id) where status in ('awaiting_payment', 'reviewing');
 create unique index if not exists deposit_requests_txid_key
   on public.deposit_requests(txid) where txid is not null;
-create unique index if not exists deposit_requests_open_sats_key
-  on public.deposit_requests(amount_sats) where status in ('awaiting_payment', 'reviewing');
+drop index if exists public.deposit_requests_open_sats_key;
+create unique index if not exists deposit_requests_open_amount_key
+  on public.deposit_requests(method, amount_units) where status in ('awaiting_payment', 'reviewing');
 create index if not exists deposit_requests_status_idx on public.deposit_requests(status, created_at desc);
 create index if not exists deposit_requests_user_idx on public.deposit_requests(user_id, created_at desc);
 
@@ -290,6 +322,12 @@ create table if not exists public.admin_audit_log (
   created_at timestamptz not null default now()
 );
 create index if not exists admin_audit_log_time_idx on public.admin_audit_log(created_at desc);
+
+-- USDT TRC20 payment method (igw-rpc-5). The address is set by the admin.
+insert into public.app_settings (key, value) values
+  ('usdt_trc20_deposits_enabled', 'true'),
+  ('usdt_trc20_required_confirmations', '20')
+on conflict (key) do nothing;
 
 -- ---------------------------------------------------------------------------
 -- Migration from earlier versions (Supabase Auth / direct DATABASE_URL)
@@ -630,6 +668,64 @@ as $$
   select to_char(p_sats / 100000000.0, 'FM9999990.00000000');
 $$;
 
+-- Display amount: BTC with 8 decimals, USDT with 2 (amounts are whole cents).
+create or replace function igw_private.format_units(p_method text, p_units bigint)
+returns text
+language sql
+immutable
+as $$
+  select case p_method
+    when 'usdt_trc20' then to_char(p_units / 1000000.0, 'FM999999999990.00')
+    else to_char(p_units / 100000000.0, 'FM9999990.00000000')
+  end;
+$$;
+
+create or replace function igw_private.method_asset(p_method text)
+returns text
+language sql
+immutable
+as $$
+  select case p_method when 'usdt_trc20' then 'USDT' else 'BTC' end;
+$$;
+
+-- Settings keys per payment method.
+create or replace function igw_private.method_key(p_method text, p_what text)
+returns text
+language sql
+immutable
+as $$
+  select case p_method
+    when 'btc' then case p_what when 'address' then 'btc_address' when 'enabled' then 'btc_deposits_enabled'
+                                when 'confirmations' then 'btc_required_confirmations' end
+    when 'usdt_trc20' then case p_what when 'address' then 'usdt_trc20_address' when 'enabled' then 'usdt_trc20_deposits_enabled'
+                                       when 'confirmations' then 'usdt_trc20_required_confirmations' end
+  end;
+$$;
+
+create or replace function igw_private.method_config(p_method text)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_build_object(
+    'method', p_method,
+    'asset', igw_private.method_asset(p_method),
+    'name', case p_method when 'usdt_trc20' then 'Tether (USDT TRC20)' else 'Bitcoin (BTC)' end,
+    'network', case p_method when 'usdt_trc20' then 'tron' else 'mainnet' end,
+    'networkLabel', case p_method when 'usdt_trc20' then 'TRON (TRC20)' else 'Bitcoin Mainnet' end,
+    'enabled', coalesce(igw_private.setting(igw_private.method_key(p_method, 'enabled')), 'true') = 'true',
+    'address', igw_private.setting(igw_private.method_key(p_method, 'address')),
+    'addressUpdatedAt', (select updated_at from public.app_settings where key = igw_private.method_key(p_method, 'address')),
+    'addressUpdatedBy', (select coalesce(p.username, p.email) from public.app_settings s
+                         join public.profiles p on p.id = s.updated_by
+                         where s.key = igw_private.method_key(p_method, 'address')),
+    'requiredConfirmations', igw_private.setting(igw_private.method_key(p_method, 'confirmations'))::int,
+    'decimals', case p_method when 'usdt_trc20' then 6 else 8 end
+  );
+$$;
+
 create or replace function igw_private.deposit_json(d public.deposit_requests)
 returns jsonb
 language sql
@@ -638,15 +734,17 @@ as $$
   select jsonb_build_object(
     'id', d.id,
     'reference', d.reference,
+    'method', d.method,
+    'asset', igw_private.method_asset(d.method),
+    'network', d.network,
     'accountNumber', d.account_number,
     'userName', d.user_name,
     'amountUsd', d.amount_usd,
-    'btcUsdRate', d.btc_usd_rate,
+    'usdRate', d.usd_rate,
     'rateSource', d.rate_source,
-    'amountSats', d.amount_sats,
-    'amountBtc', igw_private.format_btc(d.amount_sats),
-    'btcAddress', d.btc_address,
-    'network', d.network,
+    'amountUnits', d.amount_units,
+    'amountCrypto', igw_private.format_units(d.method, d.amount_units),
+    'depositAddress', d.deposit_address,
     'status', d.status,
     'txid', d.txid,
     'expiresAt', d.expires_at,
@@ -800,6 +898,10 @@ on conflict (user_id) do nothing;
 -- Removed: the old demo "wallet action" (top up / withdraw / exchange) could
 -- create balance out of nothing.
 drop function if exists public.igw_wallet_action(text, text, numeric, bigint, bigint, bigint, bigint, text, text);
+-- igw-rpc-5: BTC-only functions replaced by payment-method-aware ones.
+drop function if exists public.igw_deposit_create(text, numeric, numeric, text);
+drop function if exists public.igw_admin_set_btc_address(text, text);
+drop function if exists public.igw_admin_set_deposits_enabled(text, boolean);
 
 create or replace function public.igw_health()
 returns jsonb
@@ -808,7 +910,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-4');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-5');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1017,13 +1119,9 @@ begin
       limit 1
     ),
     'depositConfig', jsonb_build_object(
-      'enabled', coalesce(igw_private.setting('btc_deposits_enabled'), 'true') = 'true',
-      'btcAddress', igw_private.setting('btc_address'),
-      'addressUpdatedAt', (select updated_at from public.app_settings where key = 'btc_address'),
-      'network', 'mainnet',
+      'methods', jsonb_build_array(igw_private.method_config('btc'), igw_private.method_config('usdt_trc20')),
       'minUsd', igw_private.setting('deposit_min_usd')::numeric,
       'maxUsd', igw_private.setting('deposit_max_usd')::numeric,
-      'requiredConfirmations', igw_private.setting('btc_required_confirmations')::int,
       'quoteMinutes', igw_private.setting('deposit_quote_minutes')::int
     ),
     'flows', (
@@ -1066,8 +1164,10 @@ $$;
 
 -- SERVICE ROLE ONLY: the BTC/USD rate comes from the server, which fetched it
 -- from the price APIs. The anon key must never be able to choose the rate.
+-- SERVICE ROLE ONLY: the USD rate comes from the server (BTC: price APIs;
+-- USDT: 1.00). The anon key must never be able to choose the rate.
 create or replace function public.igw_deposit_create(
-  p_token text, p_amount_usd numeric, p_btc_usd_rate numeric, p_rate_source text
+  p_token text, p_method text, p_amount_usd numeric, p_usd_rate numeric, p_rate_source text
 )
 returns jsonb
 language plpgsql
@@ -1076,21 +1176,29 @@ set search_path = public, extensions
 as $$
 declare
   v_uid uuid := igw_private.require_user(p_token);
-  v_address text := igw_private.setting('btc_address');
+  v_method text := coalesce(p_method, '');
+  v_address text;
   v_min numeric := igw_private.setting('deposit_min_usd')::numeric;
   v_max numeric := igw_private.setting('deposit_max_usd')::numeric;
   v_minutes integer := igw_private.setting('deposit_quote_minutes')::integer;
   v_amount numeric(14, 2);
-  v_sats bigint;
+  v_units bigint;
+  v_base bigint;
+  v_cents integer;
   v_request public.deposit_requests%rowtype;
 begin
+  if v_method not in ('btc', 'usdt_trc20') then
+    raise exception 'Unknown payment method.';
+  end if;
   perform igw_private.expire_deposits();
+  v_address := igw_private.setting(igw_private.method_key(v_method, 'address'));
 
   if v_address is null then
-    raise exception 'Bitcoin deposits are not available yet: no deposit address has been configured.';
+    raise exception '% deposits are not available yet: no deposit address has been configured.',
+      igw_private.method_asset(v_method);
   end if;
-  if coalesce(igw_private.setting('btc_deposits_enabled'), 'true') <> 'true' then
-    raise exception 'Bitcoin deposits are temporarily disabled. Please try again later.';
+  if coalesce(igw_private.setting(igw_private.method_key(v_method, 'enabled')), 'true') <> 'true' then
+    raise exception '% deposits are temporarily disabled. Please try again later.', igw_private.method_asset(v_method);
   end if;
   if p_amount_usd is null or p_amount_usd <> round(p_amount_usd, 2) then
     raise exception 'Enter an amount in USD with at most 2 decimal places.';
@@ -1099,29 +1207,52 @@ begin
   if v_amount < v_min or v_amount > v_max then
     raise exception 'Deposit amount must be between % and % USD.', v_min, v_max;
   end if;
-  if p_btc_usd_rate is null or p_btc_usd_rate < 1000 or p_btc_usd_rate > 10000000 then
-    raise exception 'The BTC price could not be determined. Please try again.';
-  end if;
   if exists (select 1 from public.deposit_requests
              where user_id = v_uid and status in ('awaiting_payment', 'reviewing')) then
     raise exception 'You already have an open deposit request. Complete or cancel it first.';
   end if;
 
-  -- Exact satoshi amount, made unique among open requests so each payment
-  -- can be matched to exactly one request.
-  v_sats := ceil(v_amount * 100000000 / p_btc_usd_rate);
-  while exists (select 1 from public.deposit_requests
-                where amount_sats = v_sats and status in ('awaiting_payment', 'reviewing')) loop
-    v_sats := v_sats + 1;
-  end loop;
+  if v_method = 'btc' then
+    if p_usd_rate is null or p_usd_rate < 1000 or p_usd_rate > 10000000 then
+      raise exception 'The BTC price could not be determined. Please try again.';
+    end if;
+    -- Exact satoshi amount, unique among open BTC requests.
+    v_units := ceil(v_amount * 100000000 / p_usd_rate);
+    while exists (select 1 from public.deposit_requests
+                  where method = 'btc' and amount_units = v_units and status in ('awaiting_payment', 'reviewing')) loop
+      v_units := v_units + 1;
+    end loop;
+  else
+    if p_usd_rate is distinct from 1 then
+      raise exception 'Invalid USDT rate.';
+    end if;
+    -- USDT is credited 1:1. A unique cent amount (0.01–0.99) is added so each
+    -- payment matches exactly one open request; the member is credited the
+    -- exact amount sent.
+    v_base := (v_amount * 1000000)::bigint;
+    v_units := null;
+    for v_cents in 1..99 loop
+      if not exists (select 1 from public.deposit_requests
+                     where method = 'usdt_trc20' and amount_units = v_base + v_cents * 10000
+                       and status in ('awaiting_payment', 'reviewing')) then
+        v_units := v_base + v_cents * 10000;
+        exit;
+      end if;
+    end loop;
+    if v_units is null then
+      raise exception 'Too many open requests for this amount. Please try a slightly different amount.';
+    end if;
+    v_amount := v_units / 1000000.0;
+  end if;
 
   insert into public.deposit_requests (
-    reference, user_id, account_number, user_name, amount_usd, btc_usd_rate, rate_source,
-    amount_sats, btc_address, expires_at
+    reference, user_id, account_number, user_name, method, network, amount_usd, usd_rate, rate_source,
+    amount_units, deposit_address, expires_at
   )
-  select igw_private.new_reference('DEP'), v_uid, p.account_number, p.full_name, v_amount,
-         round(p_btc_usd_rate, 2), left(coalesce(p_rate_source, 'unknown'), 80),
-         v_sats, v_address, now() + make_interval(mins => v_minutes)
+  select igw_private.new_reference('DEP'), v_uid, p.account_number, p.full_name, v_method,
+         case v_method when 'usdt_trc20' then 'tron' else 'mainnet' end,
+         v_amount, round(p_usd_rate, 2), left(coalesce(p_rate_source, 'unknown'), 80),
+         v_units, v_address, now() + make_interval(mins => v_minutes)
   from public.profiles p
   where p.id = v_uid
   returning * into v_request;
@@ -1184,17 +1315,20 @@ begin
     wallet_id, type, direction, amount, currency, counterparty, note, status,
     reference, description, deposit_request_id
   ) values (
-    v_wallet_id, 'deposit', 'in', v_request.amount_usd, 'USD', 'Bitcoin (BTC)', '', 'pending',
-    v_request.reference, 'BTC deposit · ' || igw_private.format_btc(v_request.amount_sats) || ' BTC',
+    v_wallet_id, 'deposit', 'in', v_request.amount_usd, 'USD',
+    case v_request.method when 'usdt_trc20' then 'Tether (USDT TRC20)' else 'Bitcoin (BTC)' end, '', 'pending',
+    v_request.reference,
+    igw_private.method_asset(v_request.method) || ' deposit · '
+      || igw_private.format_units(v_request.method, v_request.amount_units) || ' ' || igw_private.method_asset(v_request.method),
     v_request.id
   );
 
   perform igw_private.notify_admins(
     'deposit_submitted',
-    'New BTC deposit request',
-    format('%s (account %s) reports a payment of %s USD / %s BTC.',
+    format('New %s payment request', case v_request.method when 'usdt_trc20' then 'USDT TRC20' else 'BTC' end),
+    format('%s (account %s) reports a payment of %s USD / %s %s.',
            v_profile.full_name, v_profile.account_number, v_request.amount_usd,
-           igw_private.format_btc(v_request.amount_sats)),
+           igw_private.format_units(v_request.method, v_request.amount_units), igw_private.method_asset(v_request.method)),
     jsonb_build_object(
       'requestId', v_request.id,
       'reference', v_request.reference,
@@ -1202,7 +1336,10 @@ begin
       'accountNumber', v_profile.account_number,
       'email', v_profile.email,
       'amountUsd', v_request.amount_usd,
-      'amountBtc', igw_private.format_btc(v_request.amount_sats),
+      'method', v_request.method,
+      'asset', igw_private.method_asset(v_request.method),
+      'amountCrypto', igw_private.format_units(v_request.method, v_request.amount_units),
+      'depositAddress', v_request.deposit_address,
       'txid', v_request.txid,
       'createdAt', v_request.created_at,
       'submittedAt', v_request.submitted_at,
@@ -1439,6 +1576,13 @@ begin
     'admin', (select jsonb_build_object('name', full_name, 'email', email, 'username', username)
               from public.profiles where id = v_admin),
     'counts', jsonb_build_object(
+      'new', (select count(*) from public.notifications
+              where user_id = v_admin and kind = 'deposit_submitted' and read_at is null),
+      'byMethod', (select jsonb_object_agg(m.method, jsonb_build_object(
+                     'reviewing', (select count(*) from public.deposit_requests d where d.method = m.method and d.status = 'reviewing'),
+                     'approved', (select count(*) from public.deposit_requests d where d.method = m.method and d.status = 'approved'),
+                     'rejected', (select count(*) from public.deposit_requests d where d.method = m.method and d.status = 'rejected')))
+                   from (values ('btc'), ('usdt_trc20')) m(method)),
       'reviewing', (select count(*) from public.deposit_requests where status = 'reviewing'),
       'awaitingPayment', (select count(*) from public.deposit_requests where status = 'awaiting_payment'),
       'approved', (select count(*) from public.deposit_requests where status = 'approved'),
@@ -1463,13 +1607,7 @@ begin
       from (select * from public.admin_audit_log order by created_at desc, id desc limit 100) a
     ), '[]'::jsonb),
     'settings', jsonb_build_object(
-      'enabled', coalesce(igw_private.setting('btc_deposits_enabled'), 'true') = 'true',
-      'btcAddress', igw_private.setting('btc_address'),
-      'btcAddressUpdatedAt', (select updated_at from public.app_settings where key = 'btc_address'),
-      'btcAddressUpdatedBy', (select coalesce(p.username, p.email) from public.app_settings s
-                              join public.profiles p on p.id = s.updated_by where s.key = 'btc_address'),
-      'network', 'mainnet',
-      'requiredConfirmations', igw_private.setting('btc_required_confirmations')::int,
+      'methods', jsonb_build_array(igw_private.method_config('btc'), igw_private.method_config('usdt_trc20')),
       'minUsd', igw_private.setting('deposit_min_usd')::numeric,
       'maxUsd', igw_private.setting('deposit_max_usd')::numeric,
       'quoteMinutes', igw_private.setting('deposit_quote_minutes')::int
@@ -1516,7 +1654,7 @@ begin
     raise exception 'Deposit request not found.';
   end if;
   return igw_private.admin_deposit_row(v_request) || jsonb_build_object(
-    'requiredConfirmations', igw_private.setting('btc_required_confirmations')::int,
+    'requiredConfirmations', igw_private.setting(igw_private.method_key(v_request.method, 'confirmations'))::int,
     'userTransactions', coalesce((
       select jsonb_agg(igw_private.transaction_json(t) order by t.created_at desc, t.id desc)
       from (select tx.* from public.transactions tx
@@ -1528,9 +1666,10 @@ begin
 end;
 $$;
 
--- SERVICE ROLE ONLY + admin session. The server re-checks the payment on the
--- blockchain right before calling this; the function verifies that the
--- reported result matches this exact request and needed confirmations.
+-- SERVICE ROLE ONLY + admin session. The admin approves manually, but only a
+-- payment verified on its own blockchain right before this call: the server
+-- re-checks it, and this function verifies the result matches this exact
+-- request (method, address, exact amount, token contract, confirmations).
 -- Row lock + status check make a second approval impossible.
 create or replace function public.igw_admin_approve(p_token text, p_id bigint, p_verification jsonb)
 returns jsonb
@@ -1541,7 +1680,7 @@ as $$
 declare
   v_admin uuid := igw_private.require_admin(p_token);
   v_request public.deposit_requests%rowtype;
-  v_required integer := igw_private.setting('btc_required_confirmations')::integer;
+  v_required integer;
   v_wallet public.wallets%rowtype;
 begin
   select * into v_request from public.deposit_requests where id = p_id for update;
@@ -1554,12 +1693,16 @@ begin
   if v_request.status <> 'reviewing' then
     raise exception 'Only deposits under review can be approved (status: %).', replace(v_request.status, '_', ' ');
   end if;
+  v_required := igw_private.setting(igw_private.method_key(v_request.method, 'confirmations'))::integer;
   if p_verification is null
      or coalesce((p_verification->>'matched')::boolean, false) is not true
+     or p_verification->>'method' is distinct from v_request.method
      or p_verification->>'txid' is distinct from v_request.txid
-     or p_verification->>'address' is distinct from v_request.btc_address
-     or coalesce((p_verification->>'paidSats')::bigint, -1) <> v_request.amount_sats
-     or coalesce((p_verification->>'confirmations')::integer, 0) < v_required then
+     or p_verification->>'address' is distinct from v_request.deposit_address
+     or coalesce((p_verification->>'paidUnits')::bigint, -1) <> v_request.amount_units
+     or coalesce((p_verification->>'confirmations')::integer, 0) < v_required
+     or (v_request.method = 'usdt_trc20'
+         and p_verification->>'contract' is distinct from 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t') then
     raise exception 'Blockchain verification does not match this request. The deposit was not approved.';
   end if;
 
@@ -1576,8 +1719,11 @@ begin
       wallet_id, type, direction, amount, currency, counterparty, note, status,
       reference, description, deposit_request_id
     ) values (
-      v_wallet.id, 'deposit', 'in', v_request.amount_usd, 'USD', 'Bitcoin (BTC)', '', 'completed',
-      v_request.reference, 'BTC deposit · ' || igw_private.format_btc(v_request.amount_sats) || ' BTC',
+      v_wallet.id, 'deposit', 'in', v_request.amount_usd, 'USD',
+      case v_request.method when 'usdt_trc20' then 'Tether (USDT TRC20)' else 'Bitcoin (BTC)' end, '', 'completed',
+      v_request.reference,
+      igw_private.method_asset(v_request.method) || ' deposit · '
+        || igw_private.format_units(v_request.method, v_request.amount_units) || ' ' || igw_private.method_asset(v_request.method),
       v_request.id
     );
   end if;
@@ -1592,8 +1738,8 @@ begin
   where kind = 'deposit_submitted' and read_at is null and (data->>'requestId')::bigint = v_request.id;
 
   perform igw_private.audit(v_admin, 'deposit_approved', 'deposit_request', v_request.reference,
-    jsonb_build_object('requestId', v_request.id, 'accountNumber', v_request.account_number,
-                       'amountUsd', v_request.amount_usd, 'amountSats', v_request.amount_sats,
+    jsonb_build_object('requestId', v_request.id, 'method', v_request.method, 'accountNumber', v_request.account_number,
+                       'amountUsd', v_request.amount_usd, 'amountUnits', v_request.amount_units,
                        'txid', v_request.txid, 'confirmations', p_verification->'confirmations'));
   perform igw_private.notify(
     v_request.user_id, 'deposit_approved', 'Payment approved',
@@ -1641,7 +1787,7 @@ begin
   where kind = 'deposit_submitted' and read_at is null and (data->>'requestId')::bigint = v_request.id;
 
   perform igw_private.audit(v_admin, 'deposit_rejected', 'deposit_request', v_request.reference,
-    jsonb_build_object('requestId', v_request.id, 'accountNumber', v_request.account_number,
+    jsonb_build_object('requestId', v_request.id, 'method', v_request.method, 'accountNumber', v_request.account_number,
                        'amountUsd', v_request.amount_usd, 'txid', v_request.txid, 'reason', v_reason));
   perform igw_private.notify(
     v_request.user_id, 'deposit_rejected', 'Payment rejected',
@@ -1676,7 +1822,9 @@ $$;
 
 -- SERVICE ROLE ONLY: the server validates the address checksum (mainnet only)
 -- before calling. Open requests keep the address they were shown.
-create or replace function public.igw_admin_set_btc_address(p_token text, p_address text)
+-- SERVICE ROLE ONLY: the server validates the address checksum (BTC mainnet /
+-- TRON mainnet) before calling. Requests already created keep their address.
+create or replace function public.igw_admin_set_deposit_address(p_token text, p_method text, p_address text)
 returns jsonb
 language plpgsql
 security definer
@@ -1684,29 +1832,39 @@ set search_path = public, extensions
 as $$
 declare
   v_admin uuid := igw_private.require_admin(p_token);
+  v_method text := coalesce(p_method, '');
+  v_key text := igw_private.method_key(p_method, 'address');
   v_address text := trim(coalesce(p_address, ''));
-  v_previous text := igw_private.setting('btc_address');
+  v_previous text;
 begin
-  if v_address !~ '^(bc1[02-9ac-hj-np-z]{11,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$' then
-    raise exception 'Enter a valid Bitcoin mainnet address.';
+  if v_key is null then
+    raise exception 'Unknown payment method.';
   end if;
+  if (v_method = 'btc' and v_address !~ '^(bc1[02-9ac-hj-np-z]{11,87}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$')
+     or (v_method = 'usdt_trc20' and v_address !~ '^T[1-9A-HJ-NP-Za-km-z]{33}$') then
+    raise exception 'Enter a valid % address.', case v_method when 'usdt_trc20' then 'TRON (TRC20)' else 'Bitcoin mainnet' end;
+  end if;
+  if v_method = 'usdt_trc20' and v_address = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t' then
+    raise exception 'This is the USDT token contract, not a wallet address.';
+  end if;
+  v_previous := igw_private.setting(v_key);
   insert into public.app_settings (key, value, updated_at, updated_by)
-  values ('btc_address', v_address, now(), v_admin)
+  values (v_key, v_address, now(), v_admin)
   on conflict (key) do update set value = excluded.value, updated_at = now(), updated_by = v_admin;
 
-  perform igw_private.audit(v_admin, 'btc_address_changed', 'setting', 'btc_address',
-    jsonb_build_object('previous', v_previous, 'new', v_address));
+  perform igw_private.audit(v_admin, 'deposit_address_changed', 'setting', v_key,
+    jsonb_build_object('method', v_method, 'previous', v_previous, 'new', v_address));
   perform igw_private.notify_admins(
-    'settings_changed', 'BTC deposit address changed',
-    format('The deposit address was set to %s by %s.', v_address,
+    'settings_changed', format('%s deposit address changed', igw_private.method_asset(v_method)),
+    format('The %s deposit address was set to %s by %s.', igw_private.method_asset(v_method), v_address,
            (select coalesce(username, email) from public.profiles where id = v_admin)),
-    jsonb_build_object('btcAddress', v_address)
+    jsonb_build_object('method', v_method, 'address', v_address)
   );
-  return jsonb_build_object('ok', true, 'btcAddress', v_address);
+  return jsonb_build_object('ok', true, 'method', v_method, 'address', v_address);
 end;
 $$;
 
-create or replace function public.igw_admin_set_deposits_enabled(p_token text, p_enabled boolean)
+create or replace function public.igw_admin_set_method_enabled(p_token text, p_method text, p_enabled boolean)
 returns jsonb
 language plpgsql
 security definer
@@ -1714,14 +1872,18 @@ set search_path = public, extensions
 as $$
 declare
   v_admin uuid := igw_private.require_admin(p_token);
+  v_key text := igw_private.method_key(p_method, 'enabled');
   v_value text := case when coalesce(p_enabled, false) then 'true' else 'false' end;
 begin
+  if v_key is null then
+    raise exception 'Unknown payment method.';
+  end if;
   insert into public.app_settings (key, value, updated_at, updated_by)
-  values ('btc_deposits_enabled', v_value, now(), v_admin)
+  values (v_key, v_value, now(), v_admin)
   on conflict (key) do update set value = excluded.value, updated_at = now(), updated_by = v_admin;
-  perform igw_private.audit(v_admin, case when v_value = 'true' then 'btc_deposits_enabled' else 'btc_deposits_disabled' end,
-    'setting', 'btc_deposits_enabled', jsonb_build_object('enabled', v_value = 'true'));
-  return jsonb_build_object('ok', true, 'enabled', v_value = 'true');
+  perform igw_private.audit(v_admin, case when v_value = 'true' then 'deposits_enabled' else 'deposits_disabled' end,
+    'setting', v_key, jsonb_build_object('method', p_method, 'enabled', v_value = 'true'));
+  return jsonb_build_object('ok', true, 'method', p_method, 'enabled', v_value = 'true');
 end;
 $$;
 
@@ -1750,15 +1912,15 @@ declare
     'public.igw_admin_deposits(text, text, integer)',
     'public.igw_admin_deposit(text, bigint)',
     'public.igw_admin_reject(text, bigint, text)',
-    'public.igw_admin_set_deposits_enabled(text, boolean)',
+    'public.igw_admin_set_method_enabled(text, text, boolean)',
     'public.igw_admin_transactions(text, integer)'
   ];
   -- Trusted inputs (BTC price, blockchain verification, deposit address):
   -- callable only with the secret service role key held by the server.
   service_functions text[] := array[
-    'public.igw_deposit_create(text, numeric, numeric, text)',
+    'public.igw_deposit_create(text, text, numeric, numeric, text)',
     'public.igw_admin_approve(text, bigint, jsonb)',
-    'public.igw_admin_set_btc_address(text, text)'
+    'public.igw_admin_set_deposit_address(text, text, text)'
   ];
 begin
   foreach f in array anon_functions || service_functions loop

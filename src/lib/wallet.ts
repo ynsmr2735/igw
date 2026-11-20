@@ -1,6 +1,7 @@
 import { getSessionToken } from "@/lib/auth/session";
 import { getBtcUsdPrice } from "@/lib/btc/price";
-import { AuthError, rpc, serviceRpc } from "@/lib/supabase";
+import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
+import { AuthError, RpcError, rpc, serviceRpc } from "@/lib/supabase";
 
 export { formatDate, formatMoney, initialsOf } from "./format";
 
@@ -15,14 +16,20 @@ export type DepositStatus =
 export type Deposit = {
   id: number;
   reference: string;
+  method: PaymentMethod;
+  asset: "BTC" | "USDT";
+  network: "mainnet" | "tron";
   accountNumber: string;
   amountUsd: number;
-  btcUsdRate: number;
+  /** USD per coin at quote time (BTC price; 1.00 for USDT). */
+  usdRate: number;
   rateSource: string;
-  amountSats: number;
-  amountBtc: string;
-  btcAddress: string;
-  network: "mainnet";
+  /** Smallest units: satoshis (BTC) or micro-USDT (6 decimals). */
+  amountUnits: number;
+  /** Amount to send, as text (BTC 8 decimals, USDT 2). */
+  amountCrypto: string;
+  /** Address shown for THIS request (kept even if the admin changes the address later). */
+  depositAddress: string;
   status: DepositStatus;
   txid: string | null;
   expiresAt: string;
@@ -59,14 +66,10 @@ export type Notification = {
 };
 
 export type DepositConfig = {
-  /** Payment method switched on in the admin panel. */
-  enabled: boolean;
-  btcAddress: string | null;
-  addressUpdatedAt: string | null;
-  network: "mainnet";
+  /** BTC and USDT TRC20, each with its own address and on/off switch. */
+  methods: MethodConfig[];
   minUsd: number;
   maxUsd: number;
-  requiredConfirmations: number;
   quoteMinutes: number;
 };
 
@@ -110,9 +113,14 @@ export function toDeposit(raw: Record<string, unknown>): Deposit {
   return {
     ...(raw as unknown as Deposit),
     id: num(raw.id),
+    method: raw.method === "usdt_trc20" ? "usdt_trc20" : "btc",
+    asset: raw.method === "usdt_trc20" ? "USDT" : "BTC",
+    network: raw.method === "usdt_trc20" ? "tron" : "mainnet",
     amountUsd: num(raw.amountUsd),
-    btcUsdRate: num(raw.btcUsdRate),
-    amountSats: num(raw.amountSats),
+    usdRate: num(raw.usdRate),
+    amountUnits: num(raw.amountUnits),
+    amountCrypto: String(raw.amountCrypto ?? ""),
+    depositAddress: String(raw.depositAddress ?? ""),
   };
 }
 
@@ -171,13 +179,9 @@ export async function getDashboardData(): Promise<DashboardData | null> {
     deposits: ((data.deposits as Record<string, unknown>[]) ?? []).map(toDeposit),
     openDeposit: data.openDeposit ? toDeposit(data.openDeposit as Record<string, unknown>) : null,
     depositConfig: {
-      enabled: config.enabled !== false,
-      btcAddress: (config.btcAddress as string | null) ?? null,
-      addressUpdatedAt: (config.addressUpdatedAt as string | null) ?? null,
-      network: "mainnet",
+      methods: ((config.methods as Record<string, unknown>[]) ?? []).map(toMethodConfig),
       minUsd: num(config.minUsd),
       maxUsd: num(config.maxUsd),
-      requiredConfirmations: num(config.requiredConfirmations),
       quoteMinutes: num(config.quoteMinutes),
     },
     stats: { moneyIn: num(flows.moneyIn), moneyOut: num(flows.moneyOut) },
@@ -186,15 +190,27 @@ export async function getDashboardData(): Promise<DashboardData | null> {
 
 /* ---------------- deposits ---------------- */
 
-/** Creates a payment quote. The BTC price is fetched here, on the server, never taken from the browser. */
-export async function createDeposit(amountUsd: number): Promise<Deposit> {
+/**
+ * Creates a payment request. The rate is decided here, on the server, never
+ * taken from the browser: BTC uses the live BTC/USD price, USDT is 1:1.
+ */
+export async function createDeposit(method: PaymentMethod, amountUsd: number): Promise<Deposit> {
   const token = await requireToken();
-  const price = await getBtcUsdPrice();
+  let rate = 1;
+  let source = "USDT 1:1";
+  if (method === "btc") {
+    const price = await getBtcUsdPrice();
+    rate = price.rate;
+    source = price.source;
+  } else if (method !== "usdt_trc20") {
+    throw new RpcError("Unknown payment method.");
+  }
   const raw = await serviceRpc<Record<string, unknown>>("igw_deposit_create", {
     p_token: token,
+    p_method: method,
     p_amount_usd: amountUsd,
-    p_btc_usd_rate: price.rate,
-    p_rate_source: price.source,
+    p_usd_rate: rate,
+    p_rate_source: source,
   });
   return toDeposit(raw);
 }

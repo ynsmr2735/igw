@@ -8,9 +8,10 @@ import {
   listDeposits,
   markAdminNotificationsRead,
   rejectDeposit,
-  setBtcAddress,
-  setDepositsEnabled,
+  setDepositAddress,
+  setMethodEnabled,
 } from "@/lib/admin";
+import { isPaymentMethod } from "@/lib/payment-methods";
 
 export const dynamic = "force-dynamic";
 
@@ -50,11 +51,15 @@ export async function POST(request: Request) {
       }
       case "transactions":
         return Response.json({ ok: true, transactions: await listAllTransactions() });
-      case "setBtcAddress":
-        return Response.json({ ok: true, btcAddress: await setBtcAddress(String(body.address ?? "")) });
-      case "setDepositsEnabled": {
+      case "setDepositAddress": {
+        if (!isPaymentMethod(body.method)) return Response.json({ error: "Unknown payment method" }, { status: 400 });
+        const address = await setDepositAddress(body.method, String(body.address ?? ""));
+        return Response.json({ ok: true, method: body.method, address });
+      }
+      case "setMethodEnabled": {
+        if (!isPaymentMethod(body.method)) return Response.json({ error: "Unknown payment method" }, { status: 400 });
         if (typeof body.enabled !== "boolean") return Response.json({ error: "enabled must be true or false" }, { status: 400 });
-        return Response.json({ ok: true, enabled: await setDepositsEnabled(body.enabled) });
+        return Response.json({ ok: true, method: body.method, enabled: await setMethodEnabled(body.method, body.enabled) });
       }
       case "readNotifications": {
         const ids = Array.isArray(body.ids) ? body.ids.map(toId).filter((id): id is number => id !== null) : null;

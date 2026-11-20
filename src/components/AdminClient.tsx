@@ -24,7 +24,7 @@ import {
 import { Brand } from "@/components/Brand";
 import { signOutAction } from "@/app/auth/actions";
 import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminTransaction, AuditEntry } from "@/lib/admin";
-import type { DepositVerification } from "@/lib/btc/chain";
+import { METHOD_INFO, methodInfo, type DepositVerification, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import {
   DEPOSIT_STATUS_LABEL,
   TX_STATUS_LABEL,
@@ -40,9 +40,9 @@ type View = "notifications" | "deposits" | "transactions" | "settings" | "audit"
 
 const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "notifications", label: "Notifications", icon: Bell },
-  { id: "deposits", label: "BTC payment requests", icon: Inbox },
+  { id: "deposits", label: "Payment requests", icon: Inbox },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
-  { id: "settings", label: "BTC payment settings", icon: Settings },
+  { id: "settings", label: "Payment methods", icon: Settings },
   { id: "audit", label: "Audit log", icon: History },
 ];
 
@@ -54,7 +54,18 @@ const FILTERS: { id: string | null; label: string }[] = [
   { id: "awaiting_payment", label: "Awaiting payment" },
 ];
 
+const METHOD_FILTERS: { id: PaymentMethod | null; label: string }[] = [
+  { id: null, label: "All methods" },
+  { id: "btc", label: "BTC" },
+  { id: "usdt_trc20", label: "USDT TRC20" },
+];
+
+const methodName = (method: unknown) => (method ? methodInfo(String(method)).short : "BTC");
+
 const AUDIT_LABEL: Record<string, string> = {
+  deposit_address_changed: "Deposit address changed",
+  deposits_enabled: "Payment method enabled",
+  deposits_disabled: "Payment method disabled",
   btc_address_changed: "BTC address changed",
   btc_deposits_enabled: "BTC payments enabled",
   btc_deposits_disabled: "BTC payments disabled",
@@ -66,11 +77,16 @@ function auditSummary(entry: AuditEntry): string {
   const d = entry.details as Record<string, unknown>;
   switch (entry.action) {
     case "btc_address_changed":
-      return `${d.previous ? `${String(d.previous)} → ` : ""}${String(d.new)}`;
+      return `BTC · ${d.previous ? `${String(d.previous)} → ` : ""}${String(d.new)}`;
+    case "deposit_address_changed":
+      return `${methodName(d.method)} · ${d.previous ? `${String(d.previous)} → ` : ""}${String(d.new)}`;
+    case "deposits_enabled":
+    case "deposits_disabled":
+      return methodName(d.method);
     case "deposit_approved":
-      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · ${String(d.confirmations)} conf.`;
+      return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · ${String(d.confirmations)} conf.`;
     case "deposit_rejected":
-      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
+      return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
     default:
       return entry.targetId ?? "";
   }
@@ -93,6 +109,7 @@ function DepositRow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pending = deposit.status === "reviewing";
+  const info = METHOD_INFO[deposit.method];
 
   async function run(body: Record<string, unknown>, success: string) {
     setBusy(true);
@@ -122,8 +139,14 @@ function DepositRow({
           <p className="font-mono text-slate-400">{deposit.reference}</p>
         </div>
         <div>
-          <p className="font-black">{formatMoney(deposit.amountUsd)}</p>
-          <p className="font-mono text-slate-500">{deposit.amountBtc} BTC</p>
+          <p className="flex flex-wrap items-center gap-1.5 font-black">
+            {formatMoney(deposit.amountUsd)}
+            <Badge tone={deposit.method === "usdt_trc20" ? "green" : "amber"}>{info.short}</Badge>
+          </p>
+          <p className="font-mono text-slate-500">{deposit.amountCrypto} {deposit.asset}</p>
+          <p className="truncate font-mono text-[11px] text-slate-400" title={deposit.depositAddress}>
+            To {shortHash(deposit.depositAddress, 6)} · {info.networkLabel}
+          </p>
         </div>
         <div className="min-w-0">
           <p className="truncate font-mono text-slate-500" title={deposit.txid ?? ""}>
@@ -153,9 +176,10 @@ function DepositRow({
       {pending && mode === "approve" && (
         <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
           <p className="font-bold text-emerald-900">
-            Approve {formatMoney(deposit.amountUsd)} for account {formatAccountNumber(deposit.user.accountNumber)}? The transaction is
-            verified on the Bitcoin blockchain first (address, exact amount, confirmations, TXID not used before); the balance
-            changes only if every check passes.
+            Approve {formatMoney(deposit.amountUsd)} ({deposit.amountCrypto} {deposit.asset}) for {deposit.userName ?? deposit.user.name},
+            account {formatAccountNumber(deposit.user.accountNumber)}? The transaction is verified on the{" "}
+            {deposit.method === "usdt_trc20" ? "TRON blockchain (official USDT TRC20 contract)" : "Bitcoin blockchain"} first
+            (address, exact amount, confirmations, TXID not used before); the balance changes only if every check passes.
           </p>
           <div className="mt-2 flex flex-wrap gap-2">
             <button
@@ -220,10 +244,13 @@ const admin = <T,>(body: Record<string, unknown>) => postJson<T>("/api/admin", b
 /* ---------------------------------------------------------------------------------------------- */
 
 function VerificationView({ verification }: { verification: DepositVerification }) {
+  const info = methodInfo(verification.method);
   return (
     <div className={`rounded-2xl border p-4 ${verification.matched ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50"}`} data-testid="verification">
       <p className={`text-[13px] font-black ${verification.matched ? "text-emerald-800" : "text-rose-700"}`}>
-        {verification.matched ? "Payment verified on the Bitcoin blockchain" : "Payment NOT verified"}
+        {verification.matched
+          ? `Payment verified on the ${verification.method === "usdt_trc20" ? "TRON" : "Bitcoin"} blockchain`
+          : "Payment NOT verified"}
       </p>
       <ul className="mt-3 space-y-2 text-[12px]">
         {verification.checks.map((check) => (
@@ -236,7 +263,7 @@ function VerificationView({ verification }: { verification: DepositVerification 
           </li>
         ))}
       </ul>
-      <p className="mt-3 text-[11px] text-slate-500">Checked {formatDate(verification.checkedAt)} · Bitcoin Mainnet</p>
+      <p className="mt-3 text-[11px] text-slate-500">Checked {formatDate(verification.checkedAt)} · {info.networkLabel}</p>
     </div>
   );
 }
@@ -311,6 +338,7 @@ function DepositDetail({
     }
   }
 
+  const info = deposit ? METHOD_INFO[deposit.method] : METHOD_INFO.btc;
   const reviewable = deposit?.status === "reviewing";
   const rejectable = deposit?.status === "reviewing" || deposit?.status === "awaiting_payment";
 
@@ -343,10 +371,18 @@ function DepositDetail({
               <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400">Payment</p>
               <dl className="mt-3 grid gap-3 text-[13px] sm:grid-cols-2">
                 <div><dt className="text-[11px] text-slate-500">Reference</dt><dd className="font-mono font-bold">{deposit.reference}</dd></div>
-                <div><dt className="text-[11px] text-slate-500">Amount</dt><dd className="font-black text-[#7F00FF]">{formatMoney(deposit.amountUsd)}</dd></div>
-                <div><dt className="text-[11px] text-slate-500">Expected BTC</dt><dd className="font-mono font-bold">{deposit.amountBtc} BTC ({deposit.amountSats.toLocaleString("en-US")} sats)</dd></div>
-                <div><dt className="text-[11px] text-slate-500">Rate</dt><dd className="font-bold">{formatMoney(deposit.btcUsdRate)} · {deposit.rateSource}</dd></div>
-                <div className="sm:col-span-2"><dt className="text-[11px] text-slate-500">Address (Bitcoin Mainnet)</dt><dd className="break-all font-mono text-[12px] font-bold">{deposit.btcAddress}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Payment method</dt><dd className="font-bold" data-testid="detail-method">{info.name}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Network</dt><dd className="font-bold">{info.networkLabel}</dd></div>
+                <div><dt className="text-[11px] text-slate-500">Amount (credited)</dt><dd className="font-black text-[#7F00FF]">{formatMoney(deposit.amountUsd)}</dd></div>
+                <div>
+                  <dt className="text-[11px] text-slate-500">Expected {info.asset}</dt>
+                  <dd className="font-mono font-bold">
+                    {deposit.amountCrypto} {info.asset}
+                    {deposit.method === "btc" ? ` (${deposit.amountUnits.toLocaleString("en-US")} sats)` : ""}
+                  </dd>
+                </div>
+                <div><dt className="text-[11px] text-slate-500">Rate</dt><dd className="font-bold">{formatMoney(deposit.usdRate)} / {info.asset} · {deposit.rateSource}</dd></div>
+                <div className="sm:col-span-2"><dt className="text-[11px] text-slate-500">Deposit address of this request ({info.networkLabel})</dt><dd className="break-all font-mono text-[12px] font-bold">{deposit.depositAddress}</dd></div>
                 <div><dt className="text-[11px] text-slate-500">Created</dt><dd>{formatDate(deposit.createdAt)}</dd></div>
                 <div><dt className="text-[11px] text-slate-500">Quote valid until</dt><dd>{formatDate(deposit.expiresAt)}</dd></div>
                 {deposit.submittedAt && <div><dt className="text-[11px] text-slate-500">&quot;I&apos;ve paid&quot; at</dt><dd>{formatDate(deposit.submittedAt)}</dd></div>}
@@ -358,8 +394,8 @@ function DepositDetail({
                       <>
                         <code className="min-w-0 flex-1 break-all text-[12px] font-bold">{deposit.txid}</code>
                         <CopyButton value={deposit.txid} label="Copy" />
-                        <a href={`https://mempool.space/tx/${deposit.txid}`} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-[12px] font-bold text-[#7F00FF] hover:underline">
-                          mempool.space <ExternalLink className="h-3.5 w-3.5" />
+                        <a href={info.explorerTx(deposit.txid)} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-[12px] font-bold text-[#7F00FF] hover:underline">
+                          {info.explorerName} <ExternalLink className="h-3.5 w-3.5" />
                         </a>
                       </>
                     ) : (
@@ -381,7 +417,9 @@ function DepositDetail({
                   </button>
                 </div>
                 <p className="mt-2 text-[11px] text-slate-500">
-                  Reads mempool.space and blockstream.info. Requires the exact amount to the address above and at least{" "}
+                  {deposit.method === "usdt_trc20"
+                    ? "Reads TRON mainnet via TronGrid (full + solidity node). Requires a successful transfer of the official USDT TRC20 contract, the exact amount to the address above, solidification and at least "
+                    : "Reads mempool.space and blockstream.info. Requires the exact amount to the address above and at least "}
                   {deposit.requiredConfirmations} confirmations.
                 </p>
                 <div className="mt-3">
@@ -412,6 +450,13 @@ function DepositDetail({
                       <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                         <p className="text-[13px] font-bold text-emerald-900">
                           Credit {formatMoney(deposit.amountUsd)} to {deposit.user.name} ({formatAccountNumber(deposit.user.accountNumber)})?
+                        </p>
+                        <dl className="mt-2 grid gap-x-4 gap-y-1 text-[12px] text-emerald-900 sm:grid-cols-2" data-testid="approve-summary">
+                          <div><dt className="inline opacity-70">Method: </dt><dd className="inline font-bold">{info.name}</dd></div>
+                          <div><dt className="inline opacity-70">Amount: </dt><dd className="inline font-bold">{deposit.amountCrypto} {info.asset} = {formatMoney(deposit.amountUsd)}</dd></div>
+                          <div className="sm:col-span-2 break-all"><dt className="inline opacity-70">TXID: </dt><dd className="inline font-mono">{deposit.txid}</dd></div>
+                        </dl>
+                        <p className="mt-2 text-[12px] text-emerald-900">
                           The blockchain is checked again before the balance changes.
                         </p>
                         <div className="mt-3 flex flex-wrap gap-2">
@@ -484,6 +529,132 @@ function DepositDetail({
 
 /* ---------------------------------------------------------------------------------------------- */
 
+/** Admin card for one payment method: on/off switch and deposit address (stored in the database). */
+function PaymentMethodCard({
+  config,
+  onChanged,
+  notify,
+}: {
+  config: MethodConfig;
+  onChanged: () => Promise<void>;
+  notify: (toast: Toast) => void;
+}) {
+  const info = METHOD_INFO[config.method];
+  const [address, setAddress] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [toggling, setToggling] = useState(false);
+  const inputId = `address-${config.method}`;
+
+  async function toggle() {
+    setToggling(true);
+    try {
+      const response = await admin<{ enabled: boolean }>({ action: "setMethodEnabled", method: config.method, enabled: !config.enabled });
+      notify({ type: "ok", message: `${info.name} payments are now ${response.enabled ? "active" : "inactive"}.` });
+      await onChanged();
+    } catch (err) {
+      notify({ type: "error", message: err instanceof Error ? err.message : "Could not change the setting." });
+    } finally {
+      setToggling(false);
+    }
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const response = await admin<{ address: string }>({ action: "setDepositAddress", method: config.method, address });
+      notify({ type: "ok", message: `${info.short} deposit address saved: ${shortHash(response.address, 8)}` });
+      setAddress("");
+      await onChanged();
+    } catch (err) {
+      notify({ type: "error", message: err instanceof Error ? err.message : "Could not save the address." });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card>
+      <div data-testid={`method-card-${config.method}`} className="space-y-5 text-[13px]">
+        <SectionTitle
+          eyebrow={info.asset}
+          title={info.name}
+          action={<Badge tone={config.method === "usdt_trc20" ? "red" : "amber"}>Network: {info.networkLabel}</Badge>}
+        />
+        <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 p-4">
+          <div className="min-w-0 flex-1">
+            <p className="font-black">{info.name} payment method</p>
+            <p className="mt-0.5 text-[12px] text-slate-500">
+              When inactive, members cannot create new {info.short} payment requests. Requests already created can still be completed and reviewed.
+            </p>
+          </div>
+          <Badge tone={config.enabled ? "green" : "red"}>{config.enabled ? "Active" : "Inactive"}</Badge>
+          <button
+            onClick={toggle}
+            disabled={toggling}
+            role="switch"
+            aria-checked={config.enabled}
+            aria-label={`${info.short} payment method active`}
+            className={`relative h-8 w-14 shrink-0 rounded-full transition ${config.enabled ? "bg-emerald-500" : "bg-slate-300"}`}
+          >
+            <span className={`absolute top-1 h-6 w-6 rounded-full bg-white shadow transition-all ${config.enabled ? "left-7" : "left-1"}`} />
+          </button>
+        </div>
+
+        <div>
+          <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Current deposit address</p>
+          {config.address ? (
+            <>
+              <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                <code className="min-w-0 flex-1 break-all font-bold" data-testid="current-address">{config.address}</code>
+                <CopyButton value={config.address} />
+              </div>
+              <p className="mt-1.5 text-[11px] text-slate-500" data-testid="address-updated">
+                Last updated: {config.addressUpdatedAt ? formatDate(config.addressUpdatedAt) : "—"}
+                {config.addressUpdatedBy ? ` by ${config.addressUpdatedBy}` : ""}
+              </p>
+            </>
+          ) : (
+            <p className="mt-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-amber-800">
+              Not configured — members cannot pay with {info.short} until you add an address.
+            </p>
+          )}
+        </div>
+        <div>
+          <label htmlFor={inputId} className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
+            {config.address ? "Change address" : "Add address"} (
+            {config.method === "usdt_trc20" ? "TRON mainnet: T…, 34 characters" : "Bitcoin Mainnet: bc1…, 1… or 3…"})
+          </label>
+          <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
+            <input
+              id={inputId}
+              value={address}
+              onChange={(event) => setAddress(event.target.value.trim())}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              className={`${inputClass} font-mono`}
+            />
+            <button onClick={save} disabled={saving || address.length < 26} className={`${button} igw-gradient text-white`}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+              {config.address ? "Update address" : "Add address"}
+            </button>
+          </div>
+          <p className="mt-1.5 text-[11px] text-slate-500">
+            {config.method === "usdt_trc20"
+              ? "Enter your own TRON wallet address that can receive USDT TRC20. The Base58Check checksum is verified; the USDT contract address itself is refused."
+              : "The checksum is verified and testnet addresses are refused."}{" "}
+            New payment requests and the QR code use the new address immediately; requests already created keep the address they were shown.
+          </p>
+        </div>
+        <dl className="grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-2">
+          <div><dt className="text-[11px] text-slate-500">Confirmations required</dt><dd className="font-bold">{config.requiredConfirmations}</dd></div>
+          <div><dt className="text-[11px] text-slate-500">Verification</dt><dd className="font-bold">{config.method === "usdt_trc20" ? "TronGrid · USDT contract TR7NHq…Lj6t" : "mempool.space + blockstream.info"}</dd></div>
+        </dl>
+      </div>
+    </Card>
+  );
+}
+
 export default function AdminClient({
   initialOverview,
   initialDeposits,
@@ -499,22 +670,7 @@ export default function AdminClient({
   const [openId, setOpenId] = useState<number | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
-  const [address, setAddress] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [toggling, setToggling] = useState(false);
-
-  async function toggleDeposits() {
-    setToggling(true);
-    try {
-      const response = await admin<{ enabled: boolean }>({ action: "setDepositsEnabled", enabled: !overview.settings.enabled });
-      setToast({ type: "ok", message: response.enabled ? "BTC payments are now active." : "BTC payments are now inactive." });
-      await refresh();
-    } catch (err) {
-      setToast({ type: "error", message: err instanceof Error ? err.message : "Could not change the setting." });
-    } finally {
-      setToggling(false);
-    }
-  }
+  const [methodFilter, setMethodFilter] = useState<PaymentMethod | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -561,21 +717,9 @@ export default function AdminClient({
     refresh().catch(() => {});
   }
 
-  async function saveAddress() {
-    setSaving(true);
-    try {
-      const response = await admin<{ btcAddress: string }>({ action: "setBtcAddress", address });
-      setToast({ type: "ok", message: `Deposit address saved: ${shortHash(response.btcAddress, 8)}` });
-      setAddress("");
-      await refresh();
-    } catch (err) {
-      setToast({ type: "error", message: err instanceof Error ? err.message : "Could not save the address." });
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  const visibleDeposits = deposits.filter((d) => filter === null || d.status === filter);
+  const visibleDeposits = deposits.filter(
+    (d) => (filter === null || d.status === filter) && (methodFilter === null || d.method === methodFilter),
+  );
   const goTo = (id: View) => {
     setView(id);
     setMobileOpen(false);
@@ -651,8 +795,9 @@ export default function AdminClient({
         </header>
 
         <main className="mx-auto max-w-[1200px] space-y-6 px-4 py-6 sm:px-8">
-          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
             {[
+              ["New payments", overview.counts.new, "new", "text-amber-600"],
               ["Pending payments", overview.counts.reviewing, "pending", "text-[#7F00FF]"],
               ["Approved payments", overview.counts.approved, "approved", "text-emerald-600"],
               ["Rejected payments", overview.counts.rejected, "rejected", "text-rose-600"],
@@ -661,6 +806,12 @@ export default function AdminClient({
               <div key={String(key)} className="rounded-2xl border border-slate-100 bg-white p-4 igw-shadow-soft" data-testid={`count-${key}`}>
                 <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{label}</p>
                 <p className={`mt-1 text-xl font-black ${tone}`}>{value}</p>
+                {(key === "pending" || key === "approved" || key === "rejected") && (
+                  <p className="mt-0.5 text-[10px] text-slate-400">
+                    BTC {overview.counts.byMethod?.btc?.[key === "pending" ? "reviewing" : key] ?? 0} · USDT{" "}
+                    {overview.counts.byMethod?.usdt_trc20?.[key === "pending" ? "reviewing" : key] ?? 0}
+                  </p>
+                )}
               </div>
             ))}
           </div>
@@ -701,7 +852,8 @@ export default function AdminClient({
                               <div><dt className="inline text-slate-500">User: </dt><dd className="inline font-bold">{d.userName}</dd></div>
                               <div><dt className="inline text-slate-500">Account: </dt><dd className="inline font-mono font-bold">{d.accountNumber}</dd></div>
                               <div className="break-all"><dt className="inline text-slate-500">Email: </dt><dd className="inline">{d.email}</dd></div>
-                              <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(Number(d.amountUsd))} · {d.amountBtc} BTC</dd></div>
+                              <div><dt className="inline text-slate-500">Method: </dt><dd className="inline font-bold">{methodInfo(String(d.method ?? "btc")).name}</dd></div>
+                              <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(Number(d.amountUsd))} · {d.amountCrypto ?? d.amountBtc} {d.asset ?? "BTC"}</dd></div>
                               <div><dt className="inline text-slate-500">Reference: </dt><dd className="inline font-mono">{d.reference}</dd></div>
                               <div><dt className="inline text-slate-500">Date: </dt><dd className="inline">{d.submittedAt ? formatDate(String(d.submittedAt)) : "—"}</dd></div>
                               <div><dt className="inline text-slate-500">Status: </dt><dd className="inline">{DEPOSIT_STATUS_LABEL[String(d.status)] ?? d.status}</dd></div>
@@ -720,7 +872,19 @@ export default function AdminClient({
 
           {view === "deposits" && (
             <Card>
-              <SectionTitle eyebrow="BTC" title="BTC payment requests" />
+              <SectionTitle eyebrow="BTC · USDT TRC20" title="Payment requests" />
+              <div className="-mx-1 mb-2 flex gap-2 overflow-x-auto px-1 pb-1" role="group" aria-label="Payment method filter">
+                {METHOD_FILTERS.map((f) => (
+                  <button
+                    key={f.label}
+                    onClick={() => setMethodFilter(f.id)}
+                    aria-pressed={methodFilter === f.id}
+                    className={`shrink-0 rounded-xl border px-3 py-1.5 text-[11px] font-bold ${methodFilter === f.id ? "border-[#7F00FF] bg-purple-50 text-[#7F00FF]" : "border-slate-200 bg-white text-slate-500"}`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
               <div className="-mx-1 mb-4 flex gap-2 overflow-x-auto px-1 pb-1">
                 {FILTERS.map((f) => (
                   <button
@@ -777,80 +941,20 @@ export default function AdminClient({
           )}
 
           {view === "settings" && (
-            <Card>
-              <SectionTitle eyebrow="Configuration" title="BTC payment settings" action={<Badge tone="amber">Bitcoin Mainnet</Badge>} />
-              <div className="space-y-5 text-[13px]">
-                <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 p-4">
-                  <div className="min-w-0 flex-1">
-                    <p className="font-black">Bitcoin (BTC) payment method</p>
-                    <p className="mt-0.5 text-[12px] text-slate-500">
-                      When inactive, members cannot create new BTC payment requests. Requests already created can still be completed and reviewed.
-                    </p>
-                  </div>
-                  <Badge tone={overview.settings.enabled ? "green" : "red"}>{overview.settings.enabled ? "Active" : "Inactive"}</Badge>
-                  <button
-                    onClick={toggleDeposits}
-                    disabled={toggling}
-                    role="switch"
-                    aria-checked={overview.settings.enabled}
-                    aria-label="BTC payment method active"
-                    className={`relative h-8 w-14 shrink-0 rounded-full transition ${overview.settings.enabled ? "bg-emerald-500" : "bg-slate-300"}`}
-                  >
-                    <span className={`absolute top-1 h-6 w-6 rounded-full bg-white shadow transition-all ${overview.settings.enabled ? "left-7" : "left-1"}`} />
-                  </button>
-                </div>
-
-                <div>
-                  <p className="text-[11px] font-bold uppercase tracking-wide text-slate-500">Current deposit address</p>
-                  {overview.settings.btcAddress ? (
-                    <>
-                      <div className="mt-1.5 flex flex-wrap items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                        <code className="min-w-0 flex-1 break-all font-bold" data-testid="current-address">{overview.settings.btcAddress}</code>
-                        <CopyButton value={overview.settings.btcAddress} />
-                      </div>
-                      <p className="mt-1.5 text-[11px] text-slate-500" data-testid="address-updated">
-                        Last updated: {overview.settings.btcAddressUpdatedAt ? formatDate(overview.settings.btcAddressUpdatedAt) : "—"}
-                        {overview.settings.btcAddressUpdatedBy ? ` by ${overview.settings.btcAddressUpdatedBy}` : ""}
-                      </p>
-                    </>
-                  ) : (
-                    <p className="mt-1.5 rounded-2xl border border-amber-200 bg-amber-50 p-3 text-amber-800">
-                      Not configured — members cannot deposit until you add an address.
-                    </p>
-                  )}
-                </div>
-                <div>
-                  <label htmlFor="btc-address" className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
-                    {overview.settings.btcAddress ? "Change address" : "Add address"} (Bitcoin Mainnet: bc1…, 1… or 3…)
-                  </label>
-                  <div className="mt-1.5 flex flex-col gap-2 sm:flex-row">
-                    <input
-                      id="btc-address"
-                      value={address}
-                      onChange={(event) => setAddress(event.target.value.trim())}
-                      autoCapitalize="none"
-                      autoCorrect="off"
-                      spellCheck={false}
-                      className={`${inputClass} font-mono`}
-                    />
-                    <button onClick={saveAddress} disabled={saving || address.length < 26} className={`${button} igw-gradient text-white`}>
-                      {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
-                      {overview.settings.btcAddress ? "Update address" : "Add address"}
-                    </button>
-                  </div>
-                  <p className="mt-1.5 text-[11px] text-slate-500">
-                    The checksum is verified and testnet addresses are refused. New payment requests and the QR code use the new
-                    address immediately; requests already created keep the address they were shown.
-                  </p>
-                </div>
-                <dl className="grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-4">
-                  <div><dt className="text-[11px] text-slate-500">Confirmations required</dt><dd className="font-bold">{overview.settings.requiredConfirmations}</dd></div>
-                  <div><dt className="text-[11px] text-slate-500">Minimum</dt><dd className="font-bold">{formatMoney(overview.settings.minUsd)}</dd></div>
-                  <div><dt className="text-[11px] text-slate-500">Maximum</dt><dd className="font-bold">{formatMoney(overview.settings.maxUsd)}</dd></div>
-                  <div><dt className="text-[11px] text-slate-500">Quote valid</dt><dd className="font-bold">{overview.settings.quoteMinutes} min</dd></div>
-                </dl>
+            <div className="space-y-6">
+              <div className="grid gap-6 xl:grid-cols-2">
+                {overview.settings.methods.map((config) => (
+                  <PaymentMethodCard key={config.method} config={config} onChanged={refresh} notify={setToast} />
+                ))}
               </div>
-            </Card>
+              <Card>
+                <dl className="grid gap-3 text-[13px] sm:grid-cols-3">
+                  <div><dt className="text-[11px] text-slate-500">Minimum per request</dt><dd className="font-bold">{formatMoney(overview.settings.minUsd)}</dd></div>
+                  <div><dt className="text-[11px] text-slate-500">Maximum per request</dt><dd className="font-bold">{formatMoney(overview.settings.maxUsd)}</dd></div>
+                  <div><dt className="text-[11px] text-slate-500">Payment window</dt><dd className="font-bold">{overview.settings.quoteMinutes} min</dd></div>
+                </dl>
+              </Card>
+            </div>
           )}
 
           {view === "audit" && (
