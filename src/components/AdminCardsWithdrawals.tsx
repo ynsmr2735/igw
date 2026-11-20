@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, CreditCard, ExternalLink, Loader2, Search, XCircle } from "lucide-react";
 import type { AdminCard, AdminCardRequest, AdminWithdrawal, MemberLookup } from "@/lib/admin";
 import { CARD_TIERS, CARD_TIER_STYLE, formatValidThru, type CardTier } from "@/lib/cards";
-import { formatAccountNumber, formatDate, formatMoney } from "@/lib/format";
+import { formatAccountNumber, formatDate, formatMoney, isAccountNumber, normalizeAccountNumber } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, postJson, type Toast } from "@/components/wallet-ui";
 import { WITHDRAWAL_STATUS_LABEL } from "@/components/WithdrawSection";
 
@@ -355,9 +355,9 @@ function ManageMemberCard({ onChanged, notify }: { onChanged: () => Promise<void
     <div className="rounded-2xl border border-slate-200 p-4" data-testid="manage-card">
       <p className="text-[13px] font-black">Activate, change or deactivate a member&apos;s card</p>
       <div className="mt-2 flex flex-col gap-2 sm:flex-row">
-        <input value={account} onChange={(e) => setAccount(e.target.value.replace(/[^\d ]/g, ""))} placeholder="8-digit account number"
-          aria-label="Member account number" inputMode="numeric" className={`${inputClass} font-mono`} />
-        <button onClick={lookup} disabled={busy || account.replace(/\s/g, "").length !== 8} className={`${button} h-11 shrink-0 whitespace-nowrap border border-slate-200 bg-white text-slate-700`}>
+        <input value={account} onChange={(e) => setAccount(e.target.value.toUpperCase().replace(/[^A-Z0-9 -]/g, ""))}
+          aria-label="Member account number" placeholder="UK1234567 12345" autoCapitalize="characters" spellCheck={false} className={`${inputClass} font-mono uppercase`} />
+        <button onClick={lookup} disabled={busy || !isAccountNumber(normalizeAccountNumber(account))} className={`${button} h-11 shrink-0 whitespace-nowrap border border-slate-200 bg-white text-slate-700`}>
           <Search className="h-4 w-4" /> Find member
         </button>
       </div>

@@ -34,6 +34,9 @@ import {
   TX_STATUS_LABEL,
   TX_TYPE_LABEL,
   formatAccountNumber,
+  isAccountNumber,
+  normalizeAccountNumber,
+  ACCOUNT_NUMBER_HINT,
   formatDate,
   formatMoney,
 } from "@/lib/format";
@@ -499,7 +502,7 @@ function TransferSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const cleanAccount = account.replace(/\D/g, "");
+  const cleanAccount = normalizeAccountNumber(account);
   const amountNumber = Number(amount);
   const amountValid = /^\d+(\.\d{1,2})?$/.test(amount) && amountNumber > 0;
   const enough = amountValid && amountNumber <= data.wallet.balance;
@@ -507,7 +510,7 @@ function TransferSection({
   async function checkRecipient(event: FormEvent) {
     event.preventDefault();
     setError(null);
-    if (cleanAccount.length !== 8) return setError("Account numbers have exactly 8 digits.");
+    if (!isAccountNumber(cleanAccount)) return setError(ACCOUNT_NUMBER_HINT);
     if (cleanAccount === data.user.accountNumber) return setError("You cannot transfer money to your own account.");
     if (!amountValid) return setError("Enter an amount greater than zero (max. 2 decimals).");
     if (!enough) return setError("Insufficient balance.");
@@ -563,13 +566,15 @@ function TransferSection({
             </label>
             <input
               id="recipient-account"
-              inputMode="numeric"
               autoComplete="off"
-              maxLength={9}
-              placeholder="8 digits"
+              autoCapitalize="characters"
+              autoCorrect="off"
+              spellCheck={false}
+              maxLength={20}
+              placeholder="UK1234567 12345"
               value={account}
-              onChange={(event) => setAccount(event.target.value.replace(/[^\d ]/g, ""))}
-              className={`${inputClass} font-mono tracking-[0.2em]`}
+              onChange={(event) => setAccount(event.target.value.toUpperCase().replace(/[^A-Z0-9 -]/g, ""))}
+              className={`${inputClass} font-mono tracking-[0.12em] uppercase`}
               required
             />
           </div>
@@ -851,7 +856,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
                     {formatAccountNumber(data.user.accountNumber)}
                   </p>
                 </div>
-                <CopyButton value={data.user.accountNumber} label="Copy" dark className="ml-auto" onCopied={copied} />
+                <CopyButton value={formatAccountNumber(data.user.accountNumber)} label="Copy" dark className="ml-auto" onCopied={copied} />
               </div>
               <div className="relative mt-5 flex flex-wrap gap-2.5">
                 <button onClick={() => goTo("deposit")} className="rounded-xl bg-white px-4 py-2.5 text-[12px] font-bold text-[#7F00FF] transition hover:-translate-y-0.5">
@@ -953,7 +958,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
                 <dt className="text-[11px] text-slate-500">Account number</dt>
                 <dd className="mt-1 flex items-center gap-2">
                   <span className="font-mono font-black tracking-[0.12em]">{formatAccountNumber(data.user.accountNumber)}</span>
-                  <CopyButton value={data.user.accountNumber} onCopied={copied} />
+                  <CopyButton value={formatAccountNumber(data.user.accountNumber)} onCopied={copied} />
                 </dd>
               </div>
               <div><dt className="text-[11px] text-slate-500">Member since</dt><dd className="mt-1 font-bold">{formatDate(data.user.memberSince)}</dd></div>

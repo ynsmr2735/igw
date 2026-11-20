@@ -127,12 +127,14 @@ alter table public.profiles add column if not exists account_number text;
 alter table public.profiles add column if not exists username text;
 create unique index if not exists profiles_account_number_key on public.profiles(account_number);
 create unique index if not exists profiles_username_key on public.profiles(lower(username)) where username is not null;
+-- igw-rpc-11: account numbers are UK + 12 digits (UK123456712345, shown UK1234567 12345).
+-- The old 8-digit number of an existing member is kept here and still accepted for transfers.
+alter table public.profiles add column if not exists previous_account_number text;
+create unique index if not exists profiles_previous_account_number_key
+  on public.profiles(previous_account_number) where previous_account_number is not null;
+alter table public.profiles drop constraint if exists profiles_account_number_format;
 do $$
 begin
-  if not exists (select 1 from pg_constraint where conname = 'profiles_account_number_format') then
-    alter table public.profiles add constraint profiles_account_number_format
-      check (account_number ~ '^[1-9][0-9]{7}$');
-  end if;
   if not exists (select 1 from pg_constraint where conname = 'profiles_username_format') then
     alter table public.profiles add constraint profiles_username_format
       check (username ~ '^[a-z0-9_.]{3,32}$');
@@ -612,8 +614,9 @@ as $$
          || lpad(nextval('igw_private.reference_seq')::text, 8, '0');
 $$;
 
--- Random 8-digit account number (10000000–99999999) not used by anyone yet.
--- The unique index on profiles.account_number is the final guarantee.
+-- Random account number: "UK" + 12 digits, e.g. UK123456712345, shown as
+-- "UK1234567 12345" (7 + 5 digits). Not used by anyone yet; the unique index on
+-- profiles.account_number is the final guarantee.
 create or replace function igw_private.new_account_number()
 returns text
 language plpgsql
@@ -625,11 +628,47 @@ declare
   v_number text;
 begin
   loop
-    v_number := (10000000 + floor(random() * 90000000))::bigint::text;
-    exit when not exists (select 1 from public.profiles where account_number = v_number);
+    v_number := 'UK' || (100000000000 + floor(random() * 900000000000))::bigint::text;
+    exit when not exists (select 1 from public.profiles where account_number = v_number or previous_account_number = v_number)
+          and not exists (select 1 from public.wallets where account_number = v_number);
   end loop;
   return v_number;
 end;
+$$;
+
+-- Stored form -> how it is shown: "UK123456712345" -> "UK1234567 12345" (7 + 5 digits).
+create or replace function igw_private.format_account_number(p_value text)
+returns text
+language sql
+immutable
+as $$
+  select case when p_value ~ '^UK[0-9]{12}$' then left(p_value, 9) || ' ' || right(p_value, 5) else p_value end;
+$$;
+
+-- What a member typed -> stored form: upper case, no spaces or dashes ("uk1234567 12345" -> "UK123456712345").
+create or replace function igw_private.normalize_account_number(p_value text)
+returns text
+language sql
+immutable
+as $$
+  select upper(regexp_replace(coalesce(p_value, ''), '[\s-]', '', 'g'));
+$$;
+
+-- Finds a member by account number: the current one, or (for members who joined before
+-- igw-rpc-11) their old 8-digit number. Returns null when the input is not a valid number.
+create or replace function igw_private.profile_by_account(p_value text)
+returns uuid
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select p.id from public.profiles p
+  where (igw_private.normalize_account_number(p_value) ~ '^UK[0-9]{12}$'
+         and p.account_number = igw_private.normalize_account_number(p_value))
+     or (igw_private.normalize_account_number(p_value) ~ '^[0-9]{8}$'
+         and p.previous_account_number = igw_private.normalize_account_number(p_value))
+  limit 1;
 $$;
 
 create or replace function igw_private.lock_account_number()
@@ -1298,11 +1337,44 @@ $$;
 alter table public.profiles alter column account_number set not null;
 
 drop trigger if exists profiles_lock_account_number on public.profiles;
+
+-- igw-rpc-11: every 8-digit account number gets a new UK + 12 digits number.
+-- The old number is kept (previous_account_number) and copies of it in requests and in the
+-- transfer history are updated, so members see one number everywhere. Balances are untouched.
+do $$
+declare
+  r record;
+  v_new text;
+begin
+  for r in select id, account_number from public.profiles where account_number !~ '^UK[0-9]{12}$' order by created_at, id loop
+    v_new := igw_private.new_account_number();
+    update public.profiles
+      set previous_account_number = coalesce(previous_account_number, r.account_number), account_number = v_new
+      where id = r.id;
+    update public.deposit_requests set account_number = v_new where user_id = r.id;
+    update public.card_requests set account_number = v_new where user_id = r.id;
+    update public.withdrawal_requests set account_number = v_new where user_id = r.id;
+    update public.transactions set counterparty_account = v_new where counterparty_account = r.account_number;
+    update public.transactions set description = 'Transfer to ' || igw_private.format_account_number(v_new) where description = 'Transfer to ' || r.account_number;
+    update public.transactions set description = 'Transfer from ' || igw_private.format_account_number(v_new) where description = 'Transfer from ' || r.account_number;
+  end loop;
+end;
+$$;
+do $$
+begin
+  alter table public.profiles drop constraint if exists profiles_account_number_format_v2;
+  if not exists (select 1 from pg_constraint where conname = 'profiles_account_number_uk') then
+    alter table public.profiles add constraint profiles_account_number_uk
+      check (account_number ~ '^UK[0-9]{12}$');
+  end if;
+end;
+$$;
+
 create trigger profiles_lock_account_number
   before update of account_number on public.profiles
   for each row execute function igw_private.lock_account_number();
 
--- The USD wallet carries the 8-digit account number; other currencies are retired
+-- The USD wallet carries the member's account number; other currencies are retired
 -- (rows and balances are kept, but they are hidden and can no longer be used).
 update public.wallets w
 set account_number = p.account_number, is_primary = true, is_active = true
@@ -1346,7 +1418,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-10');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-11');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1762,7 +1834,7 @@ begin
     'deposit_submitted',
     format('New %s payment request', case v_request.method when 'usdt_trc20' then 'USDT TRC20' else 'BTC' end),
     format('%s (account %s) reports a payment of %s USD / %s %s.',
-           v_profile.full_name, v_profile.account_number, v_request.amount_usd,
+           v_profile.full_name, igw_private.format_account_number(v_profile.account_number), v_request.amount_usd,
            igw_private.format_units(v_request.method, v_request.amount_units), igw_private.method_asset(v_request.method)),
     jsonb_build_object(
       'requestId', v_request.id,
@@ -1829,11 +1901,11 @@ set search_path = public, extensions
 as $$
 declare
   v_uid uuid := igw_private.require_user(p_token);
-  v_account text := trim(coalesce(p_account_number, ''));
+  v_account text := igw_private.normalize_account_number(p_account_number);
   v_recipient public.profiles%rowtype;
 begin
-  if v_account !~ '^[0-9]{8}$' then
-    raise exception 'Account numbers have exactly 8 digits.';
+  if v_account !~ '^(UK[0-9]{12}|[0-9]{8})$' then
+    raise exception 'Enter the account number like UK1234567 12345 (UK and 12 digits).';
   end if;
   -- Limit lookups so account numbers cannot be scanned.
   if (select count(*) from public.transfer_lookups
@@ -1843,14 +1915,15 @@ begin
   delete from public.transfer_lookups where looked_up_at < now() - interval '1 day';
   insert into public.transfer_lookups (user_id) values (v_uid);
 
-  select * into v_recipient from public.profiles where account_number = v_account;
+  select * into v_recipient from public.profiles where id = igw_private.profile_by_account(v_account);
   if not found then
     raise exception 'No account found with this number.';
   end if;
   if v_recipient.id = v_uid then
     raise exception 'You cannot transfer money to your own account.';
   end if;
-  return jsonb_build_object('accountNumber', v_account, 'name', igw_private.mask_name(v_recipient.full_name));
+  -- Always answer with the current number (also when an old 8-digit number was entered).
+  return jsonb_build_object('accountNumber', v_recipient.account_number, 'name', igw_private.mask_name(v_recipient.full_name));
 end;
 $$;
 
@@ -1866,7 +1939,7 @@ set search_path = public, extensions
 as $$
 declare
   v_uid uuid := igw_private.require_user(p_token);
-  v_account text := trim(coalesce(p_account_number, ''));
+  v_account text := igw_private.normalize_account_number(p_account_number);
   v_note text := left(trim(coalesce(p_note, '')), 140);
   v_sender public.profiles%rowtype;
   v_recipient public.profiles%rowtype;
@@ -1887,12 +1960,12 @@ begin
   if p_amount > 1000000000 then
     raise exception 'Amount is too large.';
   end if;
-  if v_account !~ '^[0-9]{8}$' then
-    raise exception 'Account numbers have exactly 8 digits.';
+  if v_account !~ '^(UK[0-9]{12}|[0-9]{8})$' then
+    raise exception 'Enter the account number like UK1234567 12345 (UK and 12 digits).';
   end if;
 
   select * into v_sender from public.profiles where id = v_uid;
-  select * into v_recipient from public.profiles where account_number = v_account;
+  select * into v_recipient from public.profiles where id = igw_private.profile_by_account(v_account);
   if not found then
     raise exception 'No account found with this number.';
   end if;
@@ -1916,7 +1989,7 @@ begin
     select * into v_sender_wallet from public.wallets where user_id = v_uid and currency = 'USD';
     return jsonb_build_object(
       'ok', true, 'duplicate', true, 'reference', v_existing.reference, 'amount', v_existing.amount,
-      'recipientName', igw_private.mask_name(v_recipient.full_name), 'recipientAccount', v_account,
+      'recipientName', igw_private.mask_name(v_recipient.full_name), 'recipientAccount', v_recipient.account_number,
       'balance', v_sender_wallet.balance, 'createdAt', v_existing.created_at
     );
   end if;
@@ -1945,26 +2018,26 @@ begin
     (v_sender_wallet.id, 'transfer_out', 'out', p_amount, 'USD',
      igw_private.mask_name(v_recipient.full_name), v_recipient.account_number,
      v_note, 'completed', v_transfer.reference,
-     coalesce(nullif(v_note, ''), 'Transfer to ' || v_recipient.account_number), v_transfer.id),
+     coalesce(nullif(v_note, ''), 'Transfer to ' || igw_private.format_account_number(v_recipient.account_number)), v_transfer.id),
     (v_recipient_wallet.id, 'transfer_in', 'in', p_amount, 'USD',
      igw_private.mask_name(v_sender.full_name), v_sender.account_number,
      v_note, 'completed', v_transfer.reference,
-     coalesce(nullif(v_note, ''), 'Transfer from ' || v_sender.account_number), v_transfer.id);
+     coalesce(nullif(v_note, ''), 'Transfer from ' || igw_private.format_account_number(v_sender.account_number)), v_transfer.id);
 
   perform igw_private.notify(
     v_uid, 'transfer_sent', 'Transfer sent',
-    format('You sent %s USD to account %s (ref. %s).', p_amount, v_recipient.account_number, v_transfer.reference),
+    format('You sent %s USD to account %s (ref. %s).', p_amount, igw_private.format_account_number(v_recipient.account_number), v_transfer.reference),
     jsonb_build_object('reference', v_transfer.reference, 'amount', p_amount)
   );
   perform igw_private.notify(
     v_recipient.id, 'transfer_received', 'Money received',
-    format('You received %s USD from account %s (ref. %s).', p_amount, v_sender.account_number, v_transfer.reference),
+    format('You received %s USD from account %s (ref. %s).', p_amount, igw_private.format_account_number(v_sender.account_number), v_transfer.reference),
     jsonb_build_object('reference', v_transfer.reference, 'amount', p_amount)
   );
 
   return jsonb_build_object(
     'ok', true, 'duplicate', false, 'reference', v_transfer.reference, 'amount', p_amount,
-    'recipientName', igw_private.mask_name(v_recipient.full_name), 'recipientAccount', v_account,
+    'recipientName', igw_private.mask_name(v_recipient.full_name), 'recipientAccount', v_recipient.account_number,
     'balance', v_sender_wallet.balance, 'createdAt', v_transfer.created_at
   );
 exception
@@ -2435,7 +2508,7 @@ begin
     format('Your %s card request (ref. %s) has been received. Awaiting admin review.', igw_private.card_tier_name(p_tier), v_request.reference),
     jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier));
   perform igw_private.notify_admins('card_requested', 'New card request',
-    format('%s (account %s) requests a %s card.', v_profile.full_name, v_profile.account_number, igw_private.card_tier_name(p_tier)),
+    format('%s (account %s) requests a %s card.', v_profile.full_name, igw_private.format_account_number(v_profile.account_number), igw_private.card_tier_name(p_tier)),
     jsonb_build_object('cardRequestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier,
                        'userName', v_profile.full_name, 'accountNumber', v_profile.account_number));
   return igw_private.card_request_json(v_request);
@@ -2536,7 +2609,7 @@ begin
     format('Your withdrawal request of %s USD (ref. %s) has been received. Awaiting admin review.', p_amount_usd, v_request.reference),
     jsonb_build_object('withdrawalId', v_request.id, 'reference', v_request.reference, 'amountUsd', p_amount_usd));
   perform igw_private.notify_admins('withdrawal_submitted', 'New withdrawal request',
-    format('%s (account %s) requests %s USD to %s (%s card).', v_profile.full_name, v_profile.account_number,
+    format('%s (account %s) requests %s USD to %s (%s card).', v_profile.full_name, igw_private.format_account_number(v_profile.account_number),
            p_amount_usd, v_address, igw_private.card_tier_name(v_card.tier)),
     jsonb_build_object('withdrawalId', v_request.id, 'reference', v_request.reference, 'amountUsd', p_amount_usd,
                        'userName', v_profile.full_name, 'accountNumber', v_profile.account_number,
@@ -2788,7 +2861,7 @@ declare
   v_card public.member_cards%rowtype;
   v_reason text := nullif(left(trim(coalesce(p_reason, '')), 500), '');
 begin
-  select * into v_profile from public.profiles where account_number = regexp_replace(coalesce(p_account_number, ''), '\s', '', 'g');
+  select * into v_profile from public.profiles where id = igw_private.profile_by_account(p_account_number);
   if not found then
     raise exception 'No member with this account number.';
   end if;
@@ -2835,7 +2908,7 @@ declare
   v_admin uuid := igw_private.require_admin(p_token);
   v_profile public.profiles%rowtype;
 begin
-  select * into v_profile from public.profiles where account_number = regexp_replace(coalesce(p_account_number, ''), '\s', '', 'g');
+  select * into v_profile from public.profiles where id = igw_private.profile_by_account(p_account_number);
   if not found then
     raise exception 'No member with this account number.';
   end if;

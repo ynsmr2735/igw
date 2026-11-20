@@ -109,17 +109,17 @@ function auditSummary(entry: AuditEntry): string {
     case "deposits_disabled":
       return methodName(d.method);
     case "deposit_approved":
-      return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · ${String(d.confirmations)} conf.`;
+      return `${entry.targetId} · ${methodName(d.method)} · account ${formatAccountNumber(String(d.accountNumber))} · ${formatMoney(Number(d.amountUsd))} · ${String(d.confirmations)} conf.`;
     case "withdrawal_approved":
-      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} → ${String(d.btcAddress)}${d.txid ? ` · TXID ${String(d.txid).slice(0, 12)}…` : ""}`;
+      return `${entry.targetId} · account ${formatAccountNumber(String(d.accountNumber))} · ${formatMoney(Number(d.amountUsd))} → ${String(d.btcAddress)}${d.txid ? ` · TXID ${String(d.txid).slice(0, 12)}…` : ""}`;
     case "withdrawal_rejected":
-      return `${entry.targetId} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
+      return `${entry.targetId} · account ${formatAccountNumber(String(d.accountNumber))} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
     case "card_activated":
       return `account ${entry.targetId} · ${String(d.tier)}`;
     case "card_deactivated":
       return `account ${entry.targetId} · ${String(d.tier)}${d.reason ? ` · reason: ${String(d.reason)}` : ""}`;
     case "card_request_rejected":
-      return `${entry.targetId} · account ${String(d.accountNumber)} · ${String(d.tier)} · reason: ${String(d.reason)}`;
+      return `${entry.targetId} · account ${formatAccountNumber(String(d.accountNumber))} · ${String(d.tier)} · reason: ${String(d.reason)}`;
     case "contact_updated": {
       const prev = (d.previous ?? {}) as Record<string, string>;
       const next = (d.new ?? {}) as Record<string, string>;
@@ -127,7 +127,7 @@ function auditSummary(entry: AuditEntry): string {
       return changed.length ? changed.map((k) => `${k}: ${prev[k] || "—"} → ${next[k] || "—"}`).join(" · ") : "no change";
     }
     case "deposit_rejected":
-      return `${entry.targetId} · ${methodName(d.method)} · account ${String(d.accountNumber)} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
+      return `${entry.targetId} · ${methodName(d.method)} · account ${formatAccountNumber(String(d.accountNumber))} · ${formatMoney(Number(d.amountUsd))} · reason: ${String(d.reason)}`;
     default:
       return entry.targetId ?? "";
   }
@@ -1132,7 +1132,7 @@ export default function AdminClient({
                           {n.kind === "deposit_submitted" ? (
                             <dl className="mt-2 grid gap-x-4 gap-y-1 sm:grid-cols-2">
                               <div><dt className="inline text-slate-500">User: </dt><dd className="inline font-bold">{d.userName}</dd></div>
-                              <div><dt className="inline text-slate-500">Account: </dt><dd className="inline font-mono font-bold">{d.accountNumber}</dd></div>
+                              <div><dt className="inline text-slate-500">Account: </dt><dd className="inline font-mono font-bold">{formatAccountNumber(String(d.accountNumber ?? ""))}</dd></div>
                               <div className="break-all"><dt className="inline text-slate-500">Email: </dt><dd className="inline">{d.email}</dd></div>
                               <div><dt className="inline text-slate-500">Method: </dt><dd className="inline font-bold">{methodInfo(String(d.method ?? "btc")).name}</dd></div>
                               <div><dt className="inline text-slate-500">Amount: </dt><dd className="inline font-bold">{formatMoney(Number(d.amountUsd))} · {d.amountCrypto ?? d.amountBtc} {d.asset ?? "BTC"}</dd></div>
@@ -1222,7 +1222,7 @@ export default function AdminClient({
                     <li key={tx.id} className="grid gap-1 py-3 sm:grid-cols-[1.2fr_1fr_1fr_auto] sm:items-center">
                       <span className="min-w-0">
                         <span className="block truncate font-bold">{tx.user.name}</span>
-                        <span className="block font-mono text-slate-500">{tx.user.accountNumber} · {tx.reference}</span>
+                        <span className="block font-mono text-slate-500">{formatAccountNumber(tx.user.accountNumber)} · {tx.reference}</span>
                       </span>
                       <span>
                         <span className="block font-bold">{TX_TYPE_LABEL[tx.type] ?? tx.type}</span>

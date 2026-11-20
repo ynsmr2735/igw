@@ -39,8 +39,26 @@ export function initialsOf(name: string): string {
     .toUpperCase();
 }
 
-/** "12345678" -> "1234 5678" for reading; copy the raw value. */
+/**
+ * Account numbers: "UK" + 12 digits, stored without spaces ("UK123456712345") and
+ * shown as 7 + 5 digits ("UK1234567 12345"). Members who joined before igw-rpc-11 can
+ * still be found by their old 8-digit number.
+ */
+export const ACCOUNT_NUMBER_HINT = "Enter the account number like UK1234567 12345 (UK and 12 digits).";
+
+/** What a member typed -> stored form: upper case, no spaces or dashes. */
+export function normalizeAccountNumber(value: string): string {
+  return String(value ?? "").toUpperCase().replace(/[\s-]+/g, "");
+}
+
+/** Current format (UK123456712345) or an old 8-digit number. Expects a normalized value. */
+export function isAccountNumber(value: string): boolean {
+  return /^UK\d{12}$/.test(value) || /^\d{8}$/.test(value);
+}
+
+/** "UK123456712345" -> "UK1234567 12345" (old "12345678" -> "1234 5678"). */
 export function formatAccountNumber(value: string): string {
+  if (/^UK\d{12}$/.test(value)) return `${value.slice(0, 9)} ${value.slice(9)}`;
   return /^\d{8}$/.test(value) ? `${value.slice(0, 4)} ${value.slice(4)}` : value;
 }
 

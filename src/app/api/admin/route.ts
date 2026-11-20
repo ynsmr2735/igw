@@ -1,3 +1,4 @@
+import { ACCOUNT_NUMBER_HINT, isAccountNumber, normalizeAccountNumber } from "@/lib/format";
 import { errorResponse, readJson, toAmount, toId } from "@/lib/api";
 import {
   approveDeposit,
@@ -114,16 +115,16 @@ export async function POST(request: Request) {
       case "cards":
         return Response.json({ ok: true, cards: await listCards() });
       case "setCard": {
-        const account = String(body.accountNumber ?? "").replace(/\s+/g, "");
-        if (!/^\d{8}$/.test(account)) return Response.json({ error: "Account numbers have exactly 8 digits." }, { status: 400 });
+        const account = normalizeAccountNumber(String(body.accountNumber ?? ""));
+        if (!isAccountNumber(account)) return Response.json({ error: ACCOUNT_NUMBER_HINT }, { status: 400 });
         if (typeof body.active !== "boolean") return Response.json({ error: "active must be true or false" }, { status: 400 });
         if (body.active && !isCardTier(body.tier)) return Response.json({ error: "Choose a card: Standard, Gold, Premium or Merchant." }, { status: 400 });
         const card = await setCard(account, isCardTier(body.tier) ? body.tier : null, body.active, typeof body.reason === "string" ? body.reason : null);
         return Response.json({ ok: true, card });
       }
       case "lookupMember": {
-        const account = String(body.accountNumber ?? "").replace(/\s+/g, "");
-        if (!/^\d{8}$/.test(account)) return Response.json({ error: "Account numbers have exactly 8 digits." }, { status: 400 });
+        const account = normalizeAccountNumber(String(body.accountNumber ?? ""));
+        if (!isAccountNumber(account)) return Response.json({ error: ACCOUNT_NUMBER_HINT }, { status: 400 });
         return Response.json({ ok: true, member: await lookupMember(account) });
       }
       case "readNotifications": {

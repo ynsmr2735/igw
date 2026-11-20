@@ -1,4 +1,5 @@
 import { errorResponse, readJson, toAmount } from "@/lib/api";
+import { ACCOUNT_NUMBER_HINT, isAccountNumber, normalizeAccountNumber } from "@/lib/format";
 import { lookupRecipient, sendTransfer } from "@/lib/wallet";
 
 export const dynamic = "force-dynamic";
@@ -6,7 +7,7 @@ export const dynamic = "force-dynamic";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Member-to-member transfers by 8-digit account number.
+ * Member-to-member transfers by account number (UK1234567 12345; old 8-digit numbers still work).
  *   { action: "lookup", accountNumber }                              -> masked recipient name
  *   { action: "send", accountNumber, amount, idempotencyKey, note }  -> atomic transfer
  */
@@ -14,9 +15,9 @@ export async function POST(request: Request) {
   const body = await readJson(request);
   if (body instanceof Response) return body;
 
-  const accountNumber = String(body.accountNumber ?? "").replace(/\s+/g, "");
-  if (!/^\d{8}$/.test(accountNumber)) {
-    return Response.json({ error: "Account numbers have exactly 8 digits." }, { status: 400 });
+  const accountNumber = normalizeAccountNumber(String(body.accountNumber ?? ""));
+  if (!isAccountNumber(accountNumber)) {
+    return Response.json({ error: ACCOUNT_NUMBER_HINT }, { status: 400 });
   }
 
   try {

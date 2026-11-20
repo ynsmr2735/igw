@@ -7,7 +7,7 @@
 export type PaymentMethod = "btc" | "usdt_trc20";
 
 /** Database version this code needs (public.igw_health()). Run supabase/schema.sql if it differs. */
-export const EXPECTED_SCHEMA = "igw-rpc-10";
+export const EXPECTED_SCHEMA = "igw-rpc-11";
 
 export const PAYMENT_METHODS: PaymentMethod[] = ["btc", "usdt_trc20"];
 
