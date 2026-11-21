@@ -199,7 +199,7 @@ export default async function LandingPage() {
                     <div className="mx-auto h-5 w-24 rounded-full bg-[#151a32]" />
                     <div className="mt-5 flex items-center justify-between">
                       <div>
-                        <p className="text-[9px] font-medium text-white/70">Good morning, Deniz 👋</p>
+                        <p className="text-[9px] font-medium text-white/70">Good morning, David 👋</p>
                         <p className="text-[14px] font-bold text-white">Total balance</p>
                       </div>
                       <span className="flex h-8 w-8 items-center justify-center rounded-full igw-dark-glass text-white text-[10px] font-bold">DA</span>
@@ -269,7 +269,7 @@ export default async function LandingPage() {
                 </div>
                 <p className="mt-5 font-mono text-[15px] tracking-[0.18em]">•••• •••• •••• 4291</p>
                 <div className="mt-3 flex justify-between text-[9px] font-semibold uppercase tracking-widest opacity-80">
-                  <span>Deniz Arslan</span><span>09/29</span>
+                  <span>David JOHNSON</span><span>09/29</span>
                 </div>
               </div>
             </div>
@@ -394,7 +394,7 @@ export default async function LandingPage() {
                 </div>
                 <p className="mt-12 font-mono text-lg tracking-[0.2em]">4821 •••• •••• 4291</p>
                 <div className="mt-6 flex justify-between text-[10px] uppercase tracking-widest text-white/70">
-                  <span>Deniz Arslan</span><span>09/29</span>
+                  <span>David JOHNSON</span><span>09/29</span>
                 </div>
               </div>
             </div>
@@ -408,7 +408,7 @@ export default async function LandingPage() {
               </div>
               <p className="mt-12 font-mono text-lg tracking-[0.2em]">•••• •••• •••• 8803</p>
               <div className="mt-6 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
-                <span>Deniz Arslan</span><span>04/28</span>
+                <span>David JOHNSAN</span><span>04/28</span>
               </div>
             </div>
           </div>
