@@ -547,8 +547,8 @@ export default async function LandingPage() {
             ))}
           </div>
           <div className="mt-12 flex flex-col justify-between gap-3 border-t border-slate-200 pt-6 text-[11px] text-slate-400 sm:flex-row">
-            <p>© {new Date().getFullYear()} Insta Global Wallet. All rights reserved.</p>
-            <p>© Copyright 2022 Barclays Bank       · instaglobalwallet.com</p>
+            <p>© 2022 Insta Global Wallet. All rights reserved.</p>
+            <p>© Copyright 1896 Barclays Bank       · instaglobalwallet.com</p>
           </div>
         </div>
       </footer>
