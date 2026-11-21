@@ -28,6 +28,7 @@ import { Brand } from "@/components/Brand";
 import WithdrawSection from "@/components/WithdrawSection";
 import { ContactDetails } from "@/components/ContactDetails";
 import { hasContact } from "@/lib/contact";
+import { KYC_STATUS_LABEL } from "@/lib/kyc";
 import { signOutAction } from "@/app/auth/actions";
 import {
   DEPOSIT_STATUS_LABEL,
@@ -962,6 +963,7 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
                 </dd>
               </div>
               <div><dt className="text-[11px] text-slate-500">Member since</dt><dd className="mt-1 font-bold">{formatDate(data.user.memberSince)}</dd></div>
+              <div><dt className="text-[11px] text-slate-500">Identity</dt><dd className="mt-1 font-bold" data-testid="profile-kyc">{KYC_STATUS_LABEL[data.withdrawalCenter.kyc.status]}</dd></div>
             </dl>
           </Card>
 

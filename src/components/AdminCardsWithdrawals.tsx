@@ -1,5 +1,6 @@
 "use client";
 
+import { KycBadge, KycPhotos } from "@/components/AdminKyc";
 import { useCallback, useEffect, useState } from "react";
 import { CheckCircle2, CreditCard, ExternalLink, Loader2, Search, XCircle } from "lucide-react";
 import type { AdminCard, AdminCardRequest, AdminWithdrawal, MemberLookup } from "@/lib/admin";
@@ -285,10 +286,22 @@ function CardRequestRow({
         </div>
       </div>
       {r.note && <p className="mt-2 rounded-lg bg-white/70 px-2.5 py-1.5 text-slate-600">Note: {r.note}</p>}
+      {pending && (
+        <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3" data-testid="card-request-kyc">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Identity documents</p>
+            <KycBadge kyc={r.kyc} />
+            {r.kyc && <span className="text-slate-500">{r.kyc.documentName} · {formatDate(r.kyc.createdAt)}</span>}
+          </div>
+          {r.kyc ? <KycPhotos kyc={r.kyc} compact /> : <p className="text-rose-600">No documents uploaded yet — the card cannot be activated until the member sends them.</p>}
+          {r.kyc?.status === "pending" && <p className="mt-2 text-slate-500">Activating the card also marks these documents as verified. If they are not acceptable, reject them in Identity (KYC).</p>}
+          {r.kyc?.status === "rejected" && <p className="mt-2 text-rose-600">These documents were rejected{r.kyc.rejectionReason ? `: ${r.kyc.rejectionReason}` : ""}.</p>}
+        </div>
+      )}
       {pending && !rejecting && (
         <div className="mt-3 flex flex-wrap gap-2">
-          <button onClick={() => decide(true)} disabled={busy} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />} ACTIVATE {r.tierName.toUpperCase()} CARD
+          <button onClick={() => decide(true)} disabled={busy || !r.kyc || r.kyc.status === "rejected"} className={`${button} bg-emerald-600 text-white hover:bg-emerald-700`}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />} {r.kyc?.status === "pending" ? "VERIFY ID & " : ""}ACTIVATE {r.tierName.toUpperCase()} CARD
           </button>
           <button onClick={() => setRejecting(true)} disabled={busy} className={`${button} bg-rose-600 text-white hover:bg-rose-700`}>
             <XCircle className="h-4 w-4" /> REJECT
@@ -375,6 +388,14 @@ function ManageMemberCard({ onChanged, notify }: { onChanged: () => Promise<void
               <b>none</b>
             )}
           </p>
+          <div className="flex flex-wrap items-center gap-2" data-testid="member-kyc">
+            Identity: <KycBadge kyc={member.kyc} />
+            {member.kyc && <span className="text-slate-500">{member.kyc.documentName} · {formatDate(member.kyc.createdAt)}</span>}
+          </div>
+          {member.kyc && <KycPhotos kyc={member.kyc} compact />}
+          {(!member.kyc || member.kyc.status === "rejected") && (
+            <p className="text-amber-700">A card can only be activated after the member uploads identity documents (with a card request in their Withdraw section).</p>
+          )}
           <div className="flex flex-wrap items-center gap-2">
             <label htmlFor="set-tier" className="font-bold">Card</label>
             <select id="set-tier" value={tier} onChange={(e) => setTier(e.target.value as CardTier)} className="h-10 rounded-xl border border-slate-200 bg-white px-3 font-bold">

@@ -199,7 +199,7 @@ export default async function LandingPage() {
                     <div className="mx-auto h-5 w-24 rounded-full bg-[#151a32]" />
                     <div className="mt-5 flex items-center justify-between">
                       <div>
-                        <p className="text-[9px] font-medium text-white/70">Good morning, David 👋</p>
+                        <p className="text-[9px] font-medium text-white/70">Good morning, Deniz 👋</p>
                         <p className="text-[14px] font-bold text-white">Total balance</p>
                       </div>
                       <span className="flex h-8 w-8 items-center justify-center rounded-full igw-dark-glass text-white text-[10px] font-bold">DA</span>
@@ -269,7 +269,7 @@ export default async function LandingPage() {
                 </div>
                 <p className="mt-5 font-mono text-[15px] tracking-[0.18em]">•••• •••• •••• 4291</p>
                 <div className="mt-3 flex justify-between text-[9px] font-semibold uppercase tracking-widest opacity-80">
-                  <span>David JOHNSON</span><span>09/29</span>
+                  <span>Deniz Arslan</span><span>09/29</span>
                 </div>
               </div>
             </div>
@@ -336,7 +336,7 @@ export default async function LandingPage() {
               <h3 className="mt-6 text-lg font-extrabold tracking-tight text-[#10152b]">{feature.title}</h3>
               <p className="mt-3 text-[13px] leading-6 text-slate-600">{feature.text}</p>
               <div className="mt-6 flex items-center gap-1 text-xs font-bold text-[#7F00FF]">
-                MORE <ArrowRight className="h-3.5 w-3.5 transition group-hover:translate-x-1" />
+                Daha fazla <ArrowRight className="h-3.5 w-3.5 transition group-hover:translate-x-1" />
               </div>
             </article>
           ))}
@@ -394,7 +394,7 @@ export default async function LandingPage() {
                 </div>
                 <p className="mt-12 font-mono text-lg tracking-[0.2em]">4821 •••• •••• 4291</p>
                 <div className="mt-6 flex justify-between text-[10px] uppercase tracking-widest text-white/70">
-                  <span>David JOHNSON</span><span>09/29</span>
+                  <span>Deniz Arslan</span><span>09/29</span>
                 </div>
               </div>
             </div>
@@ -408,7 +408,7 @@ export default async function LandingPage() {
               </div>
               <p className="mt-12 font-mono text-lg tracking-[0.2em]">•••• •••• •••• 8803</p>
               <div className="mt-6 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
-                <span>David JOHNSAN</span><span>04/28</span>
+                <span>Deniz Arslan</span><span>04/28</span>
               </div>
             </div>
           </div>
@@ -547,8 +547,8 @@ export default async function LandingPage() {
             ))}
           </div>
           <div className="mt-12 flex flex-col justify-between gap-3 border-t border-slate-200 pt-6 text-[11px] text-slate-400 sm:flex-row">
-            <p>© 2022 Insta Global Wallet. All rights reserved.</p>
-            <p>© Copyright 1896 Barclays Bank       · instaglobalwallet.com</p>
+            <p>© {new Date().getFullYear()} Insta Global Wallet. All rights reserved.</p>
+            <p>Demo interface · instaglobalwallet.com</p>
           </div>
         </div>
       </footer>

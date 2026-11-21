@@ -71,6 +71,29 @@ export function isServiceKeyConfigured(): boolean {
   return Boolean(SERVICE_KEY);
 }
 
+/**
+ * Server-only request to another Supabase API (Storage) with the service role key.
+ * Used for the private identity-document bucket; the key never reaches the browser.
+ */
+export async function serviceRequest(path: string, init: { method?: string; headers?: Record<string, string>; body?: BodyInit } = {}): Promise<Response> {
+  if (!isSupabaseConfigured()) {
+    throw new SetupError("Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY.");
+  }
+  if (!SERVICE_KEY) {
+    throw new SetupError(
+      "SUPABASE_SERVICE_ROLE_KEY is not set. It is needed to store identity documents. Add the secret (service role) key from Supabase -> Project Settings -> API Keys to the server environment.",
+    );
+  }
+  const headers: Record<string, string> = { apikey: SERVICE_KEY, ...(init.headers ?? {}) };
+  if (SERVICE_KEY.startsWith("eyJ")) headers.Authorization = `Bearer ${SERVICE_KEY}`;
+  try {
+    return await fetch(`${SUPABASE_URL}${path}`, { method: init.method ?? "GET", headers, body: init.body, cache: "no-store" });
+  } catch (error) {
+    console.error(`Supabase ${path} network error:`, error);
+    throw new SetupError("Cannot reach Supabase. Check NEXT_PUBLIC_SUPABASE_URL (https://<ref>.supabase.co).");
+  }
+}
+
 /** Calls a function that only the service role may execute (trusted server input). */
 export function serviceRpc<T>(fn: string, args: Record<string, unknown> = {}): Promise<T> {
   return rpc<T>(fn, args, { service: true });

@@ -1,3 +1,4 @@
+import { toKycState, type KycState } from "@/lib/kyc";
 /**
  * Cards and withdrawals — shared types (browser + server, no secrets).
  * A member needs an ACTIVE card to request a withdrawal. Cards are requested by the
@@ -88,6 +89,8 @@ export type WithdrawalCenter = {
   remainingToday: number | null;
   minUsd: number;
   withdrawals: Withdrawal[];
+  /** Identity verification (needed before a card can be activated). */
+  kyc: KycState;
 };
 
 const num = (v: unknown) => Number(v ?? 0);
@@ -133,6 +136,7 @@ export function toWithdrawalCenter(raw: Record<string, unknown> | null | undefin
     remainingToday: numOrNull(r.remainingToday),
     minUsd: num(r.minUsd),
     withdrawals: ((r.withdrawals as Record<string, unknown>[]) ?? []).map(toWithdrawal),
+    kyc: toKycState(r.kyc),
   };
 }
 

@@ -10,6 +10,7 @@ import {
   type Withdrawal,
 } from "@/lib/cards";
 import { toContact, type ContactInfo } from "@/lib/contact";
+import { toAdminKyc, type AdminKycSubmission } from "@/lib/kyc";
 import { toMethodConfig, type MethodConfig, type PaymentMethod } from "@/lib/payment-methods";
 import { AuthError, RpcError, SetupError, rpc } from "@/lib/supabase";
 import { assertSchema } from "@/lib/system";
@@ -39,6 +40,7 @@ export type AdminOverview = {
     rejected: number;
     withdrawalsPending: number;
     cardRequestsPending: number;
+    kycPending: number;
     activeCards: number;
     users: number;
     totalBalance: number;
@@ -232,6 +234,7 @@ export type AdminPoll = {
   newRequests: { notificationId: number; requestId: number; reference: string; method: PaymentMethod; amountUsd: number; userName: string }[];
   withdrawalsPending: number;
   cardRequestsPending: number;
+  kycPending: number;
   /** Unseen withdrawal requests and card requests (for the sound alert and highlighting). */
   newOther: { notificationId: number; kind: "withdrawal_submitted" | "card_requested"; id: number; reference: string; amountUsd: number | null; tier: string | null; userName: string }[];
 };
@@ -255,6 +258,7 @@ export async function pollAdmin(): Promise<AdminPoll> {
     })),
     withdrawalsPending: Number(raw.withdrawalsPending ?? 0),
     cardRequestsPending: Number(raw.cardRequestsPending ?? 0),
+    kycPending: Number(raw.kycPending ?? 0),
     newOther: ((raw.newOther as Record<string, unknown>[]) ?? []).map((n) => ({
       notificationId: Number(n.notificationId),
       kind: n.kind === "card_requested" ? "card_requested" : "withdrawal_submitted",
@@ -274,9 +278,9 @@ export async function markAdminNotificationsRead(ids: number[] | null): Promise<
 /* ---------------- cards and withdrawals (admin) ---------------- */
 
 export type AdminWithdrawal = Withdrawal & { user: { id: string; name: string; email: string; accountNumber: string; balance: number } };
-export type AdminCardRequest = CardRequest & { currentCard: MemberCard | null; email: string; balance: number; reviewedBy: string | null };
+export type AdminCardRequest = CardRequest & { currentCard: MemberCard | null; email: string; balance: number; reviewedBy: string | null; kyc: AdminKycSubmission | null };
 export type AdminCard = MemberCard & { userName: string; email: string; accountNumber: string; usedLast24h: number };
-export type MemberLookup = { name: string; email: string; accountNumber: string; balance: number; card: MemberCard | null; usedLast24h: number };
+export type MemberLookup = { name: string; email: string; accountNumber: string; balance: number; card: MemberCard | null; usedLast24h: number; kyc: AdminKycSubmission | null };
 
 const WITHDRAWAL_STATUSES = ["pending", "approved", "rejected", "cancelled"];
 
@@ -316,6 +320,7 @@ export async function listCardRequests(status: string | null): Promise<AdminCard
   return (rows ?? []).map((r) => ({
     ...toCardRequest(r)!,
     currentCard: toCard(r.currentCard),
+    kyc: toAdminKyc(r.kyc),
     email: String(r.email ?? ""),
     balance: Number(r.balance ?? 0),
     reviewedBy: (r.reviewedBy as string | null) ?? null,
@@ -365,6 +370,7 @@ export async function lookupMember(accountNumber: string): Promise<MemberLookup>
     accountNumber: String(raw.accountNumber ?? ""),
     balance: Number(raw.balance ?? 0),
     card: toCard(raw.card),
+    kyc: toAdminKyc(raw.kyc),
     usedLast24h: Number(raw.usedLast24h ?? 0),
   };
 }
@@ -372,4 +378,21 @@ export async function lookupMember(accountNumber: string): Promise<MemberLookup>
 /** Saves the website contact details (validated + audited in the database). */
 export async function setContact(contact: Record<string, string>): Promise<ContactInfo> {
   return toContact(await rpc<unknown>("igw_admin_set_contact", { p_token: await token(), p_contact: contact }));
+}
+
+/** Identity documents (KYC) submitted by members; pending first. */
+export async function listKyc(status: "pending" | "approved" | "rejected" | null): Promise<AdminKycSubmission[]> {
+  const raw = await rpc<unknown[]>("igw_admin_kyc_list", { p_token: await token(), p_status: status });
+  return (raw ?? []).map((r) => toAdminKyc(r)!).filter(Boolean);
+}
+
+/** Approve or reject identity documents (rejecting also closes a pending card request). */
+export async function decideKyc(id: number, approve: boolean, reason: string | null): Promise<AdminKycSubmission> {
+  const raw = await rpc<{ kyc: unknown }>("igw_admin_kyc_decide", { p_token: await token(), p_id: id, p_approve: approve, p_reason: reason });
+  return toAdminKyc(raw.kyc)!;
+}
+
+/** Storage path of one identity photo (admin only). */
+export async function kycFile(id: number, side: "front" | "back"): Promise<{ path: string; type: string; size: number }> {
+  return rpc("igw_admin_kyc_file", { p_token: await token(), p_id: id, p_side: side });
 }

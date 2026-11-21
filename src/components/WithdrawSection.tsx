@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
-import { ArrowUpRight, CheckCircle2, CreditCard, ExternalLink, Loader2 } from "lucide-react";
+import { ArrowUpRight, CheckCircle2, CreditCard, ExternalLink, Loader2, ShieldCheck } from "lucide-react";
+import { KycStatusLine, postForm, useKycForm } from "@/components/KycUpload";
 import { CARD_TIER_STYLE, formatValidThru, type CardTier, type MemberCard, type WithdrawalCenter } from "@/lib/cards";
 import { formatDate, formatMoney } from "@/lib/format";
 import { Badge, Card, STATUS_TONE, SectionTitle, postJson, type Toast } from "@/components/wallet-ui";
@@ -93,6 +94,37 @@ export default function WithdrawSection({
   const card = center.card;
   const active = card?.status === "active";
   const pending = center.pendingCardRequest;
+  // Identity documents are needed with the card request (none yet, or the last ones were rejected).
+  const needsDocuments = center.kyc.status === "none" || center.kyc.status === "rejected";
+  const kycForm = useKycForm();
+  // The card form / document form show their own error next to the button.
+  const errorInForm = (!active && !pending) || (active && showUpgrade) || (Boolean(pending) && needsDocuments);
+
+  async function sendDocuments(action: "requestCard" | "submitKyc", success: string) {
+    const missing = kycForm.missing();
+    if (missing) return setError(missing), false;
+    setBusy(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("action", action);
+      if (action === "requestCard") {
+        form.append("tier", tier);
+        form.append("note", note);
+      }
+      kycForm.appendTo(form);
+      await postForm("/api/withdrawals", form);
+      kycForm.reset();
+      await onChanged();
+      notify({ type: "ok", message: success });
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function run(body: Record<string, unknown>, success: string) {
     setBusy(true);
@@ -112,7 +144,10 @@ export default function WithdrawSection({
 
   async function requestCard(event: FormEvent) {
     event.preventDefault();
-    if (await run({ action: "requestCard", tier, note }, "Your card request has been sent. Awaiting admin review.")) {
+    const sent = needsDocuments
+      ? await sendDocuments("requestCard", "Your card request and identity documents have been sent. Awaiting admin review.")
+      : await run({ action: "requestCard", tier, note }, "Your card request has been sent. Awaiting admin review.");
+    if (sent) {
       setNote("");
       setShowUpgrade(false);
     }
@@ -158,12 +193,16 @@ export default function WithdrawSection({
         </label>
         <input id="card-note" value={note} maxLength={300} onChange={(e) => setNote(e.target.value)} className={inputClass} />
       </div>
+      {needsDocuments && kycForm.fields}
+      {error && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[12px] font-semibold text-rose-600" data-testid="card-request-error">{error}</p>}
       <div className="flex flex-wrap items-center gap-3">
-        <button type="submit" disabled={busy} className={primaryButton}>
+        <button type="submit" disabled={busy || kycForm.preparing} className={primaryButton}>
           {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CreditCard className="h-4 w-4" />}
           Request {CARD_TIER_STYLE[tier].name} card
         </button>
-        <p className="text-[11px] text-slate-500">No fee. An admin reviews your request and activates the card.</p>
+        <p className="text-[11px] text-slate-500">
+          No fee. An admin {needsDocuments ? "checks your documents, reviews your request" : "reviews your request"} and activates the card.
+        </p>
       </div>
     </form>
   );
@@ -193,6 +232,7 @@ export default function WithdrawSection({
         </div>
 
         <div className="min-w-0 space-y-4">
+          <KycStatusLine kyc={center.kyc} />
           {card && card.status === "expired" && (
             <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-[12px] text-amber-900" data-testid="card-expired">
               Your {card.tierName} card expired ({formatValidThru(card.validUntil)}). Request it again below; once an admin renews it, it is valid for another 3 years.
@@ -214,6 +254,24 @@ export default function WithdrawSection({
                 Cancel request
               </button>
             </div>
+          )}
+
+          {pending && needsDocuments && (
+            <form
+              onSubmit={(e: FormEvent) => {
+                e.preventDefault();
+                void sendDocuments("submitKyc", "Your identity documents have been sent. Awaiting admin review.");
+              }}
+              className="space-y-3"
+              data-testid="kyc-only-form"
+            >
+              <p className="text-[12px] font-bold text-amber-800">Your card request can only be approved after identity verification. Please upload your documents.</p>
+              {kycForm.fields}
+              {error && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[12px] font-semibold text-rose-600">{error}</p>}
+              <button type="submit" disabled={busy || kycForm.preparing} className={primaryButton}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />} Send identity documents
+              </button>
+            </form>
           )}
 
           {!active && !pending && (
@@ -298,7 +356,7 @@ export default function WithdrawSection({
             </div>
           )}
 
-          {error && (
+          {error && !errorInForm && (
             <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-3 text-[12px] font-semibold text-rose-600">
               {error}
             </p>

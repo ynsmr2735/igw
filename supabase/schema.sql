@@ -419,6 +419,46 @@ insert into public.app_settings (key, value) values
 on conflict (key) do nothing;
 
 alter table public.member_cards enable row level security;
+-- igw-rpc-12: identity verification (KYC). The images are in the private Storage bucket
+-- "kyc-documents"; only their paths are stored here.
+create table if not exists public.kyc_submissions (
+  id bigint generated always as identity primary key,
+  reference text not null unique,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  document_type text not null check (document_type in ('national_id', 'driving_licence', 'passport')),
+  front_path text not null,
+  front_type text not null check (front_type in ('image/jpeg', 'image/png', 'image/webp')),
+  front_size integer not null check (front_size between 1 and 5242880),
+  back_path text not null,
+  back_type text not null check (back_type in ('image/jpeg', 'image/png', 'image/webp')),
+  back_size integer not null check (back_size between 1 and 5242880),
+  status text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  rejection_reason text,
+  created_at timestamptz not null default now(),
+  reviewed_at timestamptz,
+  reviewed_by uuid references public.profiles(id) on delete set null
+);
+-- At most one submission that is waiting or approved per member.
+create unique index if not exists kyc_submissions_one_open on public.kyc_submissions(user_id) where status in ('pending', 'approved');
+create index if not exists kyc_submissions_status_idx on public.kyc_submissions(status, created_at desc);
+alter table public.kyc_submissions enable row level security;
+revoke all on public.kyc_submissions from public, anon, authenticated;
+
+-- Private bucket for the identity images (Supabase Storage). No storage policies are created,
+-- so only the service role (the website's server) can read or write it. Skipped on plain
+-- Postgres without Supabase Storage.
+do $$
+begin
+  if exists (select 1 from pg_namespace where nspname = 'storage')
+     and exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'storage' and c.relname = 'buckets') then
+    insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+    values ('kyc-documents', 'kyc-documents', false, 5242880, array['image/jpeg', 'image/png', 'image/webp'])
+    on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit,
+                                   allowed_mime_types = excluded.allowed_mime_types;
+  end if;
+end;
+$$;
+
 alter table public.card_requests enable row level security;
 alter table public.withdrawal_requests enable row level security;
 revoke all on public.member_cards, public.card_requests, public.withdrawal_requests from public, anon, authenticated;
@@ -1153,6 +1193,7 @@ begin
     'lastCardRequest', (select igw_private.card_request_json(r) from public.card_requests r
                         where r.user_id = p_user order by r.created_at desc, r.id desc limit 1),
     'tiers', igw_private.card_tiers(),
+    'kyc', igw_private.kyc_state(p_user),
     'canWithdraw', coalesce(v_card.status = 'active', false),
     'dailyLimit', v_limit,
     'usedLast24h', v_used,
@@ -1166,6 +1207,161 @@ begin
       from (select * from public.withdrawal_requests where user_id = p_user order by created_at desc, id desc limit 50) w
     ), '[]'::jsonb)
   );
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Identity verification (KYC), igw-rpc-12
+-- ---------------------------------------------------------------------------
+create or replace function igw_private.kyc_document_name(p_type text)
+returns text
+language sql
+immutable
+as $$
+  select case p_type when 'national_id' then 'ID card' when 'driving_licence' then 'Driving licence'
+                     when 'passport' then 'Passport' else p_type end;
+$$;
+
+-- Member view of a submission (no storage paths).
+create or replace function igw_private.kyc_json(k public.kyc_submissions)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select case when k.id is null then null else jsonb_build_object(
+    'id', k.id, 'reference', k.reference, 'documentType', k.document_type,
+    'documentName', igw_private.kyc_document_name(k.document_type),
+    'status', k.status, 'rejectionReason', k.rejection_reason,
+    'createdAt', k.created_at, 'reviewedAt', k.reviewed_at) end;
+$$;
+
+-- Latest submission of a member (the one that counts).
+create or replace function igw_private.kyc_latest(p_user uuid)
+returns public.kyc_submissions
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select * from public.kyc_submissions where user_id = p_user
+  order by (status in ('pending', 'approved')) desc, created_at desc, id desc limit 1;
+$$;
+
+-- 'none' | 'pending' | 'approved' | 'rejected'
+create or replace function igw_private.kyc_status(p_user uuid)
+returns text
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select coalesce((select (igw_private.kyc_latest(p_user)).status), 'none');
+$$;
+
+create or replace function igw_private.kyc_state(p_user uuid)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_build_object('status', igw_private.kyc_status(p_user),
+                            'submission', igw_private.kyc_json(igw_private.kyc_latest(p_user)));
+$$;
+
+-- Admin view of a submission (member details; images are fetched through the admin route).
+create or replace function igw_private.kyc_admin_json(k public.kyc_submissions)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select case when k.id is null then null else igw_private.kyc_json(k) || jsonb_build_object(
+    'userName', p.full_name, 'email', p.email, 'accountNumber', p.account_number,
+    'frontType', k.front_type, 'backType', k.back_type, 'frontSize', k.front_size, 'backSize', k.back_size,
+    'reviewedBy', (select coalesce(username, full_name) from public.profiles where id = k.reviewed_by),
+    'pendingCardRequest', (select igw_private.card_request_json(r) from public.card_requests r
+                           where r.user_id = k.user_id and r.status = 'pending' limit 1)) end
+  from (select 1) one left join public.profiles p on p.id = k.user_id;
+$$;
+
+-- Admin side: before a card is activated the member's identity must be verified. A pending
+-- submission is approved together with the activation (the admin saw the documents).
+create or replace function igw_private.kyc_require_for_activation(p_admin uuid, p_user uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_kyc public.kyc_submissions%rowtype := igw_private.kyc_latest(p_user);
+begin
+  if v_kyc.id is null then
+    raise exception 'This member has not uploaded identity documents yet. A card can only be activated after identity verification.';
+  end if;
+  if v_kyc.status = 'rejected' then
+    raise exception 'The member''s identity documents were rejected. They must upload new documents before a card can be activated.';
+  end if;
+  if v_kyc.status = 'pending' then
+    update public.kyc_submissions set status = 'approved', reviewed_at = now(), reviewed_by = p_admin
+    where id = v_kyc.id;
+    update public.notifications set read_at = now()
+    where kind = 'kyc_submitted' and read_at is null and (data->>'kycId')::bigint = v_kyc.id;
+    perform igw_private.audit(p_admin, 'kyc_approved', 'kyc_submission', v_kyc.reference,
+      jsonb_build_object('documentType', v_kyc.document_type, 'withCardActivation', true));
+    perform igw_private.notify(p_user, 'kyc_approved', 'Identity verified',
+      'Your identity documents have been verified.', jsonb_build_object('kycId', v_kyc.id));
+  end if;
+end;
+$$;
+
+-- Card request (member). Needs identity documents that are waiting for review or approved.
+create or replace function igw_private.create_card_request(p_uid uuid, p_tier text, p_note text, p_with_documents boolean default false)
+returns public.card_requests
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_profile public.profiles%rowtype;
+  v_card public.member_cards%rowtype;
+  v_request public.card_requests%rowtype;
+begin
+  if p_tier is null or p_tier not in ('standard', 'gold', 'premium', 'merchant') then
+    raise exception 'Choose a card: Standard, Gold, Premium or Merchant.';
+  end if;
+  select * into v_profile from public.profiles where id = p_uid;
+  select * into v_card from public.member_cards where user_id = p_uid;
+  -- An expired card of the same tier may be requested again (renewal).
+  if v_card.status = 'active' and v_card.tier = p_tier and (v_card.valid_until is null or v_card.valid_until > now()) then
+    raise exception 'Your % card is already active.', igw_private.card_tier_name(p_tier);
+  end if;
+  if exists (select 1 from public.card_requests where user_id = p_uid and status = 'pending') then
+    raise exception 'You already have a card request waiting for review.';
+  end if;
+  if igw_private.kyc_status(p_uid) not in ('pending', 'approved') then
+    raise exception 'Verify your identity first: upload the front and back of your ID card, driving licence or passport.';
+  end if;
+  insert into public.card_requests (reference, user_id, account_number, user_name, tier, note)
+  values (igw_private.new_reference('CRD'), p_uid, v_profile.account_number, v_profile.full_name, p_tier,
+          left(trim(coalesce(p_note, '')), 300))
+  returning * into v_request;
+
+  perform igw_private.notify(p_uid, 'card_request_received', 'Card request received',
+    format('Your %s card request (ref. %s) has been received. Awaiting admin review.', igw_private.card_tier_name(p_tier), v_request.reference),
+    jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier));
+  perform igw_private.notify_admins('card_requested', 'New card request',
+    format('%s (account %s) requests a %s card.%s', v_profile.full_name, igw_private.format_account_number(v_profile.account_number),
+           igw_private.card_tier_name(p_tier), case when p_with_documents then ' Identity documents attached.' else '' end),
+    jsonb_build_object('cardRequestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier,
+                       'userName', v_profile.full_name, 'accountNumber', v_profile.account_number));
+  return v_request;
+exception
+  when unique_violation then
+    raise exception 'You already have a card request waiting for review.';
 end;
 $$;
 
@@ -1418,7 +1614,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-11');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-12');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -2098,6 +2294,7 @@ begin
       'rejected', (select count(*) from public.deposit_requests where status = 'rejected'),
       'withdrawalsPending', (select count(*) from public.withdrawal_requests where status = 'pending'),
       'cardRequestsPending', (select count(*) from public.card_requests where status = 'pending'),
+      'kycPending', (select count(*) from public.kyc_submissions where status = 'pending'),
       'activeCards', (select count(*) from public.member_cards where status = 'active'),
       'users', (select count(*) from public.profiles),
       'totalBalance', (select coalesce(sum(balance), 0) from public.wallets where currency = 'USD')
@@ -2400,9 +2597,10 @@ begin
     'rejected', (select count(*) from public.deposit_requests where status = 'rejected'),
     'unreadCount', (select count(*) from public.notifications where user_id = v_admin and read_at is null),
     'latestRequestNotificationId', (select max(id) from public.notifications
-                                    where user_id = v_admin and kind in ('deposit_submitted', 'withdrawal_submitted', 'card_requested')),
+                                    where user_id = v_admin and kind in ('deposit_submitted', 'withdrawal_submitted', 'card_requested', 'kyc_submitted')),
     'withdrawalsPending', (select count(*) from public.withdrawal_requests where status = 'pending'),
     'cardRequestsPending', (select count(*) from public.card_requests where status = 'pending'),
+    'kycPending', (select count(*) from public.kyc_submissions where status = 'pending'),
     'newOther', coalesce((
       select jsonb_agg(jsonb_build_object(
         'notificationId', n.id, 'kind', n.kind,
@@ -2483,38 +2681,109 @@ set search_path = public, extensions
 as $$
 declare
   v_uid uuid := igw_private.require_user(p_token);
-  v_profile public.profiles%rowtype;
-  v_card public.member_cards%rowtype;
-  v_request public.card_requests%rowtype;
 begin
-  if p_tier is null or p_tier not in ('standard', 'gold', 'premium', 'merchant') then
-    raise exception 'Choose a card: Standard, Gold, Premium or Merchant.';
+  return igw_private.card_request_json(igw_private.create_card_request(v_uid, p_tier, p_note));
+end;
+$$;
+
+-- KYC step 1 (server, before uploading images): checks that the member may submit documents
+-- now and returns the member id for the storage path kyc/<member id>/<random>/front|back.
+create or replace function public.igw_kyc_prepare(p_token text, p_tier text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+  v_status text := igw_private.kyc_status(v_uid);
+  v_card public.member_cards%rowtype;
+begin
+  if v_status = 'pending' then
+    raise exception 'Your identity documents are already waiting for review.';
+  end if;
+  if v_status = 'approved' then
+    raise exception 'Your identity is already verified.';
+  end if;
+  if p_tier is not null then
+    if p_tier not in ('standard', 'gold', 'premium', 'merchant') then
+      raise exception 'Choose a card: Standard, Gold, Premium or Merchant.';
+    end if;
+    if exists (select 1 from public.card_requests where user_id = v_uid and status = 'pending') then
+      raise exception 'You already have a card request waiting for review.';
+    end if;
+    select * into v_card from public.member_cards where user_id = v_uid;
+    if v_card.status = 'active' and v_card.tier = p_tier and (v_card.valid_until is null or v_card.valid_until > now()) then
+      raise exception 'Your % card is already active.', igw_private.card_tier_name(p_tier);
+    end if;
+  end if;
+  return jsonb_build_object('userId', v_uid, 'folder', 'kyc/' || v_uid || '/' || gen_random_uuid());
+end;
+$$;
+
+-- KYC step 2 (server, after both images were uploaded to the private bucket): records the
+-- submission and, if a card was chosen, the card request - in one transaction.
+create or replace function public.igw_kyc_submit(
+  p_token text, p_document_type text,
+  p_front_path text, p_front_type text, p_front_size integer,
+  p_back_path text, p_back_type text, p_back_size integer,
+  p_tier text default null, p_note text default ''
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.require_user(p_token);
+  v_profile public.profiles%rowtype;
+  v_kyc public.kyc_submissions%rowtype;
+  v_request public.card_requests%rowtype;
+  v_folder text;
+begin
+  if p_document_type is null or p_document_type not in ('national_id', 'driving_licence', 'passport') then
+    raise exception 'Choose the document: ID card, driving licence or passport.';
+  end if;
+  -- Paths must be in this member's own folder (kyc/<member id>/<uuid>/front|back.<ext>).
+  v_folder := 'kyc/' || v_uid || '/';
+  if coalesce(p_front_path, '') !~ ('^' || v_folder || '[0-9a-f-]{36}/front\.(jpg|png|webp)$')
+     or coalesce(p_back_path, '') !~ ('^' || v_folder || '[0-9a-f-]{36}/back\.(jpg|png|webp)$')
+     or split_part(p_front_path, '/', 3) <> split_part(p_back_path, '/', 3) then
+    raise exception 'Invalid document upload. Please try again.';
+  end if;
+  if p_front_type not in ('image/jpeg', 'image/png', 'image/webp') or p_back_type not in ('image/jpeg', 'image/png', 'image/webp') then
+    raise exception 'Upload photos as JPG, PNG or WebP.';
+  end if;
+  if coalesce(p_front_size, 0) not between 1 and 5242880 or coalesce(p_back_size, 0) not between 1 and 5242880 then
+    raise exception 'Each photo can be at most 5 MB.';
+  end if;
+  if igw_private.kyc_status(v_uid) in ('pending', 'approved') then
+    raise exception 'Your identity documents are already %.', case igw_private.kyc_status(v_uid) when 'pending' then 'waiting for review' else 'verified' end;
   end if;
   select * into v_profile from public.profiles where id = v_uid;
-  select * into v_card from public.member_cards where user_id = v_uid;
-  -- An expired card of the same tier may be requested again (renewal).
-  if v_card.status = 'active' and v_card.tier = p_tier and (v_card.valid_until is null or v_card.valid_until > now()) then
-    raise exception 'Your % card is already active.', igw_private.card_tier_name(p_tier);
-  end if;
-  if exists (select 1 from public.card_requests where user_id = v_uid and status = 'pending') then
-    raise exception 'You already have a card request waiting for review.';
-  end if;
-  insert into public.card_requests (reference, user_id, account_number, user_name, tier, note)
-  values (igw_private.new_reference('CRD'), v_uid, v_profile.account_number, v_profile.full_name, p_tier,
-          left(trim(coalesce(p_note, '')), 300))
-  returning * into v_request;
+  insert into public.kyc_submissions (reference, user_id, document_type, front_path, front_type, front_size,
+                                      back_path, back_type, back_size)
+  values (igw_private.new_reference('KYC'), v_uid, p_document_type, p_front_path, p_front_type, p_front_size,
+          p_back_path, p_back_type, p_back_size)
+  returning * into v_kyc;
+  perform igw_private.notify(v_uid, 'kyc_received', 'Identity documents received',
+    format('Your %s photos (ref. %s) were received. An admin will review them.', lower(igw_private.kyc_document_name(p_document_type)), v_kyc.reference),
+    jsonb_build_object('kycId', v_kyc.id));
 
-  perform igw_private.notify(v_uid, 'card_request_received', 'Card request received',
-    format('Your %s card request (ref. %s) has been received. Awaiting admin review.', igw_private.card_tier_name(p_tier), v_request.reference),
-    jsonb_build_object('requestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier));
-  perform igw_private.notify_admins('card_requested', 'New card request',
-    format('%s (account %s) requests a %s card.', v_profile.full_name, igw_private.format_account_number(v_profile.account_number), igw_private.card_tier_name(p_tier)),
-    jsonb_build_object('cardRequestId', v_request.id, 'reference', v_request.reference, 'tier', p_tier,
-                       'userName', v_profile.full_name, 'accountNumber', v_profile.account_number));
-  return igw_private.card_request_json(v_request);
+  if p_tier is not null then
+    v_request := igw_private.create_card_request(v_uid, p_tier, p_note, true);
+  else
+    perform igw_private.notify_admins('kyc_submitted', 'Identity documents uploaded',
+      format('%s (account %s) uploaded a %s (front and back) for identity verification.', v_profile.full_name,
+             igw_private.format_account_number(v_profile.account_number), lower(igw_private.kyc_document_name(p_document_type))),
+      jsonb_build_object('kycId', v_kyc.id, 'reference', v_kyc.reference, 'userName', v_profile.full_name,
+                         'accountNumber', v_profile.account_number));
+  end if;
+  return jsonb_build_object('ok', true, 'kyc', igw_private.kyc_json(v_kyc),
+                            'request', case when v_request.id is null then null else igw_private.card_request_json(v_request) end);
 exception
   when unique_violation then
-    raise exception 'You already have a card request waiting for review.';
+    raise exception 'Your identity documents are already waiting for review.';
 end;
 $$;
 
@@ -2769,6 +3038,7 @@ begin
   return coalesce((
     select jsonb_agg(igw_private.card_request_json(r) || jsonb_build_object(
              'currentCard', (select igw_private.card_json(c) from public.member_cards c where c.user_id = r.user_id),
+             'kyc', igw_private.kyc_admin_json(igw_private.kyc_latest(r.user_id)),
              'email', (select email from public.profiles where id = r.user_id),
              'balance', (select balance from public.wallets x where x.user_id = r.user_id and x.currency = 'USD'),
              'reviewedBy', (select coalesce(username, full_name) from public.profiles where id = r.reviewed_by))
@@ -2801,6 +3071,7 @@ begin
   update public.notifications set read_at = now()
   where kind = 'card_requested' and read_at is null and (data->>'cardRequestId')::bigint = v_request.id;
   if coalesce(p_approve, false) then
+    perform igw_private.kyc_require_for_activation(v_admin, v_request.user_id);
     v_card := igw_private.activate_card(v_admin, v_request.user_id, v_request.tier);
     update public.card_requests set status = 'approved', reviewed_at = now(), reviewed_by = v_admin
     where id = v_request.id returning * into v_request;
@@ -2869,6 +3140,7 @@ begin
     if p_tier is null or p_tier not in ('standard', 'gold', 'premium', 'merchant') then
       raise exception 'Choose a card: Standard, Gold, Premium or Merchant.';
     end if;
+    perform igw_private.kyc_require_for_activation(v_admin, v_profile.id);
     v_card := igw_private.activate_card(v_admin, v_profile.id, p_tier);
     -- A pending request is settled by this decision.
     update public.card_requests set status = 'approved', reviewed_at = now(), reviewed_by = v_admin
@@ -2916,8 +3188,110 @@ begin
     'name', v_profile.full_name, 'email', v_profile.email, 'accountNumber', v_profile.account_number,
     'balance', (select balance from public.wallets where user_id = v_profile.id and currency = 'USD'),
     'card', (select igw_private.card_json(c) from public.member_cards c where c.user_id = v_profile.id),
+    'kyc', igw_private.kyc_admin_json(igw_private.kyc_latest(v_profile.id)),
     'usedLast24h', igw_private.withdrawn_last_24h(v_profile.id)
   );
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Identity verification (KYC), admin side (igw-rpc-12)
+-- ---------------------------------------------------------------------------
+create or replace function public.igw_admin_kyc_list(p_token text, p_status text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+begin
+  return coalesce((
+    select jsonb_agg(igw_private.kyc_admin_json(k) order by (k.status = 'pending') desc, k.created_at desc, k.id desc)
+    from (select * from public.kyc_submissions where p_status is null or status = p_status
+          order by (status = 'pending') desc, created_at desc, id desc limit 300) k
+  ), '[]'::jsonb);
+end;
+$$;
+
+-- Storage path of one image, for the website's server to stream it to the admin.
+create or replace function public.igw_admin_kyc_file(p_token text, p_id bigint, p_side text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_kyc public.kyc_submissions%rowtype;
+begin
+  select * into v_kyc from public.kyc_submissions where id = p_id;
+  if not found then
+    raise exception 'Identity submission not found.';
+  end if;
+  if p_side = 'front' then
+    return jsonb_build_object('path', v_kyc.front_path, 'type', v_kyc.front_type, 'size', v_kyc.front_size);
+  elsif p_side = 'back' then
+    return jsonb_build_object('path', v_kyc.back_path, 'type', v_kyc.back_type, 'size', v_kyc.back_size);
+  end if;
+  raise exception 'Side must be front or back.';
+end;
+$$;
+
+create or replace function public.igw_admin_kyc_decide(p_token text, p_id bigint, p_approve boolean, p_reason text default null)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_kyc public.kyc_submissions%rowtype;
+  v_profile public.profiles%rowtype;
+  v_reason text := left(trim(coalesce(p_reason, '')), 500);
+  v_request public.card_requests%rowtype;
+begin
+  select * into v_kyc from public.kyc_submissions where id = p_id for update;
+  if not found then
+    raise exception 'Identity submission not found.';
+  end if;
+  if v_kyc.status <> 'pending' then
+    raise exception 'These identity documents have already been reviewed (status: %).', v_kyc.status;
+  end if;
+  select * into v_profile from public.profiles where id = v_kyc.user_id;
+  update public.notifications set read_at = now()
+  where kind = 'kyc_submitted' and read_at is null and (data->>'kycId')::bigint = v_kyc.id;
+  if coalesce(p_approve, false) then
+    update public.kyc_submissions set status = 'approved', reviewed_at = now(), reviewed_by = v_admin
+    where id = v_kyc.id returning * into v_kyc;
+    perform igw_private.audit(v_admin, 'kyc_approved', 'kyc_submission', v_kyc.reference,
+      jsonb_build_object('documentType', v_kyc.document_type, 'accountNumber', v_profile.account_number));
+    perform igw_private.notify(v_kyc.user_id, 'kyc_approved', 'Identity verified',
+      'Your identity documents have been verified.', jsonb_build_object('kycId', v_kyc.id));
+  else
+    if length(v_reason) < 3 then
+      raise exception 'Enter a reason for the rejection (sent to the member).';
+    end if;
+    update public.kyc_submissions set status = 'rejected', rejection_reason = v_reason, reviewed_at = now(), reviewed_by = v_admin
+    where id = v_kyc.id returning * into v_kyc;
+    -- A card request waiting on these documents cannot be approved any more: close it, so the
+    -- member can send new documents together with a new card request.
+    update public.card_requests
+    set status = 'rejected', rejection_reason = 'Identity verification rejected: ' || v_reason, reviewed_at = now(), reviewed_by = v_admin
+    where user_id = v_kyc.user_id and status = 'pending'
+    returning * into v_request;
+    if v_request.id is not null then
+      update public.notifications set read_at = now()
+      where kind = 'card_requested' and read_at is null and (data->>'cardRequestId')::bigint = v_request.id;
+    end if;
+    perform igw_private.audit(v_admin, 'kyc_rejected', 'kyc_submission', v_kyc.reference,
+      jsonb_build_object('documentType', v_kyc.document_type, 'accountNumber', v_profile.account_number, 'reason', v_reason,
+                         'cardRequestClosed', v_request.reference));
+    perform igw_private.notify(v_kyc.user_id, 'kyc_rejected', 'Identity documents rejected',
+      format('Your identity documents were rejected. Reason: %s. Please upload new photos.', v_reason),
+      jsonb_build_object('kycId', v_kyc.id, 'reason', v_reason));
+  end if;
+  return jsonb_build_object('ok', true, 'kyc', igw_private.kyc_admin_json(v_kyc));
 end;
 $$;
 
@@ -3030,6 +3404,11 @@ declare
     'public.igw_admin_member_lookup(text, text)',
     'public.igw_contact_info()',
     'public.igw_admin_set_contact(text, jsonb)',
+    'public.igw_kyc_prepare(text, text)',
+    'public.igw_kyc_submit(text, text, text, text, integer, text, text, integer, text, text)',
+    'public.igw_admin_kyc_list(text, text)',
+    'public.igw_admin_kyc_file(text, bigint, text)',
+    'public.igw_admin_kyc_decide(text, bigint, boolean, text)',
     'public.igw_admin_approve(text, bigint, numeric)',
     'public.igw_admin_transactions(text, integer)'
   ];

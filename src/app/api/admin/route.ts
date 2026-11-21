@@ -4,6 +4,8 @@ import {
   approveDeposit,
   approveWithdrawal,
   decideCardRequest,
+  decideKyc,
+  listKyc,
   listCardRequests,
   listCards,
   listWithdrawals,
@@ -111,6 +113,16 @@ export async function POST(request: Request) {
         if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
         if (typeof body.approve !== "boolean") return Response.json({ error: "approve must be true or false" }, { status: 400 });
         return Response.json({ ok: true, request: await decideCardRequest(id, body.approve, typeof body.reason === "string" ? body.reason : null) });
+      }
+      case "kyc": {
+        const status = body.status === "pending" || body.status === "approved" || body.status === "rejected" ? body.status : null;
+        return Response.json({ ok: true, submissions: await listKyc(status) });
+      }
+      case "decideKyc": {
+        const id = toId(body.id);
+        if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
+        if (typeof body.approve !== "boolean") return Response.json({ error: "approve must be true or false" }, { status: 400 });
+        return Response.json({ ok: true, kyc: await decideKyc(id, body.approve, typeof body.reason === "string" ? body.reason : null) });
       }
       case "cards":
         return Response.json({ ok: true, cards: await listCards() });

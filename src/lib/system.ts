@@ -1,5 +1,5 @@
 import { EXPECTED_SCHEMA } from "@/lib/payment-methods";
-import { SetupError, isServiceKeyConfigured, rpc, serviceRpc } from "@/lib/supabase";
+import { SetupError, isServiceKeyConfigured, rpc, serviceRequest, serviceRpc } from "@/lib/supabase";
 
 /**
  * Setup checks. The most common reason payments "do not work" after an update is
@@ -63,6 +63,7 @@ export async function getSystemStatus(): Promise<StatusItem[]> {
     try {
       await serviceRpc("igw_service_ping");
       items.push({ key: "serviceKey", label: "SUPABASE_SERVICE_ROLE_KEY", ok: true, required: true, detail: "Set and accepted by Supabase." });
+      items.push(await kycStorageStatus());
     } catch (error) {
       items.push({
         key: "serviceKey",
@@ -75,4 +76,28 @@ export async function getSystemStatus(): Promise<StatusItem[]> {
   }
 
   return items;
+}
+
+/** The private Storage bucket for identity documents (KYC) exists and is NOT public. */
+async function kycStorageStatus(): Promise<StatusItem> {
+  const label = "Identity documents storage";
+  try {
+    const response = await serviceRequest("/storage/v1/bucket/kyc-documents");
+    const text = await response.text();
+    if (!response.ok) {
+      return {
+        key: "kycStorage", label, ok: false, required: true,
+        detail: /not found/i.test(text)
+          ? 'Bucket "kyc-documents" is missing. Run the whole supabase/schema.sql in the SQL Editor (it creates the private bucket).'
+          : `Supabase Storage answered ${response.status}. Check SUPABASE_SERVICE_ROLE_KEY.`,
+      };
+    }
+    const bucket = JSON.parse(text || "{}") as { public?: boolean };
+    if (bucket.public) {
+      return { key: "kycStorage", label, ok: false, required: true, detail: 'Bucket "kyc-documents" is PUBLIC. Run supabase/schema.sql again, or turn off "Public bucket" in Supabase → Storage.' };
+    }
+    return { key: "kycStorage", label, ok: true, required: true, detail: 'Private bucket "kyc-documents" ready.' };
+  } catch (error) {
+    return { key: "kycStorage", label, ok: false, required: true, detail: error instanceof Error ? error.message : "Storage check failed" };
+  }
 }

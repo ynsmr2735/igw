@@ -27,6 +27,7 @@ import {
 import { Brand } from "@/components/Brand";
 import { AdminCardsView, AdminWithdrawalsView } from "@/components/AdminCardsWithdrawals";
 import { AdminContactView } from "@/components/AdminContact";
+import { AdminKycView } from "@/components/AdminKyc";
 import { signOutAction } from "@/app/auth/actions";
 import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AuditEntry } from "@/lib/admin";
 import {
@@ -52,13 +53,14 @@ import {
 } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, ToastView, postJson, type Toast } from "@/components/wallet-ui";
 
-type View = "notifications" | "deposits" | "withdrawals" | "cards" | "transactions" | "settings" | "contact" | "audit";
+type View = "notifications" | "deposits" | "withdrawals" | "cards" | "kyc" | "transactions" | "settings" | "contact" | "audit";
 
 const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "deposits", label: "Payment requests", icon: Inbox },
   { id: "withdrawals", label: "Withdrawals", icon: ArrowUpRight },
   { id: "cards", label: "Cards", icon: CreditCard },
+  { id: "kyc", label: "Identity (KYC)", icon: ShieldCheck },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
   { id: "settings", label: "Payment methods", icon: Settings },
   { id: "contact", label: "Contact details", icon: Phone },
@@ -95,6 +97,8 @@ const AUDIT_LABEL: Record<string, string> = {
   card_deactivated: "Card deactivated",
   card_request_rejected: "Card request rejected",
   contact_updated: "Contact details changed",
+  kyc_approved: "Identity verified",
+  kyc_rejected: "Identity documents rejected",
   deposit_rejected: "Payment rejected",
 };
 
@@ -120,6 +124,10 @@ function auditSummary(entry: AuditEntry): string {
       return `account ${entry.targetId} · ${String(d.tier)}${d.reason ? ` · reason: ${String(d.reason)}` : ""}`;
     case "card_request_rejected":
       return `${entry.targetId} · account ${formatAccountNumber(String(d.accountNumber))} · ${String(d.tier)} · reason: ${String(d.reason)}`;
+    case "kyc_approved":
+      return `${entry.targetId} · ${String(d.documentType ?? "").replace("_", " ")}${d.accountNumber ? ` · ${formatAccountNumber(String(d.accountNumber))}` : ""}${d.withCardActivation ? " · with card activation" : ""}`;
+    case "kyc_rejected":
+      return `${entry.targetId} · ${formatAccountNumber(String(d.accountNumber ?? ""))} · reason: ${String(d.reason ?? "")}${d.cardRequestClosed ? ` · card request ${String(d.cardRequestClosed)} closed` : ""}`;
     case "contact_updated": {
       const prev = (d.previous ?? {}) as Record<string, string>;
       const next = (d.new ?? {}) as Record<string, string>;
@@ -889,6 +897,7 @@ export default function AdminClient({
         new: p.newRequests.length,
         withdrawalsPending: p.withdrawalsPending,
         cardRequestsPending: p.cardRequestsPending,
+        kycPending: p.kycPending,
       },
     }));
     const latest = p.latestRequestNotificationId ?? 0;
@@ -1014,6 +1023,7 @@ export default function AdminClient({
               : item.id === "deposits" ? overview.counts.reviewing
               : item.id === "withdrawals" ? overview.counts.withdrawalsPending ?? 0
               : item.id === "cards" ? overview.counts.cardRequestsPending ?? 0
+              : item.id === "kyc" ? overview.counts.kycPending ?? 0
               : 0;
             return (
               <button
@@ -1075,7 +1085,7 @@ export default function AdminClient({
               Sound alerts are blocked by the browser until you interact with the page. Click here to enable them.
             </button>
           )}
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
             {[
               ["New payments", overview.counts.new, "new", "text-amber-600"],
               ["Pending payments", overview.counts.reviewing, "pending", "text-[#7F00FF]"],
@@ -1083,6 +1093,7 @@ export default function AdminClient({
               ["Rejected payments", overview.counts.rejected, "rejected", "text-rose-600"],
               ["Pending withdrawals", overview.counts.withdrawalsPending ?? 0, "withdrawals", "text-rose-600"],
               ["Card requests", overview.counts.cardRequestsPending ?? 0, "card-requests", "text-[#7F00FF]"],
+              ["Identity checks", overview.counts.kycPending ?? 0, "kyc", "text-amber-600"],
               ["Members", overview.counts.users, "members", ""],
             ].map(([label, value, key, tone]) => (
               <div key={String(key)} className="rounded-2xl border border-slate-100 bg-white p-4 igw-shadow-soft" data-testid={`count-${key}`}>
@@ -1270,6 +1281,8 @@ export default function AdminClient({
               notify={setToast}
             />
           )}
+
+          {view === "kyc" && <AdminKycView notify={setToast} onCountsChanged={refresh} />}
 
           {view === "contact" && <AdminContactView contact={overview.contact} onChanged={refresh} notify={setToast} />}
 
