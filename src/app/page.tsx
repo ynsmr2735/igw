@@ -336,7 +336,7 @@ export default async function LandingPage() {
               <h3 className="mt-6 text-lg font-extrabold tracking-tight text-[#10152b]">{feature.title}</h3>
               <p className="mt-3 text-[13px] leading-6 text-slate-600">{feature.text}</p>
               <div className="mt-6 flex items-center gap-1 text-xs font-bold text-[#7F00FF]">
-                Daha fazla <ArrowRight className="h-3.5 w-3.5 transition group-hover:translate-x-1" />
+                MORE <ArrowRight className="h-3.5 w-3.5 transition group-hover:translate-x-1" />
               </div>
             </article>
           ))}
