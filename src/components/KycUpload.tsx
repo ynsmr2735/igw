@@ -226,6 +226,10 @@ export async function postForm<T>(url: string, form: FormData, loginNext = "/das
     window.location.assign(`/login?next=${encodeURIComponent(loginNext)}`);
     throw new Error("Your session has ended. Please sign in again.");
   }
+  if (response.status === 428) {
+    window.location.assign("/dashboard");
+    throw new Error("Please set a new password first.");
+  }
   if (response.status === 413) throw new Error("The photos are too large to upload. Take them again a little further away.");
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) throw new Error(data.error ?? "Something went wrong. Please try again.");

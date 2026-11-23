@@ -19,6 +19,7 @@ import {
   Phone,
   Settings,
   ShieldCheck,
+  Users,
   Wallet,
   X,
   XCircle,
@@ -28,6 +29,7 @@ import { Brand } from "@/components/Brand";
 import { AdminCardsView, AdminWithdrawalsView } from "@/components/AdminCardsWithdrawals";
 import { AdminContactView } from "@/components/AdminContact";
 import { AdminKycView } from "@/components/AdminKyc";
+import { AdminMembersView } from "@/components/AdminMembers";
 import { signOutAction } from "@/app/auth/actions";
 import type { AdminDeposit, AdminDepositDetail, AdminOverview, AdminPoll, AdminTransaction, AuditEntry } from "@/lib/admin";
 import {
@@ -53,7 +55,7 @@ import {
 } from "@/lib/format";
 import { Badge, Card, CopyButton, STATUS_TONE, SectionTitle, ToastView, postJson, type Toast } from "@/components/wallet-ui";
 
-type View = "notifications" | "deposits" | "withdrawals" | "cards" | "kyc" | "transactions" | "settings" | "contact" | "audit";
+type View = "notifications" | "deposits" | "withdrawals" | "cards" | "kyc" | "members" | "transactions" | "settings" | "contact" | "audit";
 
 const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "notifications", label: "Notifications", icon: Bell },
@@ -61,6 +63,7 @@ const navItems: { id: View; label: string; icon: LucideIcon }[] = [
   { id: "withdrawals", label: "Withdrawals", icon: ArrowUpRight },
   { id: "cards", label: "Cards", icon: CreditCard },
   { id: "kyc", label: "Identity (KYC)", icon: ShieldCheck },
+  { id: "members", label: "Members", icon: Users },
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
   { id: "settings", label: "Payment methods", icon: Settings },
   { id: "contact", label: "Contact details", icon: Phone },
@@ -98,6 +101,7 @@ const AUDIT_LABEL: Record<string, string> = {
   card_request_rejected: "Card request rejected",
   contact_updated: "Contact details changed",
   kyc_approved: "Identity verified",
+  password_reset: "Member password reset",
   kyc_rejected: "Identity documents rejected",
   deposit_rejected: "Payment rejected",
 };
@@ -124,6 +128,8 @@ function auditSummary(entry: AuditEntry): string {
       return `account ${entry.targetId} · ${String(d.tier)}${d.reason ? ` · reason: ${String(d.reason)}` : ""}`;
     case "card_request_rejected":
       return `${entry.targetId} · account ${formatAccountNumber(String(d.accountNumber))} · ${String(d.tier)} · reason: ${String(d.reason)}`;
+    case "password_reset":
+      return `${formatAccountNumber(entry.targetId ?? "")} · ${String(d.name ?? "")} · ${String(d.email ?? "")} · ${Number(d.sessionsEnded ?? 0)} session(s) signed out`;
     case "kyc_approved":
       return `${entry.targetId} · ${String(d.documentType ?? "").replace("_", " ")}${d.accountNumber ? ` · ${formatAccountNumber(String(d.accountNumber))}` : ""}${d.withCardActivation ? " · with card activation" : ""}`;
     case "kyc_rejected":
@@ -1281,6 +1287,8 @@ export default function AdminClient({
               notify={setToast}
             />
           )}
+
+          {view === "members" && <AdminMembersView notify={setToast} />}
 
           {view === "kyc" && <AdminKycView notify={setToast} onCountsChanged={refresh} />}
 

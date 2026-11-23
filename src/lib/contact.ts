@@ -55,3 +55,18 @@ export function contactLinks(c: ContactInfo) {
     c.telegram && { kind: "telegram" as const, label: tgLabel, href: tg },
   ].filter(Boolean) as { kind: "email" | "phone" | "whatsapp" | "telegram"; label: string; href: string }[];
 }
+
+/** "Forgot / change password" on the sign-in page: WhatsApp chat with a prefilled message. */
+export type PasswordHelp = { kind: "whatsapp"; number: string } | { kind: "contact"; href: string } | null;
+
+export function passwordHelp(c: ContactInfo): PasswordHelp {
+  const digits = c.whatsapp.replace(/[^0-9]/g, "");
+  if (digits.length >= 6) return { kind: "whatsapp", number: digits };
+  if (hasContact(c)) return { kind: "contact", href: "/#contact" };
+  return null;
+}
+
+export function passwordHelpWhatsAppUrl(number: string, email: string): string {
+  const text = `Hello, I would like to reset / change my Insta Global Wallet password.${email ? ` My email: ${email}` : ""}`;
+  return `https://wa.me/${number}?text=${encodeURIComponent(text)}`;
+}

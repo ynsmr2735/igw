@@ -182,6 +182,11 @@ export async function postJson<T>(url: string, body: unknown, loginNext = "/dash
     window.location.assign(`/login?next=${encodeURIComponent(loginNext)}`);
     throw new Error("Your session has ended. Please sign in again.");
   }
+  if (response.status === 428) {
+    // Temporary password (admin reset): the dashboard asks for a new password first.
+    window.location.assign("/dashboard");
+    throw new Error("Please set a new password first.");
+  }
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) {
     // Keep the server's JSON (e.g. blockchain result) on the error for the caller.

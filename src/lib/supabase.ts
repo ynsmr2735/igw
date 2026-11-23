@@ -55,6 +55,14 @@ export class ForbiddenError extends Error {
   }
 }
 
+/** Signed in with a temporary password (after an admin reset): a new password must be set first (HTTP 428). */
+export class PasswordChangeRequiredError extends Error {
+  constructor(message = "Please set a new password first.") {
+    super(message);
+    this.name = "PasswordChangeRequiredError";
+  }
+}
+
 /** A normal error raised by a database function, e.g. "Insufficient balance". */
 export class RpcError extends Error {
   constructor(message: string) {
@@ -158,6 +166,7 @@ export async function rpc<T>(
   // Raised on purpose by the database functions: not signed in / not an admin.
   if (info.code === "28000") throw new AuthError(info.message || undefined);
   if (info.code === "PT403") throw new ForbiddenError(info.message || undefined);
+  if (info.code === "PT428") throw new PasswordChangeRequiredError(info.message || undefined);
 
   console.error(`Supabase RPC ${fn} failed (${response.status}):`, body);
 

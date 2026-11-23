@@ -5,6 +5,9 @@ import {
   approveWithdrawal,
   decideCardRequest,
   decideKyc,
+  getMemberDetail,
+  listMembers,
+  resetMemberPassword,
   listKyc,
   listCardRequests,
   listCards,
@@ -113,6 +116,18 @@ export async function POST(request: Request) {
         if (id === null) return Response.json({ error: "Invalid id" }, { status: 400 });
         if (typeof body.approve !== "boolean") return Response.json({ error: "approve must be true or false" }, { status: 400 });
         return Response.json({ ok: true, request: await decideCardRequest(id, body.approve, typeof body.reason === "string" ? body.reason : null) });
+      }
+      case "members": {
+        const search = typeof body.search === "string" ? body.search.slice(0, 120) : "";
+        const offset = Number.isInteger(body.offset) && (body.offset as number) >= 0 ? (body.offset as number) : 0;
+        return Response.json({ ok: true, ...(await listMembers(search, offset)) });
+      }
+      case "memberDetail":
+      case "resetPassword": {
+        const account = normalizeAccountNumber(String(body.accountNumber ?? ""));
+        if (!isAccountNumber(account)) return Response.json({ error: ACCOUNT_NUMBER_HINT }, { status: 400 });
+        if (body.action === "memberDetail") return Response.json({ ok: true, member: await getMemberDetail(account) });
+        return Response.json({ ok: true, ...(await resetMemberPassword(account)) });
       }
       case "kyc": {
         const status = body.status === "pending" || body.status === "approved" || body.status === "rejected" ? body.status : null;

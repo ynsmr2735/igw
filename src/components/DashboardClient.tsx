@@ -22,11 +22,11 @@ import {
   User,
   Wallet,
   X,
-  type LucideIcon,
-} from "lucide-react";
+  type LucideIcon, KeyRound } from "lucide-react";
 import { Brand } from "@/components/Brand";
 import WithdrawSection from "@/components/WithdrawSection";
 import { ContactDetails } from "@/components/ContactDetails";
+import { ChangePasswordForm } from "@/components/ChangePassword";
 import { hasContact } from "@/lib/contact";
 import { KYC_STATUS_LABEL } from "@/lib/kyc";
 import { signOutAction } from "@/app/auth/actions";
@@ -63,6 +63,7 @@ const navItems: { id: string; label: string; icon: LucideIcon }[] = [
   { id: "transactions", label: "Transactions", icon: ArrowLeftRight },
   { id: "notifications", label: "Notifications", icon: Bell },
   { id: "profile", label: "Profile", icon: User },
+  { id: "security", label: "Password", icon: KeyRound },
 ];
 
 const inputClass =
@@ -965,6 +966,12 @@ export default function DashboardClient({ initialData }: { initialData: Dashboar
               <div><dt className="text-[11px] text-slate-500">Member since</dt><dd className="mt-1 font-bold">{formatDate(data.user.memberSince)}</dd></div>
               <div><dt className="text-[11px] text-slate-500">Identity</dt><dd className="mt-1 font-bold" data-testid="profile-kyc">{KYC_STATUS_LABEL[data.withdrawalCenter.kyc.status]}</dd></div>
             </dl>
+          </Card>
+
+          <Card id="security">
+            <SectionTitle eyebrow="Security" title="Change your password" />
+            <p className="mb-4 text-[12px] text-slate-500">After the change you stay signed in here; other devices are signed out.</p>
+            <ChangePasswordForm onDone={() => setToast({ type: "ok", message: "Password changed. Other devices were signed out." })} />
           </Card>
 
           {hasContact(data.contact) && (

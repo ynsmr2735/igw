@@ -4,7 +4,7 @@ import { NextResponse, type NextRequest } from "next/server";
 // well-formed token exists; the database verifies it on every request.
 const SESSION_COOKIE = "igw_session";
 const SESSION_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
-const PROTECTED_API = ["/api/dashboard", "/api/deposits", "/api/transfers", "/api/withdrawals", "/api/notifications", "/api/admin"];
+const PROTECTED_API = ["/api/dashboard", "/api/deposits", "/api/transfers", "/api/withdrawals", "/api/notifications", "/api/admin", "/api/password"];
 
 export function proxy(request: NextRequest) {
   const path = request.nextUrl.pathname;
@@ -38,5 +38,6 @@ export const config = {
     "/api/withdrawals/:path*",
     "/api/notifications/:path*",
     "/api/admin/:path*",
+    "/api/password/:path*",
   ],
 };

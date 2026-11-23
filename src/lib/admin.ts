@@ -396,3 +396,74 @@ export async function decideKyc(id: number, approve: boolean, reason: string | n
 export async function kycFile(id: number, side: "front" | "back"): Promise<{ path: string; type: string; size: number }> {
   return rpc("igw_admin_kyc_file", { p_token: await token(), p_id: id, p_side: side });
 }
+
+/** One line of the member list. */
+export type MemberSummary = {
+  accountNumber: string;
+  previousAccountNumber: string | null;
+  name: string;
+  email: string;
+  username: string | null;
+  createdAt: string;
+  isAdmin: boolean;
+  balance: number;
+  card: { tier: CardTier; status: string; expired: boolean } | null;
+  kycStatus: "none" | "pending" | "approved" | "rejected";
+  lastSeenAt: string | null;
+  mustChangePassword: boolean;
+  passwordChangedAt: string | null;
+};
+
+export type MemberDetail = MemberSummary & {
+  plan: string;
+  activeSessions: number;
+  cardDetails: MemberCard | null;
+  usedLast24h: number;
+  kyc: AdminKycSubmission[];
+  transactions: Transaction[];
+  deposits: Deposit[];
+  withdrawals: Withdrawal[];
+  cardRequests: CardRequest[];
+  passwordResets: { at: string; by: string }[];
+};
+
+function toMemberSummary(r: Record<string, unknown>): MemberSummary {
+  return {
+    ...(r as unknown as MemberSummary),
+    balance: Number(r.balance ?? 0),
+    isAdmin: r.isAdmin === true,
+    mustChangePassword: r.mustChangePassword === true,
+  };
+}
+
+/** Members (newest first), optionally filtered by name, email, username or account number. */
+export async function listMembers(search: string, offset = 0): Promise<{ total: number; totalMembers: number; members: MemberSummary[] }> {
+  const raw = await rpc<{ total: number; totalMembers: number; members: Record<string, unknown>[] }>("igw_admin_members", {
+    p_token: await token(),
+    p_search: search,
+    p_offset: offset,
+  });
+  return { total: Number(raw.total ?? 0), totalMembers: Number(raw.totalMembers ?? 0), members: (raw.members ?? []).map(toMemberSummary) };
+}
+
+export async function getMemberDetail(accountNumber: string): Promise<MemberDetail> {
+  const r = await rpc<Record<string, unknown>>("igw_admin_member_detail", { p_token: await token(), p_account_number: accountNumber });
+  return {
+    ...toMemberSummary(r),
+    plan: String(r.plan ?? ""),
+    activeSessions: Number(r.activeSessions ?? 0),
+    cardDetails: toCard(r.cardDetails),
+    usedLast24h: Number(r.usedLast24h ?? 0),
+    kyc: ((r.kyc as unknown[]) ?? []).map((k) => toAdminKyc(k)!).filter(Boolean),
+    transactions: ((r.transactions as Record<string, unknown>[]) ?? []).map(toTransaction),
+    deposits: ((r.deposits as Record<string, unknown>[]) ?? []).map(toDeposit),
+    withdrawals: ((r.withdrawals as Record<string, unknown>[]) ?? []).map(toWithdrawal),
+    cardRequests: ((r.cardRequests as Record<string, unknown>[]) ?? []).map((c) => toCardRequest(c)!),
+    passwordResets: (r.passwordResets as { at: string; by: string }[]) ?? [],
+  };
+}
+
+/** New temporary password for a member; returned once, never stored in plain text. */
+export async function resetMemberPassword(accountNumber: string): Promise<{ temporaryPassword: string; email: string; name: string; accountNumber: string; sessionsEnded: number }> {
+  return rpc("igw_admin_reset_password", { p_token: await token(), p_account_number: accountNumber });
+}

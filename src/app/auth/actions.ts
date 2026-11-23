@@ -12,7 +12,7 @@ export type AuthState = {
   values?: { name?: string; email?: string };
 };
 
-type AuthResult = { ok: boolean; token?: string; error?: string };
+type AuthResult = { ok: boolean; token?: string; error?: string; mustChangePassword?: boolean };
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const encoder = new TextEncoder();
@@ -66,6 +66,7 @@ export async function signInAction(
   const next = safeNextPath(formData.get("next"));
   const values = { email };
 
+  let mustChange = false;
   if (!email || !password) return { error: "Email and password are required.", values };
 
   try {
@@ -74,11 +75,13 @@ export async function signInAction(
       return { error: result?.error ?? "Email or password is incorrect.", values };
     }
     await setSessionCookie(result.token);
+    mustChange = Boolean(result.mustChangePassword);
   } catch (error) {
     return failure("Could not sign you in", error, values);
   }
 
-  redirect(next);
+  // Temporary password from support: the dashboard asks for a new password first.
+  redirect(mustChange ? "/dashboard" : next);
 }
 
 export async function signOutAction(): Promise<void> {

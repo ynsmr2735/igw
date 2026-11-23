@@ -442,6 +442,10 @@ create table if not exists public.kyc_submissions (
 create unique index if not exists kyc_submissions_one_open on public.kyc_submissions(user_id) where status in ('pending', 'approved');
 create index if not exists kyc_submissions_status_idx on public.kyc_submissions(status, created_at desc);
 alter table public.kyc_submissions enable row level security;
+
+-- igw-rpc-13: after an admin password reset the member must choose a new password.
+alter table public.profiles add column if not exists must_change_password boolean not null default false;
+alter table public.profiles add column if not exists password_changed_at timestamptz;
 revoke all on public.kyc_submissions from public, anon, authenticated;
 
 -- Private bucket for the identity images (Supabase Storage). No storage policies are created,
@@ -755,6 +759,10 @@ declare
 begin
   if v_uid is null then
     raise exception using errcode = '28000', message = 'You must be signed in';
+  end if;
+  -- After an admin password reset the member must first set a new password.
+  if exists (select 1 from public.profiles where id = v_uid and must_change_password) then
+    raise exception using errcode = 'PT428', message = 'Please set a new password first.';
   end if;
   return v_uid;
 end;
@@ -1288,6 +1296,58 @@ as $$
   from (select 1) one left join public.profiles p on p.id = k.user_id;
 $$;
 
+-- ---------------------------------------------------------------------------
+-- Members and passwords (igw-rpc-13)
+-- ---------------------------------------------------------------------------
+-- Random temporary password: 12 characters without look-alikes (0/O, 1/l/I).
+create or replace function igw_private.temporary_password()
+returns text
+language plpgsql
+volatile
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_chars constant text := 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  v_bytes bytea := gen_random_bytes(12);
+  v_out text := '';
+begin
+  for i in 0..11 loop
+    v_out := v_out || substr(v_chars, 1 + (get_byte(v_bytes, i) % length(v_chars)), 1);
+  end loop;
+  -- Always at least one digit and one capital letter.
+  return substr(v_out, 1, 10) || substr('23456789', 1 + (get_byte(v_bytes, 0) % 8), 1)
+                              || substr('ABCDEFGHJKMNPQRSTUVWXYZ', 1 + (get_byte(v_bytes, 1) % 23), 1);
+end;
+$$;
+
+-- One line of the admin member list.
+create or replace function igw_private.member_summary_json(p public.profiles)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public, extensions
+as $$
+  select jsonb_build_object(
+    'accountNumber', p.account_number,
+    'previousAccountNumber', p.previous_account_number,
+    'name', p.full_name,
+    'email', p.email,
+    'username', p.username,
+    'createdAt', p.created_at,
+    'isAdmin', igw_private.is_admin(p.id),
+    'balance', coalesce((select balance from public.wallets where user_id = p.id and currency = 'USD'), 0),
+    'card', (select jsonb_build_object('tier', c.tier, 'status', c.status,
+                                       'expired', c.valid_until is not null and c.valid_until <= now())
+             from public.member_cards c where c.user_id = p.id),
+    'kycStatus', igw_private.kyc_status(p.id),
+    'lastSeenAt', (select max(last_seen_at) from public.sessions where user_id = p.id),
+    'mustChangePassword', p.must_change_password,
+    'passwordChangedAt', p.password_changed_at
+  );
+$$;
+
 -- Admin side: before a card is activated the member's identity must be verified. A pending
 -- submission is approved together with the activation (the admin saw the documents).
 create or replace function igw_private.kyc_require_for_activation(p_admin uuid, p_user uuid)
@@ -1614,7 +1674,7 @@ stable
 security definer
 set search_path = public, extensions
 as $$
-  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-12');
+  select jsonb_build_object('ok', true, 'schema', 'igw-rpc-13');
 $$;
 
 create or replace function public.igw_sign_up(p_full_name text, p_email text, p_password text)
@@ -1713,7 +1773,8 @@ begin
   end if;
 
   delete from public.login_attempts where email = v_login;
-  return jsonb_build_object('ok', true, 'token', igw_private.create_session(v_id));
+  return jsonb_build_object('ok', true, 'token', igw_private.create_session(v_id),
+    'mustChangePassword', (select must_change_password from public.profiles where id = v_id));
 end;
 $$;
 
@@ -1743,7 +1804,8 @@ begin
     select jsonb_build_object(
       'id', p.id, 'name', p.full_name, 'email', p.email, 'plan', p.plan,
       'username', p.username, 'accountNumber', p.account_number,
-      'isAdmin', igw_private.is_admin(p.id)
+      'isAdmin', igw_private.is_admin(p.id),
+      'mustChangePassword', p.must_change_password
     )
     from public.profiles p
     where p.id = v_uid
@@ -1763,6 +1825,9 @@ declare
 begin
   if v_uid is null then
     return jsonb_build_object('ok', false, 'error', 'You must be signed in');
+  end if;
+  if exists (select 1 from public.profiles where id = v_uid and must_change_password) then
+    raise exception using errcode = 'PT428', message = 'Please set a new password first.';
   end if;
   perform igw_private.expire_deposits();
   select * into v_wallet from public.wallets where user_id = v_uid and currency = 'USD';
@@ -3195,6 +3260,163 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Passwords and member directory (igw-rpc-13)
+-- ---------------------------------------------------------------------------
+-- Member changes their own password (also the forced change after an admin reset).
+-- Other sessions of the member are ended; the current one stays signed in.
+create or replace function public.igw_change_password(p_token text, p_current text, p_new text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := igw_private.touch_session(p_token);
+  v_profile public.profiles%rowtype;
+  v_key text;
+begin
+  if v_uid is null then
+    raise exception using errcode = '28000', message = 'You must be signed in';
+  end if;
+  select * into v_profile from public.profiles where id = v_uid for update;
+  v_key := 'pwchange:' || v_uid;
+  if (select count(*) from public.login_attempts where email = v_key and attempted_at > now() - interval '15 minutes') >= 5 then
+    raise exception 'Too many wrong attempts. Please wait 15 minutes and try again.';
+  end if;
+  if v_profile.password_hash is null or crypt(coalesce(p_current, ''), v_profile.password_hash) <> v_profile.password_hash then
+    -- Returned, not raised: a raised error would also undo this attempt record.
+    insert into public.login_attempts (email) values (v_key);
+    return jsonb_build_object('ok', false, 'error', 'Your current password is incorrect.');
+  end if;
+  if length(coalesce(p_new, '')) < 8 then
+    raise exception 'The new password must be at least 8 characters long.';
+  end if;
+  if octet_length(p_new) > 72 then
+    raise exception 'The new password is too long (max 72 characters).';
+  end if;
+  if crypt(p_new, v_profile.password_hash) = v_profile.password_hash then
+    raise exception 'Choose a new password that is different from the current one.';
+  end if;
+  update public.profiles
+    set password_hash = crypt(p_new, gen_salt('bf', 10)), must_change_password = false, password_changed_at = now()
+    where id = v_uid;
+  delete from public.login_attempts where email = v_key;
+  delete from public.sessions where user_id = v_uid and token_hash <> igw_private.token_hash(p_token);
+  perform igw_private.notify(v_uid, 'password_changed', 'Password changed',
+    'Your password was changed. If this was not you, contact support immediately.', '{}'::jsonb);
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+-- Admin: member list with search (name, email, username or account number).
+create or replace function public.igw_admin_members(p_token text, p_search text default '', p_offset integer default 0)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_q text := left(trim(coalesce(p_search, '')), 120);
+  v_like text := '%' || replace(replace(replace(left(trim(coalesce(p_search, '')), 120), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  v_acc text := igw_private.normalize_account_number(p_search);
+  v_offset integer := greatest(coalesce(p_offset, 0), 0);
+begin
+  return (
+    with m as (
+      select p.* from public.profiles p
+      where v_q = ''
+         or p.full_name ilike v_like or p.email ilike v_like or coalesce(p.username, '') ilike v_like
+         or (length(v_acc) >= 4 and (p.account_number like '%' || v_acc || '%' or p.previous_account_number = v_acc))
+    )
+    select jsonb_build_object(
+      'total', (select count(*) from m),
+      'members', coalesce((select jsonb_agg(igw_private.member_summary_json(x) order by x.created_at desc, x.id)
+                           from (select * from m order by created_at desc, id limit 50 offset v_offset) x), '[]'::jsonb),
+      'totalMembers', (select count(*) from public.profiles)
+    )
+  );
+end;
+$$;
+
+-- Admin: everything about one member (no password, no photos - those go through the KYC route).
+create or replace function public.igw_admin_member_detail(p_token text, p_account_number text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_profile public.profiles%rowtype;
+begin
+  select * into v_profile from public.profiles where id = igw_private.profile_by_account(p_account_number);
+  if not found then
+    raise exception 'No member with this account number.';
+  end if;
+  return igw_private.member_summary_json(v_profile) || jsonb_build_object(
+    'plan', v_profile.plan,
+    'activeSessions', (select count(*) from public.sessions where user_id = v_profile.id and expires_at > now()),
+    'cardDetails', (select igw_private.card_json(c) from public.member_cards c where c.user_id = v_profile.id),
+    'usedLast24h', igw_private.withdrawn_last_24h(v_profile.id),
+    'kyc', coalesce((select jsonb_agg(igw_private.kyc_admin_json(k) order by k.created_at desc, k.id desc)
+                     from public.kyc_submissions k where k.user_id = v_profile.id), '[]'::jsonb),
+    'transactions', coalesce((select jsonb_agg(igw_private.transaction_json(t) order by t.created_at desc, t.id desc)
+                              from (select t.* from public.transactions t join public.wallets w on w.id = t.wallet_id
+                                    where w.user_id = v_profile.id order by t.created_at desc, t.id desc limit 25) t), '[]'::jsonb),
+    'deposits', coalesce((select jsonb_agg(igw_private.deposit_json(d) order by d.created_at desc, d.id desc)
+                          from (select * from public.deposit_requests where user_id = v_profile.id order by created_at desc, id desc limit 10) d), '[]'::jsonb),
+    'withdrawals', coalesce((select jsonb_agg(igw_private.withdrawal_json(w) order by w.created_at desc, w.id desc)
+                             from (select * from public.withdrawal_requests where user_id = v_profile.id order by created_at desc, id desc limit 10) w), '[]'::jsonb),
+    'cardRequests', coalesce((select jsonb_agg(igw_private.card_request_json(r) order by r.created_at desc, r.id desc)
+                              from (select * from public.card_requests where user_id = v_profile.id order by created_at desc, id desc limit 10) r), '[]'::jsonb),
+    'passwordResets', coalesce((select jsonb_agg(jsonb_build_object('at', a.created_at, 'by', a.admin_label) order by a.created_at desc)
+                                from (select * from public.admin_audit_log where action = 'password_reset' and target_id = v_profile.account_number
+                                      order by created_at desc limit 5) a), '[]'::jsonb)
+  );
+end;
+$$;
+
+-- Admin: new temporary password for a member. Returned ONCE (only its bcrypt hash is stored);
+-- all sessions of the member end, and the member must choose a new password after signing in.
+create or replace function public.igw_admin_reset_password(p_token text, p_account_number text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_admin uuid := igw_private.require_admin(p_token);
+  v_profile public.profiles%rowtype;
+  v_password text := igw_private.temporary_password();
+  v_sessions integer;
+begin
+  select * into v_profile from public.profiles where id = igw_private.profile_by_account(p_account_number) for update;
+  if not found then
+    raise exception 'No member with this account number.';
+  end if;
+  if v_profile.id = v_admin then
+    raise exception 'Change your own password in your profile (My wallet -> Profile).';
+  end if;
+  if igw_private.is_admin(v_profile.id) then
+    raise exception 'Admin passwords cannot be reset here.';
+  end if;
+  update public.profiles
+    set password_hash = crypt(v_password, gen_salt('bf', 10)), must_change_password = true, password_changed_at = now()
+    where id = v_profile.id;
+  delete from public.sessions where user_id = v_profile.id;
+  get diagnostics v_sessions = row_count;
+  delete from public.login_attempts where email = v_profile.email or email = lower(coalesce(v_profile.username, '')) or email = 'pwchange:' || v_profile.id;
+  perform igw_private.audit(v_admin, 'password_reset', 'member', v_profile.account_number,
+    jsonb_build_object('name', v_profile.full_name, 'email', v_profile.email, 'sessionsEnded', v_sessions));
+  perform igw_private.notify(v_profile.id, 'password_reset', 'Password reset by support',
+    'Your password was reset by our support team. Sign in with the temporary password you received and choose a new password.', '{}'::jsonb);
+  return jsonb_build_object('ok', true, 'temporaryPassword', v_password, 'email', v_profile.email,
+                            'name', v_profile.full_name, 'accountNumber', v_profile.account_number, 'sessionsEnded', v_sessions);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Identity verification (KYC), admin side (igw-rpc-12)
 -- ---------------------------------------------------------------------------
 create or replace function public.igw_admin_kyc_list(p_token text, p_status text default null)
@@ -3405,6 +3627,10 @@ declare
     'public.igw_contact_info()',
     'public.igw_admin_set_contact(text, jsonb)',
     'public.igw_kyc_prepare(text, text)',
+    'public.igw_change_password(text, text, text)',
+    'public.igw_admin_members(text, text, integer)',
+    'public.igw_admin_member_detail(text, text)',
+    'public.igw_admin_reset_password(text, text)',
     'public.igw_kyc_submit(text, text, text, text, integer, text, text, integer, text, text)',
     'public.igw_admin_kyc_list(text, text)',
     'public.igw_admin_kyc_file(text, bigint, text)',

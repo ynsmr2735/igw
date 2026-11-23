@@ -1,4 +1,4 @@
-import { AuthError, ForbiddenError, RpcError, SetupError } from "@/lib/supabase";
+import { AuthError, ForbiddenError, RpcError, SetupError, PasswordChangeRequiredError } from "@/lib/supabase";
 
 /** Shared helpers for the JSON API routes. */
 
@@ -36,6 +36,7 @@ export function toAmount(value: unknown): number | null {
 export function errorResponse(error: unknown, context: string): Response {
   if (error instanceof AuthError) return Response.json({ error: error.message }, { status: 401 });
   if (error instanceof ForbiddenError) return Response.json({ error: error.message }, { status: 403 });
+  if (error instanceof PasswordChangeRequiredError) return Response.json({ error: error.message, mustChangePassword: true }, { status: 428 });
   if (error instanceof RpcError) return Response.json({ error: error.message }, { status: 400 });
   if (error instanceof SetupError) {
     console.error(`${context}:`, error.message);

@@ -2,17 +2,35 @@
 
 import Link from "next/link";
 import { useActionState, useState } from "react";
-import { ArrowRight, Check, Eye, EyeOff, Loader2, LockKeyhole, Mail, User } from "lucide-react";
+import { ArrowRight, Check, Eye, EyeOff, KeyRound, Loader2, LockKeyhole, Mail, MessageCircle, User } from "lucide-react";
 import {
   signInAction,
   signUpAction,
   type AuthState,
 } from "@/app/auth/actions";
 import { Brand } from "@/components/Brand";
+import { passwordHelpWhatsAppUrl, type PasswordHelp } from "@/lib/contact";
 
 const initialState: AuthState = {};
 
-export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: string }) {
+/**
+ * Link to the support WhatsApp chat (number set by the admin in Contact details), with a prefilled
+ * message that includes the email typed in the form, or to the Contact section of the homepage.
+ */
+function helpLinkProps(help: Exclude<PasswordHelp, null>) {
+  if (help.kind === "contact") return { href: help.href };
+  return {
+    href: passwordHelpWhatsAppUrl(help.number, ""),
+    target: "_blank",
+    rel: "noopener noreferrer",
+    onClick: (event: { currentTarget: { href: string } }) => {
+      const email = (document.getElementById("email") as HTMLInputElement | null)?.value.trim() ?? "";
+      event.currentTarget.href = passwordHelpWhatsAppUrl(help.number, email.slice(0, 180));
+    },
+  };
+}
+
+export function AuthForm({ mode, next, passwordHelp = null }: { mode: "login" | "signup"; next: string; passwordHelp?: PasswordHelp }) {
   const isSignup = mode === "signup";
   const [state, formAction, pending] = useActionState(
     isSignup ? signUpAction : signInAction,
@@ -150,8 +168,14 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                   <label htmlFor="password" className="text-[11px] font-bold uppercase tracking-wide text-slate-500">
                     Password
                   </label>
-                  {!isSignup && (
-                    <span className="text-[10px] font-semibold text-[#7F00FF]">Forgot password?</span>
+                  {!isSignup && passwordHelp && (
+                    <a
+                      {...helpLinkProps(passwordHelp)}
+                      className="text-[11px] font-bold text-[#7F00FF] hover:underline"
+                      data-testid="forgot-password-link"
+                    >
+                      Forgot password?
+                    </a>
                   )}
                 </div>
                 <div className="relative">
@@ -218,6 +242,21 @@ export function AuthForm({ mode, next }: { mode: "login" | "signup"; next: strin
                 {!pending && <ArrowRight className="h-4 w-4" />}
               </button>
             </form>
+
+            {!isSignup && passwordHelp && (
+              <a
+                {...helpLinkProps(passwordHelp)}
+                className={`mt-3 flex h-12 w-full items-center justify-center gap-2 rounded-xl border text-[13px] font-bold transition ${
+                  passwordHelp.kind === "whatsapp"
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100"
+                    : "border-slate-200 bg-white text-slate-700 hover:border-purple-200"
+                }`}
+                data-testid="change-password-help"
+              >
+                {passwordHelp.kind === "whatsapp" ? <MessageCircle className="h-4 w-4" /> : <KeyRound className="h-4 w-4" />}
+                {passwordHelp.kind === "whatsapp" ? "Change / reset password via WhatsApp" : "Change / reset password: contact support"}
+              </a>
+            )}
 
             <p className="mt-6 text-center text-[12px] font-medium text-slate-500">
               {isSignup ? "Already have an account? " : "New to Insta Global Wallet? "}

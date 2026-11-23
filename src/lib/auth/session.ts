@@ -21,6 +21,8 @@ export type SessionUser = {
   accountNumber: string;
   /** From public.admin_roles in the database, never from the username. */
   isAdmin: boolean;
+  /** Signed in with a temporary password after an admin reset: must choose a new one first. */
+  mustChangePassword?: boolean;
 };
 
 export async function getSessionToken(): Promise<string | null> {
